@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
+import pytest
 import yaml
 
 from conftest import call_facade, create_run, make_home, write_article
@@ -86,4 +88,81 @@ def test_fork_failure_corrupt_state_zero_residue(tmp_path):
 
     runs_after = sorted(p.name for p in (home / "runs").iterdir())
     assert runs_after == runs_before, f"损坏态 fork 不应留孤儿 run"
+    assert (home / "current_run").read_bytes() == ptr_before
+
+
+# ── 第 6 轮：真正进入回滚分支的并发用例 ────────────────────────────────────
+
+def _seed_inprocess(home: Path) -> tuple[str, str]:
+    """子进程 helper 建好 run 后，在测试进程内复用（同 home）。"""
+    run_id = create_run(home, "父")
+    ver = write_article(home, run_id, "父正文")
+    return run_id, ver
+
+
+def test_fork_rollback_keeps_concurrent_run(tmp_path, monkeypatch):
+    """注入「新 run 已创建后」失败，且期间并发建了另一 run：
+    回滚只删本次 fork 的 run，并发 run 留存，current_run 不被覆盖。"""
+    from dsh_wewrite_facade import storage
+
+    home = make_home(tmp_path)
+    rid, ver = _seed_inprocess(home)
+    monkeypatch.setenv("WEWRITE_HOME", str(home))
+
+    runs_before = set(p.name for p in (home / "runs").iterdir())
+    created: dict[str, str] = {}
+
+    def fake_write(run_id: str, filename: str, data: bytes):
+        # 模拟并发 writer（不遵守本 facade 的 home_lock）在此期间建了新 run。
+        from wewrite.runs import create_run as _up
+        st = _up(topic="并发", mode="draft", visual_mode="none",
+                 max_images=4, max_image_cost=None, allow_publish=False)
+        created["concurrent"] = st["run_id"]
+        created["fork"] = run_id
+        raise RuntimeError("注入写正文失败")
+
+    monkeypatch.setattr(storage, "write_run_file", fake_write)
+
+    with pytest.raises(RuntimeError):
+        storage.fork_article(rid, ver)
+
+    # 本次 fork 的 run 被清理。
+    assert not (home / "runs" / created["fork"]).exists()
+    # 并发创建的 run 留存。
+    assert (home / "runs" / created["concurrent"]).exists()
+    # current_run 仍指向并发 run，未被覆盖回旧父 run。
+    assert (home / "current_run").read_text(encoding="utf-8").strip() == created["concurrent"]
+
+
+def test_fork_upstream_create_then_raise_zero_residue(tmp_path, monkeypatch):
+    """上游 create_run 建完目录后抛错（new_run_id 为 None 路径）：
+    回滚清理本次 run，runs/ 集合与 current_run 恢复调用前。"""
+    from dsh_wewrite_facade import storage
+
+    home = make_home(tmp_path)
+    rid, ver = _seed_inprocess(home)
+    monkeypatch.setenv("WEWRITE_HOME", str(home))
+
+    runs_before = set(p.name for p in (home / "runs").iterdir())
+    ptr_before = (home / "current_run").read_bytes()
+
+    import wewrite.runs as wr
+    real_create = wr.create_run
+    created: dict[str, str] = {}
+
+    def fake_create(**kwargs):
+        st = real_create(**kwargs)
+        created["run"] = st["run_id"]
+        raise RuntimeError("create crashed after mkdir")
+
+    monkeypatch.setattr(wr, "create_run", fake_create)
+
+    with pytest.raises(RuntimeError):
+        storage.fork_article(rid, ver)
+
+    # 本次 fork 的 run 被清理。
+    assert created["run"] not in set(p.name for p in (home / "runs").iterdir())
+    # runs/ 集合与调用前完全相同。
+    assert set(p.name for p in (home / "runs").iterdir()) == runs_before
+    # current_run 恢复调用前。
     assert (home / "current_run").read_bytes() == ptr_before

@@ -481,8 +481,15 @@ def _current_run_bytes() -> bytes | None:
         os.close(root_fd)
 
 
-def _restore_current_run(content: bytes | None) -> None:
-    """恢复 current_run 指针内容（fork 失败回滚用）。"""
+def _restore_current_run_if_owned(new_run_id: str, content: bytes | None) -> None:
+    """条件恢复 current_run 指针（fork 失败回滚用）。
+
+    仅当 current_run 仍指向本次 fork 创建的 run（new_run_id）时才恢复为备份值；
+    若已被并发 writer 改写为其他值，保持他人写入的值不动。
+    """
+    expected = (new_run_id + "\n").encode("utf-8")
+    if _current_run_bytes() != expected:
+        return  # 他人已改写，不动
     root_fd = paths._open_root()
     try:
         if content is None:
@@ -555,22 +562,32 @@ def _remove_run_dir(run_id: str) -> None:
 
 
 def _rollback_fork(new_run_id: str | None, runs_before: set[str], current_ptr_before: bytes | None) -> None:
-    """fork 失败回滚：删除新建空壳 run 目录，恢复 current_run 指针。"""
-    try:
-        if new_run_id is not None:
-            _remove_run_dir(new_run_id)
-        else:
-            for rid in set(paths.list_run_ids()) - runs_before:
-                _remove_run_dir(rid)
-    finally:
-        _restore_current_run(current_ptr_before)
+    """fork 失败回滚：只删本次 fork 有凭据的 run，条件恢复 current_run。
+
+    必须在 home_lock 临界区内调用（调用方持锁），此时「runs/ 差集」只会是本次
+    fork 的 run，不会误删并发 writer 的 run。
+    """
+    # 确定本次 fork 创建的 run：优先用返回的 new_run_id；否则在 home_lock 互斥下
+    # 用差集判定（安全，因为其他 writer 无法在锁内新建 run）。
+    target_run_id: str | None = new_run_id
+    if target_run_id is None:
+        diff = set(paths.list_run_ids()) - runs_before
+        if len(diff) == 1:
+            target_run_id = next(iter(diff))
+        # 0 个：create_run 尚未落盘目录；>1：不应发生（home_lock 互斥），保守不删。
+
+    if target_run_id is not None:
+        _remove_run_dir(target_run_id)
+        _restore_current_run_if_owned(target_run_id, current_ptr_before)
 
 
 def fork_article(run_id: str, expected_version: str | None) -> dict[str, Any]:
     """article/fork：复制源 run 正文到新 run。源 run 原文字节不变，parentRunId 可回溯。
 
     - 新 run 建好后立即预建 run 锁文件（ensure_run_lock_file），后续 run_lock(create=False) 可用。
-    - 任何失败路径回滚：删除新建空壳 run 目录、恢复 current_run 指针逐字节不变。
+    - 创建 + 写正文 + 失败回滚全程持 home 全局锁（home → run 固定顺序），
+      使「runs/ 差集」判定在互斥窗口内进行，不会误删并发 writer 的 run。
+    - current_run 仅在仍指向本次失败 run 时恢复，不覆盖他人写入。
     """
     from wewrite.runs import create_run as _upstream_create
 
@@ -582,33 +599,33 @@ def fork_article(run_id: str, expected_version: str | None) -> dict[str, Any]:
         if expected_version is not None and version != expected_version:
             raise version_conflict("内容版本冲突，请刷新后重试")
 
-    runs_before = set(paths.list_run_ids())
-    current_ptr_before = _current_run_bytes()
-
     new_run_id: str | None = None
-    try:
-        # 创建新 run（写面，持 home 全局锁）。
-        with home_lock(create=True):
+    # 全程持 home 全局锁：建 run、写正文、失败回滚在同一互斥窗口内完成，
+    # 其他 facade 写入口（都经 home_lock）无法插入建 run。
+    with home_lock(create=True):
+        runs_before = set(paths.list_run_ids())
+        current_ptr_before = _current_run_bytes()
+        try:
             state = _upstream_create(topic="", mode="draft", visual_mode="none",
                                      max_images=4, max_image_cost=None, allow_publish=False)
-        new_run_id = state.get("run_id")
-        if not new_run_id:
-            raise internal("创建 run 失败")
+            new_run_id = state.get("run_id")
+            if not new_run_id:
+                raise internal("创建 run 失败")
 
-        # 预建新 run 锁文件，使后续 run_lock(create=False) 可用（不得放宽为 create=True）。
-        ensure_run_lock_file(new_run_id)
+            # 预建新 run 锁文件，使后续 run_lock(create=False) 可用（不得放宽为 create=True）。
+            ensure_run_lock_file(new_run_id)
 
-        with run_lock(new_run_id, create=False):
-            write_run_file(new_run_id, "article.md", content.encode("utf-8"))
-            # 记录 parent 关系到 state.yaml
-            from . import projection
-            new_state, _diags = projection.read_state(new_run_id)
-            new_state["parent_run_id"] = run_id
-            new_state["fork_source_version"] = version
-            new_state["updated"] = projection._now_rfc3339()
-            write_state_yaml(new_run_id, yaml.safe_dump(new_state, allow_unicode=True, sort_keys=False))
-    except BaseException:
-        _rollback_fork(new_run_id, runs_before, current_ptr_before)
-        raise
+            with run_lock(new_run_id, create=False):
+                write_run_file(new_run_id, "article.md", content.encode("utf-8"))
+                # 记录 parent 关系到 state.yaml
+                from . import projection
+                new_state, _diags = projection.read_state(new_run_id)
+                new_state["parent_run_id"] = run_id
+                new_state["fork_source_version"] = version
+                new_state["updated"] = projection._now_rfc3339()
+                write_state_yaml(new_run_id, yaml.safe_dump(new_state, allow_unicode=True, sort_keys=False))
+        except BaseException:
+            _rollback_fork(new_run_id, runs_before, current_ptr_before)
+            raise
 
     return {"runId": new_run_id, "parentRunId": run_id, "version": sha256_hex(content.encode("utf-8"))}
