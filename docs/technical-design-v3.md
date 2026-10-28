@@ -150,7 +150,9 @@ RunSummary = {runId:RunId,title:string,mode:'draft'|'complete',
 
 `PushSummary={runId,title,digest,articleVersion,themeId,coverHash,contentHash,accountLabel,dryRun}`，所有字段必填；accountLabel 仅显示账号名或掩码，不含 app secret。只提供设置诊断，不实现通用 `config/set`、`credentials/get` 或任意命令 RPC。密钥由宿主 credentials 配置界面管理；私有配置仅保 credential ref。
 
-业务错误码固定：`INVALID_INPUT`、`NOT_FOUND`、`FORBIDDEN`、`VERSION_CONFLICT`、`RUN_BUSY`、`INVALID_TRANSITION`、`CAPABILITY_UNAVAILABLE`、`DEPENDENCY_MISMATCH`、`ARTIFACT_MISSING`、`REVIEW_REQUIRED`、`APPROVAL_REQUIRED`、`APPROVAL_DENIED`、`APPROVAL_UNAVAILABLE`、`TIMEOUT`、`CANCELLED`、`PUBLISH_UNKNOWN`、`INTERNAL`。重试标志不等于允许自动重放外部动作。
+业务错误码固定为 18 项（JEE-1941 第 5 轮正式纳入状态损坏码）：`INVALID_INPUT`、`NOT_FOUND`、`FORBIDDEN`、`VERSION_CONFLICT`、`RUN_BUSY`、`INVALID_TRANSITION`、`CAPABILITY_UNAVAILABLE`、`DEPENDENCY_MISMATCH`、`ARTIFACT_MISSING`、`REVIEW_REQUIRED`、`APPROVAL_REQUIRED`、`APPROVAL_DENIED`、`APPROVAL_UNAVAILABLE`、`TIMEOUT`、`CANCELLED`、`PUBLISH_UNKNOWN`、`INTERNAL`、`STATE_CORRUPTED`。重试标志不等于允许自动重放外部动作。
+
+状态损坏的读写操作统一返回业务码 `STATE_CORRUPTED`，默认中文消息为「状态不可读，禁止编辑」；列表及详情仍可成功返回不可读条目，并在诊断或 `lastError` 使用同名键。不得将损坏状态映射为普通 `INVALID_TRANSITION`，也不得写回合成状态。相较复用旧码，本次扩展要求 Python 与 TypeScript 同步升级错误码枚举；跨语言测试校验集合、中文消息和业务失败解析，防止单端新增漂移。
 
 ## 5. Agent 工具、skills 与生命周期
 

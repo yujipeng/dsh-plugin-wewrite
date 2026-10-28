@@ -10,7 +10,7 @@ export const RPC_CHANNEL = '/wewrite-python';
 export const CONTRACT_VERSION = 1;
 
 /**
- * 业务错误码（设计 §4 固定 18 项，实际列出 17 项；以设计原文为准）。
+ * 业务错误码（设计 §4：18 项，含状态不可读 STATE_CORRUPTED）。
  * 业务错误码只出现在成功传输 value 内的业务失败联合里，不写进宿主传输 error.code。
  */
 export const ERROR_CODES = [
@@ -31,6 +31,7 @@ export const ERROR_CODES = [
   'CANCELLED',
   'PUBLISH_UNKNOWN',
   'INTERNAL',
+  'STATE_CORRUPTED',
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -54,4 +55,5 @@ export const ERROR_MESSAGES: Readonly<Record<ErrorCode, string>> = {
   CANCELLED: '操作已取消',
   PUBLISH_UNKNOWN: '推送结果未知',
   INTERNAL: '内部错误',
+  STATE_CORRUPTED: '状态不可读，禁止编辑',
 };

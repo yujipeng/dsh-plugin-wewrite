@@ -116,7 +116,7 @@ def test_read_face_no_write_corrupt(tmp_path, raw_state):
     assert detail["data"]["gate"] is None
     art = call_facade(str(home), "artifact.get", {"runId": run_id, "kind": "article"})
     assert art["ok"] is False
-    assert art["error"]["code"] == "INVALID_TRANSITION"
+    assert art["error"]["code"] == "STATE_CORRUPTED"
     assert art["error"]["runId"] == run_id
     after = snapshot_tree(home)
     assert after == before

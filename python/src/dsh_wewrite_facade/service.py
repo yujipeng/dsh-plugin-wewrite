@@ -228,7 +228,7 @@ def op_artifact_get(payload: dict) -> dict[str, Any]:
     storage.check_no_pending_transaction(run_id)
     state, diags = projection.read_state(run_id)
     if "STATE_CORRUPTED" in diags:
-        raise FacadeError("INVALID_TRANSITION", "状态不可读，无法读取产物", run_id=run_id)
+        raise FacadeError("STATE_CORRUPTED", "状态不可读，无法读取产物", run_id=run_id)
     content, version = projection.read_artifact_content(run_id, kind)
     return business_success({
         "runId": run_id,
