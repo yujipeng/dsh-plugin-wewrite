@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
-from conftest import call_facade, create_run, make_home, write_article
+from conftest import call_facade, create_run, make_home, snapshot_tree, write_article
 
 
 def _seed_healthy(home: Path) -> tuple[str, str]:
@@ -21,6 +23,8 @@ def _seed_healthy(home: Path) -> tuple[str, str]:
 def test_fork_healthy_path_success(tmp_path):
     home = make_home(tmp_path)
     run_id, ver = _seed_healthy(home)
+    parent_before = snapshot_tree(home / "runs" / run_id)
+    pointer_before = (home / "current_run").read_bytes()
 
     resp = call_facade(str(home), "run.fork", {
         "requestId": "f1", "runId": run_id, "expectedVersion": ver,
@@ -47,6 +51,8 @@ def test_fork_healthy_path_success(tmp_path):
 
     # 源 run 正文与 state 字节不变。
     src_article = (home / "runs" / run_id / "article.md").read_bytes()
+    assert snapshot_tree(home / "runs" / run_id) == parent_before
+    assert (home / "current_run").read_bytes() == pointer_before
     assert src_article == b"\xe7\x88\xb6\xe6\xad\xa3\xe6\x96\x87"  # "父正文"
 
 
@@ -134,9 +140,8 @@ def test_fork_rollback_keeps_concurrent_run(tmp_path, monkeypatch):
     assert (home / "current_run").read_text(encoding="utf-8").strip() == created["concurrent"]
 
 
-def test_fork_upstream_create_then_raise_zero_residue(tmp_path, monkeypatch):
-    """上游 create_run 建完目录后抛错（new_run_id 为 None 路径）：
-    回滚清理本次 run，runs/ 集合与 current_run 恢复调用前。"""
+def test_fork_initialize_then_raise_zero_residue(tmp_path, monkeypatch):
+    """初始化已落盘后抛错：凭据清理本次目录，指针无需恢复。"""
     from dsh_wewrite_facade import storage
 
     home = make_home(tmp_path)
@@ -146,16 +151,15 @@ def test_fork_upstream_create_then_raise_zero_residue(tmp_path, monkeypatch):
     runs_before = set(p.name for p in (home / "runs").iterdir())
     ptr_before = (home / "current_run").read_bytes()
 
-    import wewrite.runs as wr
-    real_create = wr.create_run
+    real_initialize = storage._initialize_fork_run
     created: dict[str, str] = {}
 
-    def fake_create(**kwargs):
-        st = real_create(**kwargs)
-        created["run"] = st["run_id"]
-        raise RuntimeError("create crashed after mkdir")
+    def fake_initialize(receipt, parent_id, version):
+        real_initialize(receipt, parent_id, version)
+        created["run"] = receipt.run_id
+        raise RuntimeError("初始化完成后注入失败")
 
-    monkeypatch.setattr(wr, "create_run", fake_create)
+    monkeypatch.setattr(storage, "_initialize_fork_run", fake_initialize)
 
     with pytest.raises(RuntimeError):
         storage.fork_article(rid, ver)
@@ -166,3 +170,90 @@ def test_fork_upstream_create_then_raise_zero_residue(tmp_path, monkeypatch):
     assert set(p.name for p in (home / "runs").iterdir()) == runs_before
     # current_run 恢复调用前。
     assert (home / "current_run").read_bytes() == ptr_before
+
+
+# 第 7 轮：独立进程上游 writer 不获取 facade home 锁，确定性同步完成，无睡眠。
+def _peer_create(home: Path) -> tuple[str, dict, bytes]:
+    env = os.environ.copy()
+    env["WEWRITE_HOME"] = str(home)
+    peer_id = subprocess.check_output([
+        sys.executable, "-c",
+        "from wewrite.runs import create_run; print(create_run(topic='并发他人')['run_id'])",
+    ], env=env, text=True, timeout=20).strip()
+    peer_dir = home / "runs" / peer_id
+    (peer_dir / "sentinel.bin").write_bytes(b"peer-owned\x00keep")
+    return peer_id, snapshot_tree(peer_dir), (home / "current_run").read_bytes()
+
+
+def test_fork_receipt_before_state_keeps_peer(tmp_path, monkeypatch):
+    """自身尚未落盘、唯一新增 run 属于他人；另覆盖仅分配空目录的异常窗口。"""
+    from dsh_wewrite_facade import storage
+
+    home = make_home(tmp_path)
+    rid, ver = _seed_inprocess(home)
+    monkeypatch.setenv("WEWRITE_HOME", str(home))
+    parent_before = snapshot_tree(home / "runs" / rid)
+    real_allocate = storage._allocate_fork_run
+    peer = {}
+
+    # 精确复现阻断 A：自己完全未 mkdir，唯一新增目录是独立进程建的。
+    def fail_before_allocate():
+        peer["id"], peer["tree"], peer["pointer"] = _peer_create(home)
+        raise RuntimeError("本次尚未落盘")
+
+    monkeypatch.setattr(storage, "_allocate_fork_run", fail_before_allocate)
+    with pytest.raises(RuntimeError, match="本次尚未落盘"):
+        storage.fork_article(rid, ver)
+    assert set(p.name for p in (home / "runs").iterdir()) == {rid, peer["id"]}
+    assert snapshot_tree(home / "runs" / peer["id"]) == peer["tree"]
+    assert (home / "current_run").read_bytes() == peer["pointer"]
+
+    # 业务 state 未落盘、仅凭据已分配：删除回滚时必须暴露空目录残留。
+    monkeypatch.setattr(storage, "_allocate_fork_run", real_allocate)
+    runs_before = set(p.name for p in (home / "runs").iterdir())
+    mine = {}
+
+    def fail_before_state(receipt, parent_id, version):
+        mine["id"] = receipt.run_id
+        assert list((home / "runs" / receipt.run_id).iterdir()) == []
+        peer["id"], peer["tree"], peer["pointer"] = _peer_create(home)
+        raise RuntimeError("本次尚未写状态")
+
+    monkeypatch.setattr(storage, "_initialize_fork_run", fail_before_state)
+    with pytest.raises(RuntimeError, match="本次尚未写状态"):
+        storage.fork_article(rid, ver)
+    assert not (home / "runs" / mine["id"]).exists()
+    assert set(p.name for p in (home / "runs").iterdir()) == runs_before | {peer["id"]}
+    assert snapshot_tree(home / "runs" / peer["id"]) == peer["tree"]
+    assert (home / "current_run").read_bytes() == peer["pointer"]
+    assert snapshot_tree(home / "runs" / rid) == parent_before
+
+
+def test_fork_receipt_after_state_keeps_peer(tmp_path, monkeypatch):
+    """自身已落盘且另有并发目录：只删凭据目录，保留他人全部字节与指针。"""
+    from dsh_wewrite_facade import storage
+
+    home = make_home(tmp_path)
+    rid, ver = _seed_inprocess(home)
+    monkeypatch.setenv("WEWRITE_HOME", str(home))
+    parent_before = snapshot_tree(home / "runs" / rid)
+    runs_before = set(p.name for p in (home / "runs").iterdir())
+    real_initialize = storage._initialize_fork_run
+    peer = {}
+    mine = {}
+
+    def fail_after_state(receipt, parent_id, version):
+        real_initialize(receipt, parent_id, version)
+        mine["id"] = receipt.run_id
+        assert (home / "runs" / receipt.run_id / "state.yaml").is_file()
+        peer["id"], peer["tree"], peer["pointer"] = _peer_create(home)
+        raise RuntimeError("本次落盘后失败")
+
+    monkeypatch.setattr(storage, "_initialize_fork_run", fail_after_state)
+    with pytest.raises(RuntimeError, match="本次落盘后失败"):
+        storage.fork_article(rid, ver)
+    assert not (home / "runs" / mine["id"]).exists()
+    assert set(p.name for p in (home / "runs").iterdir()) == runs_before | {peer["id"]}
+    assert snapshot_tree(home / "runs" / peer["id"]) == peer["tree"]
+    assert (home / "current_run").read_bytes() == peer["pointer"]
+    assert snapshot_tree(home / "runs" / rid) == parent_before
