@@ -8,7 +8,10 @@ import subprocess
 import sys
 import time
 
+import pytest
+
 from dsh_wewrite_facade import runner
+from conftest import facade_env
 
 
 def test_terminate_kill_when_term_ignored(tmp_path):
@@ -68,3 +71,31 @@ def test_timeout_tiers(tmp_path):
     assert runner.timeout_for("draft.prepare") == 120
     assert runner.timeout_for("run.detail") == 30
     assert runner.timeout_for("draft.status") == 30
+
+
+def test_diagnose_output_limit_is_distinct_and_reaped(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", facade_env(str(tmp_path))["PYTHONPATH"])
+    normal = runner.run_facade(home=str(tmp_path), operation="diagnose", payload={}, request_id="normal")
+    assert normal.response["ok"] is True
+    assert normal.issue is None
+    assert normal.response["data"]["counters"] == {"wechatApiCalls": 0, "remoteFetchCalls": 0}
+
+    children = []
+    popen = subprocess.Popen
+
+    def track_child(*args, **kwargs):
+        proc = popen(*args, **kwargs)
+        children.append(proc)
+        return proc
+
+    monkeypatch.setattr(runner.subprocess, "Popen", track_child)
+    monkeypatch.setattr(runner, "MAX_OUTPUT_BYTES", 1)
+    result = runner.run_facade(home=str(tmp_path), operation="diagnose", payload={}, request_id="limited")
+    assert result.issue == {"code": "OUTPUT_TOO_LARGE", "message": "子进程输出超限", "blocking": True}
+    assert result.timed_out is False
+    assert result.timed_out_after_send is False
+    assert result.returncode is not None
+    assert len(children) == 1
+    assert children[0].returncode == result.returncode
+    with pytest.raises(ProcessLookupError):
+        os.kill(children[0].pid, 0)

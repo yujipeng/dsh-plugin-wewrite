@@ -76,11 +76,11 @@ def read_state(run_id: str) -> tuple[dict, list[str]]:
         if exc.code == "NOT_FOUND":
             raise not_found("run 状态不存在") from exc
         raise
-    with os.fdopen(fd, "r", encoding="utf-8") as f:
-        raw = f.read()
     try:
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            raw = f.read()
         parsed = yaml.safe_load(raw)
-    except yaml.YAMLError:
+    except (UnicodeDecodeError, yaml.YAMLError):
         return _empty_state(run_id), ["STATE_CORRUPTED"]
     if not isinstance(parsed, dict):
         return _empty_state(run_id), ["STATE_CORRUPTED"]
@@ -126,7 +126,7 @@ def _empty_state(run_id: str) -> dict:
         "run_id": run_id,
         "created": "",
         "updated": "",
-        "status": "active",
+        "status": "unreadable",
         "mode": "draft",
         "permissions": {},
         "visual": {},
@@ -193,6 +193,19 @@ def read_artifact_content(run_id: str, kind: str) -> tuple[str, str | None]:
 
 
 def run_summary(state: dict, run_id: str) -> dict[str, Any]:
+    if state.get("status") == "unreadable":
+        # 保留可识别的失败条目，使用现有 RunSummarySchema；不捏造正常写作状态。
+        fd, st = paths.open_state(run_id)
+        os.close(fd)
+        return {
+            "runId": run_id,
+            "title": "状态不可读",
+            "mode": "draft",  # schema 必填占位，不表示已恢复业务状态。
+            "pythonStatus": "unreadable",
+            "phase": "failed",
+            "updated": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(),
+            "editable": False,
+        }
     topic = _as_dict(state.get("topic"))
     title = _as_str(topic.get("title")) or _as_str(state.get("seo", {}).get("title") if isinstance(state.get("seo"), dict) else "")
     phase = _normalize_phase(state.get("status"))
@@ -209,7 +222,7 @@ def run_summary(state: dict, run_id: str) -> dict[str, Any]:
 
 def _editable(state: dict) -> bool:
     status = state.get("status")
-    return status != "completed"
+    return status not in ("completed", "unreadable")
 
 
 def build_gate(state: dict, run_id: str) -> dict[str, Any] | None:
@@ -242,15 +255,25 @@ def build_gate(state: dict, run_id: str) -> dict[str, Any] | None:
     article_version = None
     try:
         fd2, _st2 = paths.open_artifact(run_id, "article")
-    except FacadeError:
-        pass
+    except FacadeError as exc:
+        if exc.code != "NOT_FOUND":
+            raise
+        # GateSchema.articleVersion 必须是真实哈希；无正文时返回业务失败，禁止伪造。
+        raise FacadeError("ARTIFACT_MISSING", "缺少正文，无法验证审稿绑定") from exc
     else:
         with os.fdopen(fd2, "rb") as f2:
             article_version = _sha256(f2.read())
 
     # 审稿绑定的正文哈希（report.article_hash 或 report.articleVersion）。
-    bound_hash = report.get("article_hash") or report.get("articleVersion")
-    if bound_hash is not None and article_version is not None and bound_hash != article_version:
+    bound_hash = report.get("article_hash", report.get("articleVersion"))
+    if not isinstance(bound_hash, str) or len(bound_hash) != 64 or any(c not in "0123456789abcdef" for c in bound_hash):
+        return {
+            "publishable": False,
+            "issues": [{"code": "REVIEW_BINDING_MISSING", "message": "审稿缺少有效正文绑定，需要重新审稿", "blocking": True}],
+            "articleVersion": article_version,
+            "reportVersion": report_version,
+        }
+    if bound_hash != article_version:
         # 正文已更新、旧审稿未删：审稿失效，不展示 pass。
         return {
             "publishable": False,
@@ -261,7 +284,7 @@ def build_gate(state: dict, run_id: str) -> dict[str, Any] | None:
             "reportVersion": report_version,
         }
 
-    publishable = bool(report.get("publishable"))
+    publishable = report.get("publishable") is True
     issues = [
         {"code": "REVIEW_REQUIRED", "message": "需要先完成审稿", "blocking": True}
         if not publishable
@@ -270,7 +293,7 @@ def build_gate(state: dict, run_id: str) -> dict[str, Any] | None:
     return {
         "publishable": publishable,
         "issues": issues,
-        "articleVersion": article_version or ("a" * 64),
+        "articleVersion": article_version,
         "reportVersion": report_version,
     }
 

@@ -57,6 +57,8 @@ class RunResult:
     timed_out: bool
     timed_out_after_send: bool
     returncode: int | None
+    # runner 本地诊断，形状与契约 IssueSchema 一致；不扩展业务 ErrorCode 枚举。
+    issue: dict[str, Any] | None = None
 
 
 def _default_interpreter() -> str:
@@ -202,7 +204,11 @@ def run_facade(
             total += len(chunk)
             if total > MAX_OUTPUT_BYTES:
                 _terminate(proc, proc.pid)
-                return RunResult(response=None, timed_out=False, timed_out_after_send=sent, returncode=proc.returncode)
+                return RunResult(
+                    response=None, timed_out=False, timed_out_after_send=False,
+                    returncode=proc.returncode,
+                    issue={"code": "OUTPUT_TOO_LARGE", "message": "子进程输出超限", "blocking": True},
+                )
             chunks.append(chunk)
     except subprocess.TimeoutExpired:
         _terminate(proc, proc.pid)

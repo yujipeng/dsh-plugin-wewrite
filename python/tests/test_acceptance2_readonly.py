@@ -82,22 +82,45 @@ def test_read_face_no_write_legacy(tmp_path):
     _read_then_assert_unchanged(home, run_id, before)
 
 
-def test_read_face_no_write_corrupt(tmp_path):
+@pytest.mark.parametrize("raw_state", [b":\n  - not: [valid", b"- not-a-mapping", b"\xff\xfe"])
+def test_read_face_no_write_corrupt(tmp_path, raw_state):
     home = make_home(tmp_path)
     run_id = create_run(home)
     _seed_corrupt(home, run_id)
+    run_dir = home / "runs" / run_id
+    (run_dir / "state.yaml").write_bytes(raw_state)
+    article_hash = write_article(home, run_id, "已有正文")
+    (run_dir / "review-report.json").write_text(json.dumps({
+        "publishable": True, "article_hash": article_hash,
+    }), encoding="utf-8")
     before = snapshot_tree(home)
+    dirs_before = sorted(str(p.relative_to(home)) for p in home.rglob("*") if p.is_dir())
     # 损坏 state 显示不可读而非消失；连续执行三种读，且返回「不可读」投影而非崩溃。
     resp = call_facade(str(home), "snapshot", {})
     assert resp["ok"] is True
-    # 损坏 state 不应出现在 snapshot 的 runs 里（不可读而非消失/崩溃）。
-    # run.detail 与 artifact.get 对损坏 state 返回业务失败而非崩溃（FacadeError 转中文错误）。
+    runs = [r for r in resp["data"]["runs"] if r["runId"] == run_id]
+    assert len(runs) == 1
+    summary = runs[0]
+    assert summary["title"] == "状态不可读"
+    assert summary["pythonStatus"] == "unreadable"
+    assert summary["phase"] == "failed"
+    assert summary["editable"] is False
+    assert {"code": "STATE_CORRUPTED", "message": "状态不可读", "blocking": True} in resp["data"]["diagnostics"]
     detail = call_facade(str(home), "run.detail", {"runId": run_id})
-    assert detail["ok"] is False or detail["ok"] is True
+    assert detail["ok"] is True
+    assert detail["data"]["run"] == summary
+    assert detail["data"]["lastError"]["code"] == "STATE_CORRUPTED"
+    assert detail["data"]["lastError"]["blocking"] is True
+    assert detail["data"]["steps"] == []
+    assert detail["data"]["artifacts"] == []
+    assert detail["data"]["gate"] is None
     art = call_facade(str(home), "artifact.get", {"runId": run_id, "kind": "article"})
-    assert art["ok"] is False or art["ok"] is True
+    assert art["ok"] is False
+    assert art["error"]["code"] == "INVALID_TRANSITION"
+    assert art["error"]["runId"] == run_id
     after = snapshot_tree(home)
     assert after == before
+    assert sorted(str(p.relative_to(home)) for p in home.rglob("*") if p.is_dir()) == dirs_before
 
 
 def test_get_does_not_create_lock(tmp_path):

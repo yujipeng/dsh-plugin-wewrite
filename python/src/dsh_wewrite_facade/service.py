@@ -97,7 +97,7 @@ def op_snapshot(payload: dict) -> dict[str, Any]:
             continue
         runs.append(projection.run_summary(state, run_id))
         for d in diags:
-            diagnostics.append({"code": d, "message": "状态为旧格式或需检查", "blocking": False})
+            diagnostics.append({"code": d, "message": "状态不可读" if d == "STATE_CORRUPTED" else "状态为旧格式或需检查", "blocking": d == "STATE_CORRUPTED"})
 
     runs.sort(key=lambda r: r.get("updated", ""), reverse=True)
 
@@ -142,6 +142,16 @@ def op_run_detail(payload: dict) -> dict[str, Any]:
     run_id = payload["runId"]
     storage.check_no_pending_transaction(run_id)
     state, diags = projection.read_state(run_id)
+    if "STATE_CORRUPTED" in diags:
+        return business_success({
+            "run": projection.run_summary(state, run_id),
+            "binding": None,
+            "steps": [],
+            "artifacts": [],
+            "gate": None,
+            "lastError": {"code": "STATE_CORRUPTED", "message": "状态不可读，禁止编辑", "blocking": True},
+            "push": None,
+        })
     artifacts = projection.list_artifacts(state, run_id)
     gate = projection.build_gate(state, run_id)
     return business_success({
@@ -214,13 +224,16 @@ def op_artifact_get(payload: dict) -> dict[str, Any]:
     run_id = payload["runId"]
     kind = payload["kind"]
     storage.check_no_pending_transaction(run_id)
+    state, diags = projection.read_state(run_id)
+    if "STATE_CORRUPTED" in diags:
+        raise FacadeError("INVALID_TRANSITION", "状态不可读，无法读取产物", run_id=run_id)
     content, version = projection.read_artifact_content(run_id, kind)
     return business_success({
         "runId": run_id,
         "kind": kind,
         "content": content,
         "version": version,
-        "editable": True,
+        "editable": projection.run_summary(state, run_id)["editable"],
     })
 
 
