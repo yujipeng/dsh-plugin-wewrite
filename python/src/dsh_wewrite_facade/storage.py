@@ -23,7 +23,7 @@ from typing import Any, Iterator
 import yaml
 
 from . import paths
-from .errors import FacadeError, forbidden, internal, invalid_input, not_found, version_conflict
+from .errors import FacadeError, forbidden, internal, invalid_input, not_found, state_corrupted, version_conflict
 
 _HOME_LOCK_NAME = ".dsh-workbench.lock"
 _RUN_LOCK_NAME = ".dsh-workbench.lock"
@@ -47,6 +47,38 @@ _JOURNAL_FILE = "journal.json"
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def ensure_writable_state(run_id: str) -> None:
+    """统一写面守卫：在 run_lock 内、任何写入前校验**原始** state.yaml 可读性。
+
+    直接解析 state.yaml 原始字节（不经过 projection 的合成状态），损坏即抛
+    STATE_CORRUPTED（明确业务码，前端可区分「状态不可读」与真实内部故障），
+    绝不写回合成状态、绝不覆盖损坏证据。
+    """
+    paths.validate_run_id(run_id)
+    try:
+        fd, _st = paths.open_state(run_id)
+    except FacadeError as exc:
+        if exc.code == "NOT_FOUND":
+            # 写操作遇到 state 不存在：不可读，拒绝（不给 INTERNAL）。
+            raise state_corrupted("状态不可读，禁止编辑") from exc
+        raise
+    try:
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read()
+    except OSError as exc:
+        raise state_corrupted("状态不可读，禁止编辑") from exc
+    try:
+        parsed = yaml.safe_load(raw.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise state_corrupted("状态不可读，禁止编辑") from exc
+    if not isinstance(parsed, dict):
+        raise state_corrupted("状态不可读，禁止编辑")
+    if parsed.get("run_id") != run_id:
+        raise forbidden("state 与 runId 不符")
+    if parsed.get("status") == "unreadable":
+        raise state_corrupted("状态不可读，禁止编辑")
 
 
 def _open_lock_file(path_name: str, parent: str, *, create: bool) -> int:
@@ -306,6 +338,7 @@ def article_save(
     data = markdown.encode("utf-8")
 
     with run_lock(run_id, create=True):
+        ensure_writable_state(run_id)
         try:
             fd, _st = paths.open_artifact(run_id, "article")
         except FacadeError as exc:
@@ -360,11 +393,16 @@ def _invalidate_review(run_id: str) -> None:
 
 
 def _update_state_metadata(run_id: str, metadata: dict[str, Any]) -> None:
-    """更新 state.yaml 的 editorial 元数据（标题/digest/themeId）。"""
-    # 复用上游 update_run 会触发 load_run（可能升级写盘），故此处走自己的安全读改写：
-    # 读 state.yaml → 改内存 → 写回（run 锁内）。仅改 editorial/seo 元数据字段。
+    """更新 state.yaml 的 editorial 元数据（标题/digest/themeId）。
+
+    先经写面守卫校验原始 state.yaml 可读，损坏即拒绝——绝不把 projection 的
+    合成状态写回磁盘（那是抹除损坏证据的根因）。
+    """
+    ensure_writable_state(run_id)
     from . import projection
     state, _diags = projection.read_state(run_id)
+    if "STATE_CORRUPTED" in _diags:
+        raise state_corrupted("状态不可读，禁止编辑")
     editorial = dict(state.get("editorial") or {})
     title = metadata.get("title")
     if title:
@@ -428,8 +466,9 @@ def fork_article(run_id: str, expected_version: str | None) -> dict[str, Any]:
     from wewrite.runs import create_run as _upstream_create
 
     paths.validate_run_id(run_id)
-    # 读源正文（run 锁内保证一致性快照）。
+    # 读源正文（run 锁内保证一致性快照 + 写面守卫校验源 run 可写）。
     with run_lock(run_id, create=False):
+        ensure_writable_state(run_id)
         content, version = _read_article(run_id)
         if expected_version is not None and version != expected_version:
             raise version_conflict("内容版本冲突，请刷新后重试")

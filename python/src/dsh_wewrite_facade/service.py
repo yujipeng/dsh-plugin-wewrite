@@ -183,6 +183,7 @@ def _steps_from_state(state: dict) -> list[dict[str, Any]]:
 def op_run_step(payload: dict) -> dict[str, Any]:
     run_id = payload["runId"]
     with storage.run_lock(run_id, create=False):
+        storage.ensure_writable_state(run_id)
         _mark_step(run_id, payload["step"], payload["status"], payload.get("error"))
     return business_success({
         "runId": run_id,
@@ -203,6 +204,7 @@ def _mark_step(run_id: str, step: str, status: str, error: str | None) -> None:
 def op_run_finish(payload: dict) -> dict[str, Any]:
     run_id = payload["runId"]
     with storage.run_lock(run_id, create=False):
+        storage.ensure_writable_state(run_id)
         from wewrite.runs import finish_run as _upstream
         try:
             state = _upstream(run_id=run_id)
@@ -243,6 +245,7 @@ def op_artifact_write(payload: dict) -> dict[str, Any]:
     content = payload["content"]
     expected = payload["expectedVersion"]
     with storage.run_lock(run_id, create=False):
+        storage.ensure_writable_state(run_id)
         current = _current_version(run_id, kind)
         if current != expected:
             from .errors import version_conflict
@@ -324,6 +327,7 @@ def op_draft_prepare(payload: dict) -> dict[str, Any]:
     # 生成 intent（内存 + 落盘到 .dsh-workbench，写面如实）。
     intent_id = uuid.uuid4().hex
     with storage.run_lock(run_id, create=False):
+        storage.ensure_writable_state(run_id)
         storage.write_run_file_rel(run_id, ".dsh-workbench/intent.json",
                                    json.dumps({"intentId": intent_id, "runId": run_id,
                                                "articleVersion": version}, ensure_ascii=False).encode("utf-8"))

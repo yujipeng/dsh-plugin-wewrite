@@ -9,6 +9,8 @@ from __future__ import annotations
 from typing import Any
 
 # 与 src/shared/constants.ts 的 ERROR_CODES 保持一致（17 项）。
+# 追加 STATE_CORRUPTED：写面守卫在状态不可读时返回的可区分业务码（不进 host 传输 error.code）。
+# 该码已在只读面作为诊断键（Issue.code/lastError.code）使用，写面沿用同一键以便前端统一识别。
 ERROR_CODES = (
     "INVALID_INPUT",
     "NOT_FOUND",
@@ -27,6 +29,7 @@ ERROR_CODES = (
     "CANCELLED",
     "PUBLISH_UNKNOWN",
     "INTERNAL",
+    "STATE_CORRUPTED",
 )
 
 ERROR_MESSAGES: dict[str, str] = {
@@ -47,12 +50,13 @@ ERROR_MESSAGES: dict[str, str] = {
     "CANCELLED": "操作已取消",
     "PUBLISH_UNKNOWN": "推送结果未知",
     "INTERNAL": "内部错误",
+    "STATE_CORRUPTED": "状态不可读，禁止编辑",
 }
 
 # 本 facade 内部使用的非业务诊断键（只进 diagnostics，不进 error.code）。
 DIAGNOSTIC_CODES = (
     "HOME_UNINITIALIZED",  # 数据根/锁设施不存在，需先 create_run 或显式写操作
-    "STATE_CORRUPTED",     # state.yaml 无法解析
+    "STATE_CORRUPTED",     # state.yaml 无法解析（读面诊断键；写面同键进入 error.code）
     "STATE_LEGACY",        # 旧格式 state（缺字段，已内存补默认）
 )
 
@@ -104,6 +108,10 @@ def version_conflict(message: str | None = None) -> FacadeError:
 
 def internal(message: str | None = None) -> FacadeError:
     return FacadeError("INTERNAL", message)
+
+
+def state_corrupted(message: str | None = None) -> FacadeError:
+    return FacadeError("STATE_CORRUPTED", message)
 
 
 def business_failure(code: str, message: str | None = None, **extra: Any) -> dict[str, Any]:

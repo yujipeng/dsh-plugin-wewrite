@@ -84,6 +84,7 @@ def put_asset(*, run_id: str, role: str, media_type: str, base64_text: str,
     filename = f"{content_hash}.{ext}"
 
     with storage.run_lock(run_id, create=False):
+        storage.ensure_writable_state(run_id)
         # 登记项写入（run 锁内原子）：relpath 为 assets/<hash>.<ext>，图片字节一并写入。
         relpath = f"{paths.ASSET_REGISTRY_DIR}/{filename}"
         storage.write_run_file_rel(run_id, relpath, data)
