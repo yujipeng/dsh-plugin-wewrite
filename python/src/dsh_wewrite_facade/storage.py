@@ -397,15 +397,30 @@ def _invalidate_review(run_id: str) -> None:
 def _update_state_metadata(run_id: str, metadata: dict[str, Any]) -> None:
     """更新 state.yaml 的 editorial 元数据（标题/digest/themeId）。
 
-    先经写面守卫校验原始 state.yaml 可读，损坏即拒绝——绝不把 projection 的
-    合成状态写回磁盘（那是抹除损坏证据的根因）。
+    写回基底必须是**磁盘上的原始 state**，而非 projection 的固定字段投影：
+    只就地补丁 editorial 与 updated，其余字段（含 parent_run_id /
+    fork_source_version / artifacts / steps / permissions / visual 及未知扩展字段）
+    原样保留。损坏即拒绝，绝不写回合成状态。
     """
     ensure_writable_state(run_id)
-    from . import projection
-    state, _diags = projection.read_state(run_id)
-    if "STATE_CORRUPTED" in _diags:
+
+    # 读磁盘原始 state.yaml 字节，就地解析（不经 projection 投影）。
+    fd, _st = paths.open_state(run_id)
+    with os.fdopen(fd, "rb") as f:
+        raw = f.read()
+    try:
+        state = yaml.safe_load(raw.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise state_corrupted("状态不可读，禁止编辑") from exc
+    if not isinstance(state, dict):
         raise state_corrupted("状态不可读，禁止编辑")
-    editorial = dict(state.get("editorial") or {})
+    if state.get("run_id") != run_id:
+        raise forbidden("state 与 runId 不符")
+
+    # 就地补丁：只改 editorial 与 updated，其余字段原样保留。
+    editorial = state.get("editorial")
+    if not isinstance(editorial, dict):
+        editorial = {}
     title = metadata.get("title")
     if title:
         editorial["title"] = title
@@ -415,6 +430,7 @@ def _update_state_metadata(run_id: str, metadata: dict[str, Any]) -> None:
     if metadata.get("themeId"):
         editorial["theme"] = metadata["themeId"]
     state["editorial"] = editorial
+    from . import projection
     state["updated"] = projection._now_rfc3339()
     write_state_yaml(run_id, yaml.safe_dump(state, allow_unicode=True, sort_keys=False))
 

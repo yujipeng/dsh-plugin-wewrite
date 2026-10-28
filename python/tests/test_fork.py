@@ -257,3 +257,49 @@ def test_fork_receipt_after_state_keeps_peer(tmp_path, monkeypatch):
     assert snapshot_tree(home / "runs" / peer["id"]) == peer["tree"]
     assert (home / "current_run").read_bytes() == peer["pointer"]
     assert snapshot_tree(home / "runs" / rid) == parent_before
+
+
+# ── 第 8 轮：article.save 不得抹掉派生链字段与未知扩展字段 ─────────────────
+
+def test_fork_save_preserves_provenance_and_unknown_fields(tmp_path):
+    """fork → article.save → 重读 state：parent_run_id / fork_source_version 保留，
+    未知扩展字段保留，源 run 整树 sha256 不变。"""
+    home = make_home(tmp_path)
+    run_id, ver = _seed_healthy(home)
+    parent_before = snapshot_tree(home / "runs" / run_id)
+
+    resp = call_facade(str(home), "run.fork", {
+        "requestId": "f1", "runId": run_id, "expectedVersion": ver,
+    })
+    assert resp["ok"] is True, resp
+    new_run_id = resp["data"]["runId"]
+    assert resp["data"]["parentRunId"] == run_id
+
+    new_run_dir = home / "runs" / new_run_id
+
+    # 在磁盘 state 里写入一个投影外的未知扩展字段，验证保存后仍在。
+    state_path = new_run_dir / "state.yaml"
+    state = yaml.safe_load(state_path.read_text(encoding="utf-8"))
+    state["x_custom_extension"] = {"keep": "me", "nested": [1, 2, 3]}
+    state_path.write_text(yaml.safe_dump(state, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    # 用正确版本调用 article.save（走 _update_state_metadata 就地补丁路径）。
+    save = call_facade(str(home), "article.save", {
+        "requestId": "s1",
+        "runId": new_run_id,
+        "markdown": "派生后正文",
+        "expectedVersion": ver,
+        "metadata": {"title": "派生标题", "digest": "派生摘要", "themeId": "professional-clean"},
+    })
+    assert save["ok"] is True, save
+
+    # 重读 state：派生字段保留、未知扩展字段保留、editorial 已补丁。
+    reloaded = yaml.safe_load(state_path.read_text(encoding="utf-8"))
+    assert reloaded.get("parent_run_id") == run_id
+    assert reloaded.get("fork_source_version") == ver
+    assert reloaded.get("x_custom_extension") == {"keep": "me", "nested": [1, 2, 3]}
+    assert reloaded.get("editorial", {}).get("title") == "派生标题"
+    assert reloaded.get("editorial", {}).get("digest") == "派生摘要"
+
+    # 源 run 整树 sha256 不变。
+    assert snapshot_tree(home / "runs" / run_id) == parent_before
