@@ -7,10 +7,11 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from .errors import FacadeError, invalid_input, not_found
-from . import projection
+from . import projection, storage
 
 
 def build_review(*, run_id: str, article_version: str | None, draft_version: str | None,
@@ -45,18 +46,25 @@ def build_review(*, run_id: str, article_version: str | None, draft_version: str
     report["draft_hash"] = draft_actual
     report["assessment_source"] = "facade"
 
+    # 落盘审稿报告（写面，显式写操作）：review-report.json 绑定 article_hash。
+    with storage.run_lock(run_id, create=False):
+        report["article_hash"] = article_actual
+        storage.write_run_file(run_id, "review-report.json",
+                               json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"))
+    report_version = storage.sha256_hex(json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"))
+
     gate = {
         "publishable": bool(report.get("publishable")),
         "issues": [] if report.get("publishable") else [
             {"code": "REVIEW_REQUIRED", "message": "需要先完成审稿", "blocking": True}
         ],
         "articleVersion": article_actual,
-        "reportVersion": None,
+        "reportVersion": report_version,
     }
     return {
         "runId": run_id,
         "report": report,
-        "reportVersion": None,
+        "reportVersion": report_version,
         "gate": gate,
     }
 

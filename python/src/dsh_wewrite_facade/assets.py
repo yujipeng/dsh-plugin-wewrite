@@ -103,8 +103,8 @@ def put_asset(*, run_id: str, role: str, media_type: str, base64_text: str,
             "relpath": f"{paths.ASSET_REGISTRY_DIR}/{filename}",
         })
         registry["assets"] = assets
-        storage.write_run_file(run_id, f"{paths.ASSET_REGISTRY_DIR}/{paths.ASSET_REGISTRY_FILE}",
-                               json.dumps(registry, ensure_ascii=False, indent=2).encode("utf-8"))
+        storage.write_run_file_rel(run_id, f"{paths.ASSET_REGISTRY_DIR}/{paths.ASSET_REGISTRY_FILE}",
+                                   json.dumps(registry, ensure_ascii=False, indent=2).encode("utf-8"))
 
     return {"assetId": asset_id, "contentHash": content_hash, "bytes": len(data)}
 

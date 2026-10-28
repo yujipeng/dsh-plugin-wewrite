@@ -1,8 +1,9 @@
-"""验收 7：子进程超时与回收——模拟挂死，断言 TERM→KILL 且只回收确切 PID，无遗留子进程。"""
+"""验收 7：子进程超时与回收——TERM 无效 → KILL 生效；run_facade() 真实超时链路。"""
 
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -10,27 +11,17 @@ import time
 from dsh_wewrite_facade import runner
 
 
-def _spawn_hang_interpreter_script(tmp_path, delay):
-    """造一个会挂起的假解释器脚本（作为 python -m 的替代）。"""
-    script = tmp_path / "hang.py"
-    script.write_text(
-        "import time, sys\n"
-        f"time.sleep({delay})\n"
-        "print('{}')\n"
-    , encoding="utf-8")
-    return str(script)
-
-
-def test_timeout_terminates_exact_pid(tmp_path):
-    # 用真 python -m 挂起不易注入；直接调用 runner 的 _terminate 路径：
-    # 起一个 sleep 子进程，断言 TERM 后 KILL 且只回收该 pid。
-    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+def test_terminate_kill_when_term_ignored(tmp_path):
+    """TERM 被忽略时，KILL 必须生效并回收子进程。"""
+    # 子进程忽略 SIGTERM，只有 SIGKILL 能终止。
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"]
+    )
     pid = proc.pid
-    runner._terminate(proc, pid)
-    # 子进程应已被回收。
-    assert proc.poll() is not None
-    # 该 pid 不再存在。
-    import errno
+    rc = runner._terminate(proc, pid)
+    assert proc.poll() is not None, "子进程未回收"
+    assert rc is not None, "应返回 returncode"
     try:
         os.kill(pid, 0)
         alive = True
@@ -39,21 +30,39 @@ def test_timeout_terminates_exact_pid(tmp_path):
     assert not alive, "子进程未回收"
 
 
-def test_timeout_returns_timed_out_flag(tmp_path):
-    # 挂起的 facade：用一个能挂起的自定义 interpreter（真实 wewrite 环境里不便挂起，
-    # 这里验证 runner 的超时分类逻辑）。
-    class _FakePopen:
-        def __init__(self):
-            self.pid = 999999
-            self.returncode = None
+def test_terminate_wait_when_already_exited(tmp_path):
+    """poll() 已退出的分支也要 wait() 回收。"""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    pid = proc.pid
+    rc = runner._terminate(proc, pid)
+    assert rc == 0
+    assert proc.returncode == 0
 
-        def poll(self):
-            return None
 
-        def wait(self, timeout=None):
-            return 0
+def test_run_facade_real_timeout(tmp_path, monkeypatch):
+    """run_facade() 真实超时链路：挂起子进程，返回 timed_out。"""
+    # 造一个挂起的 dsh_wewrite_facade 模块，放在 PYTHONPATH 最前。
+    fake_pkg = tmp_path / "fakepkg" / "dsh_wewrite_facade"
+    fake_pkg.mkdir(parents=True)
+    (fake_pkg / "__init__.py").write_text("", encoding="utf-8")
+    (fake_pkg / "__main__.py").write_text(
+        "import time\ntime.sleep(30)\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "fakepkg"))
 
-    # 直接验证 timeout_for 档位。
+    result = runner.run_facade(
+        home=str(tmp_path),
+        operation="run.detail",
+        payload={"runId": "20261028-120000-abcdef"},
+        request_id="r",
+        timeout=1,
+    )
+    assert result.timed_out is True
+    assert result.response is None
+
+
+def test_timeout_tiers(tmp_path):
     assert runner.timeout_for("hotspots.fetch") == 60
     assert runner.timeout_for("draft.send") == 120
     assert runner.timeout_for("draft.prepare") == 120

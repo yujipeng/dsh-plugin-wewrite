@@ -16,6 +16,7 @@ import os
 import secrets
 import stat
 import tempfile
+import threading
 from contextlib import contextmanager
 from typing import Any, Iterator
 
@@ -26,6 +27,18 @@ from .errors import FacadeError, forbidden, internal, invalid_input, not_found, 
 
 _HOME_LOCK_NAME = ".dsh-workbench.lock"
 _RUN_LOCK_NAME = ".dsh-workbench.lock"
+
+# 锁顺序记账（线程内）：固定顺序 home → run；run → home 反序在获取 home 前被拒绝。
+# 每个 facade 子进程单请求单响应，跨进程不出现同一线程同时持两把锁的 run→home 反序。
+_lock_ctx = threading.local()
+
+
+def _lock_stack() -> list[str]:
+    stack = getattr(_lock_ctx, "stack", None)
+    if stack is None:
+        stack = []
+        _lock_ctx.stack = stack
+    return stack
 
 # journal 目录（插件增量，放在 run 根内）
 _JOURNAL_DIR = ".dsh-workbench"
@@ -50,7 +63,14 @@ def _open_lock_file(path_name: str, parent: str, *, create: bool) -> int:
 
 @contextmanager
 def home_lock(*, create: bool) -> Iterator[None]:
-    """home 全局写锁（仅创建/历史/共享索引）。读面 create=False 不建锁文件。"""
+    """home 全局写锁（仅创建/历史/共享索引）。读面 create=False 不建锁文件。
+
+    锁顺序：home 必须最先获取（栈为空时才能取 home），拒绝 run→home 反序。
+    """
+    stack = _lock_stack()
+    if "run" in stack:
+        # 反序获取：先持 run 再取 home，违反固定顺序。
+        raise forbidden("锁顺序违规：不能先持 run 锁再取全局锁")
     root = paths.home()
     if create:
         # 写路径允许预建数据根（create_run 的副作用清单含 home 目录）。
@@ -63,7 +83,11 @@ def home_lock(*, create: bool) -> Iterator[None]:
         raise forbidden(f"全局锁不可用（{paths._os_reason(exc)}）") from exc
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        stack.append("home")
+        try:
+            yield
+        finally:
+            stack.pop()
     finally:
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -73,7 +97,11 @@ def home_lock(*, create: bool) -> Iterator[None]:
 
 @contextmanager
 def run_lock(run_id: str, *, create: bool) -> Iterator[None]:
-    """run 锁（普通 run 文件修改）。读面 create=False 不建锁文件。"""
+    """run 锁（普通 run 文件修改）。读面 create=False 不建锁文件。
+
+    锁顺序：run 锁可在 home 锁之后获取（home 栈顶），也可独立获取；一旦先持 run
+    再请求 home 会被 home_lock 拒绝。
+    """
     paths.validate_run_id(run_id)
     run_fd, _exists = paths._open_run_dir_fd(run_id, create=False)
     try:
@@ -86,7 +114,12 @@ def run_lock(run_id: str, *, create: bool) -> Iterator[None]:
         os.close(run_fd)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        stack = _lock_stack()
+        stack.append("run")
+        try:
+            yield
+        finally:
+            stack.pop()
     finally:
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -122,6 +155,19 @@ def _open_run_file_for_write(run_id: str, filename: str) -> int:
     return run_fd
 
 
+def ensure_run_lock_file(run_id: str) -> None:
+    """首次显式写操作预建 run 锁文件（create_run 后调用，使后续 create=False 写操作可用）。"""
+    paths.validate_run_id(run_id)
+    run_fd, _exists = paths._open_run_dir_fd(run_id, create=False)
+    try:
+        fd = os.open(_RUN_LOCK_NAME, os.O_RDWR | os.O_CREAT | paths._O_NOFOLLOW, 0o600, dir_fd=run_fd)
+    except OSError as exc:
+        raise forbidden(f"run 锁不可用（{paths._os_reason(exc)}）") from exc
+    finally:
+        os.close(run_fd)
+    os.close(fd)
+
+
 def write_run_file(run_id: str, filename: str, data: bytes) -> None:
     """原子写 runs/<run_id>/<filename>（调用方须已持 run 锁）。"""
     if not filename or filename.startswith(".") or "/" in filename or "\\" in filename or filename == "state.yaml":
@@ -134,17 +180,29 @@ def write_run_file(run_id: str, filename: str, data: bytes) -> None:
 
 
 def write_run_file_rel(run_id: str, relpath: str, data: bytes) -> None:
-    """原子写 runs/<run_id>/<relpath>（调用方须已持 run 锁）。中间目录段缺失时创建。"""
+    """原子写 runs/<run_id>/<relpath>（调用方须已持 run 锁）。中间目录段缺失时创建。
+
+    逐级 O_NOFOLLOW 打开，任一段是 symlink/非目录拒绝；仅 ENOENT 时创建目录。
+    """
     segs = paths.safe_relative_segments(relpath)
     run_fd = _open_run_file_for_write(run_id, relpath)
+    cur_fd = run_fd
+    cur_is_run = True
     try:
-        cur_fd = run_fd
-        cur_is_run = True
         for segment in segs[:-1]:
             try:
                 nxt = paths._open_dir_at(cur_fd, segment, "dir")
-            except FacadeError:
-                os.mkdir(segment, dir_fd=cur_fd)
+            except FacadeError as exc:
+                if exc.code != "FORBIDDEN":
+                    raise
+                # 仅缺失（enoent）才创建目录；symlink/非目录等 O_NOFOLLOW 拒绝后仍会拒绝。
+                try:
+                    os.mkdir(segment, dir_fd=cur_fd)
+                except FileExistsError:
+                    # 已存在但打开失败（如 symlink）：重开仍会 O_NOFOLLOW 拒绝。
+                    pass
+                except OSError as e:
+                    raise forbidden(f"目录创建失败（{paths._os_reason(e)}）") from e
                 nxt = paths._open_dir_at(cur_fd, segment, "dir")
             if not cur_is_run:
                 os.close(cur_fd)
@@ -166,13 +224,18 @@ def write_state_yaml(run_id: str, text: str) -> None:
         os.close(run_fd)
 
 
-def _journal_path(run_id: str) -> tuple[int, str]:
-    """打开（或创建）journal 所在目录 .dsh-workbench，返回 (dir_fd, journal_filename)。"""
+def _journal_path(run_id: str, *, create: bool) -> tuple[int, str]:
+    """打开（或创建）journal 所在目录 .dsh-workbench，返回 (dir_fd, journal_filename)。
+
+    create=False（读面）绝不创建目录/文件。
+    """
     run_fd, _exists = paths._open_run_dir_fd(run_id, create=False)
     try:
         try:
             jd_fd = paths._open_dir_at(run_fd, _JOURNAL_DIR, "journal")
-        except FacadeError:
+        except FacadeError as exc:
+            if not create:
+                raise
             os.mkdir(_JOURNAL_DIR, dir_fd=run_fd)
             jd_fd = paths._open_dir_at(run_fd, _JOURNAL_DIR, "journal")
     finally:
@@ -181,9 +244,12 @@ def _journal_path(run_id: str) -> tuple[int, str]:
 
 
 def read_journal(run_id: str) -> dict[str, Any]:
-    """读 journal；不存在返回空。半提交事务由调用方判定为冲突。"""
+    """读 journal；不存在返回空。半提交事务由调用方判定为冲突。
+
+    读面绝不创建 .dsh-workbench 目录或锁文件。
+    """
     try:
-        jd_fd, jname = _journal_path(run_id)
+        jd_fd, jname = _journal_path(run_id, create=False)
     except FacadeError:
         return {}
     try:
@@ -191,10 +257,8 @@ def read_journal(run_id: str) -> dict[str, Any]:
             fd = os.open(jname, os.O_RDONLY | paths._O_NOFOLLOW, dir_fd=jd_fd)
         except OSError:
             return {}
-        try:
-            raw = os.fdopen(fd, "rb").read()
-        finally:
-            pass
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read()
     finally:
         os.close(jd_fd)
     try:
@@ -205,7 +269,7 @@ def read_journal(run_id: str) -> dict[str, Any]:
 
 
 def write_journal(run_id: str, data: dict[str, Any]) -> None:
-    jd_fd, jname = _journal_path(run_id)
+    jd_fd, jname = _journal_path(run_id, create=True)
     try:
         _write_file_atomically(jd_fd, jname, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
     finally:
@@ -335,6 +399,9 @@ def create_run(*, topic: str, mode: str, visual_mode: str, theme_id: str, reques
     run_id = state.get("run_id")
     if not run_id:
         raise internal("创建 run 失败")
+    # 首次显式写操作预建 run 锁文件，使后续 draft.prepare/asset.put 等写操作
+    # 能以 create=False 取得 run 锁（读面仍不创建锁设施）。
+    ensure_run_lock_file(run_id)
     return {"runId": run_id, "phase": "created"}
 
 

@@ -70,13 +70,15 @@ def write_article(home: Path, run_id: str, content: str) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def snapshot_tree(home: Path) -> dict[str, tuple[int, int]]:
-    """返回 (relpath -> (size, mtime_ns)) 的完整目录清单（不含自身锁文件外的增量）。"""
+def snapshot_tree(home: Path) -> dict[str, tuple[str, int, int]]:
+    """返回 (relpath -> (sha256, size, mtime_ns)) 的完整目录清单，字节用哈希比对。"""
+    import hashlib
     result = {}
     for root, dirs, files in os.walk(home):
         for name in files:
             p = Path(root) / name
             rel = str(p.relative_to(home))
             st = p.stat()
-            result[rel] = (st.st_size, st.st_mtime_ns)
+            digest = hashlib.sha256(p.read_bytes()).hexdigest()
+            result[rel] = (digest, st.st_size, st.st_mtime_ns)
     return result

@@ -213,7 +213,14 @@ def _editable(state: dict) -> bool:
 
 
 def build_gate(state: dict, run_id: str) -> dict[str, Any] | None:
-    """从 state 与 review_report 投影 Gate；未审稿返回 None。"""
+    """从 state 与 review_report 投影 Gate；未审稿或审稿失效返回 None。
+
+    除审稿文件的 publishable 外，还必须核对审稿绑定的正文哈希与当前正文哈希一致，
+    不一致即不展示 pass（正文已更新、旧审稿未删、journal 未提交 → 不返回 pass）。
+    """
+    from . import storage
+    storage.check_no_pending_transaction(run_id)
+
     report_version = None
     try:
         fd, _st = paths.open_artifact(run_id, "review_report")
@@ -230,6 +237,8 @@ def build_gate(state: dict, run_id: str) -> dict[str, Any] | None:
         return None
     if not isinstance(report, dict):
         return None
+
+    # 当前正文哈希。
     article_version = None
     try:
         fd2, _st2 = paths.open_artifact(run_id, "article")
@@ -238,6 +247,20 @@ def build_gate(state: dict, run_id: str) -> dict[str, Any] | None:
     else:
         with os.fdopen(fd2, "rb") as f2:
             article_version = _sha256(f2.read())
+
+    # 审稿绑定的正文哈希（report.article_hash 或 report.articleVersion）。
+    bound_hash = report.get("article_hash") or report.get("articleVersion")
+    if bound_hash is not None and article_version is not None and bound_hash != article_version:
+        # 正文已更新、旧审稿未删：审稿失效，不展示 pass。
+        return {
+            "publishable": False,
+            "issues": [
+                {"code": "REVIEW_REQUIRED", "message": "正文已更新，需要重新审稿", "blocking": True}
+            ],
+            "articleVersion": article_version,
+            "reportVersion": report_version,
+        }
+
     publishable = bool(report.get("publishable"))
     issues = [
         {"code": "REVIEW_REQUIRED", "message": "需要先完成审稿", "blocking": True}

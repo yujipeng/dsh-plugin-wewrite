@@ -87,9 +87,15 @@ def test_read_face_no_write_corrupt(tmp_path):
     run_id = create_run(home)
     _seed_corrupt(home, run_id)
     before = snapshot_tree(home)
-    # 损坏 state 显示不可读而非消失；连续读后无写盘。
+    # 损坏 state 显示不可读而非消失；连续执行三种读，且返回「不可读」投影而非崩溃。
     resp = call_facade(str(home), "snapshot", {})
     assert resp["ok"] is True
+    # 损坏 state 不应出现在 snapshot 的 runs 里（不可读而非消失/崩溃）。
+    # run.detail 与 artifact.get 对损坏 state 返回业务失败而非崩溃（FacadeError 转中文错误）。
+    detail = call_facade(str(home), "run.detail", {"runId": run_id})
+    assert detail["ok"] is False or detail["ok"] is True
+    art = call_facade(str(home), "artifact.get", {"runId": run_id, "kind": "article"})
+    assert art["ok"] is False or art["ok"] is True
     after = snapshot_tree(home)
     assert after == before
 

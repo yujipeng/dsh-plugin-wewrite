@@ -91,6 +91,7 @@ def op_snapshot(payload: dict) -> dict[str, Any]:
     runs = []
     for run_id in paths.list_run_ids():
         try:
+            storage.check_no_pending_transaction(run_id)
             state, diags = projection.read_state(run_id)
         except FacadeError:
             continue
@@ -139,6 +140,7 @@ def op_run_create(payload: dict) -> dict[str, Any]:
 
 def op_run_detail(payload: dict) -> dict[str, Any]:
     run_id = payload["runId"]
+    storage.check_no_pending_transaction(run_id)
     state, diags = projection.read_state(run_id)
     artifacts = projection.list_artifacts(state, run_id)
     gate = projection.build_gate(state, run_id)
@@ -211,6 +213,7 @@ def op_run_fork(payload: dict) -> dict[str, Any]:
 def op_artifact_get(payload: dict) -> dict[str, Any]:
     run_id = payload["runId"]
     kind = payload["kind"]
+    storage.check_no_pending_transaction(run_id)
     content, version = projection.read_artifact_content(run_id, kind)
     return business_success({
         "runId": run_id,
@@ -308,9 +311,9 @@ def op_draft_prepare(payload: dict) -> dict[str, Any]:
     # 生成 intent（内存 + 落盘到 .dsh-workbench，写面如实）。
     intent_id = uuid.uuid4().hex
     with storage.run_lock(run_id, create=False):
-        storage.write_run_file(run_id, ".dsh-workbench/intent.json",
-                               json.dumps({"intentId": intent_id, "runId": run_id,
-                                           "articleVersion": version}, ensure_ascii=False).encode("utf-8"))
+        storage.write_run_file_rel(run_id, ".dsh-workbench/intent.json",
+                                   json.dumps({"intentId": intent_id, "runId": run_id,
+                                               "articleVersion": version}, ensure_ascii=False).encode("utf-8"))
     summary = {
         "runId": run_id,
         "title": "",
