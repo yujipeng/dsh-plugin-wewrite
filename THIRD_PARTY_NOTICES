@@ -1,0 +1,20 @@
+# THIRD_PARTY_NOTICES
+
+本仓库（dsh-plugin-wewrite）是一个 DSH（DeepSeek Harness）插件，自身以 MIT License 分发。
+下述第三方来源在本仓库的设计与后续实现中被参考或复用，特此声明。
+
+## WeWrite
+
+- 来源仓库：https://github.com/yujipeng/wewrite
+- 锁定修订：`220db1dcf141d92c03ddb704628a774ecd2b79f7`
+- 版本：4.2.1
+- 许可：MIT License（与上游仓库保持一致）
+- 用途：本插件的设计以该仓库为业务真源。当前 S1 阶段仅记录来源契约（runId 形态、状态/产物、错误码等），
+  后续 stage 的 Python facade 将以独立包名 `dsh_wewrite_facade` 复用其公开方法，不修改上游、不放残缺遮蔽包。
+
+## jerryjiao/dsh-wewrite（参考实现）
+
+- 来源仓库：https://github.com/jerryjiao/dsh-wewrite
+- 许可：MIT License
+- 用途：仅作 DSH 插件工程形态（package.json、cordis.patch.yml、host/client 装配、RPC 信封）的参考范本，
+  其独立 TypeScript 管线与存储不复制。

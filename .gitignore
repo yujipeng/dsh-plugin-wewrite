@@ -1,0 +1,14 @@
+# 依赖
+node_modules/
+
+# 构建产物（发布时由 prepublishOnly / 构建脚本生成）
+lib/
+
+# 测试覆盖率
+coverage/
+
+# 日志
+*.log
+
+# macOS
+.DS_Store
