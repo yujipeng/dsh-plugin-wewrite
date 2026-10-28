@@ -461,8 +461,117 @@ def create_run_side_effects() -> list[str]:
     ]
 
 
+def _read_article(run_id: str) -> tuple[str, str]:
+    fd, _st = paths.open_artifact(run_id, "article")
+    data = os.fdopen(fd, "rb").read()
+    return data.decode("utf-8"), sha256_hex(data)
+
+
+def _current_run_bytes() -> bytes | None:
+    """读取 current_run 指针原始字节；不存在返回 None。"""
+    root_fd = paths._open_root()
+    try:
+        try:
+            fd = os.open("current_run", os.O_RDONLY | paths._O_NOFOLLOW, dir_fd=root_fd)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd, "rb") as f:
+            return f.read()
+    finally:
+        os.close(root_fd)
+
+
+def _restore_current_run(content: bytes | None) -> None:
+    """恢复 current_run 指针内容（fork 失败回滚用）。"""
+    root_fd = paths._open_root()
+    try:
+        if content is None:
+            try:
+                os.unlink("current_run", dir_fd=root_fd)
+            except FileNotFoundError:
+                pass
+        else:
+            _write_file_atomically(root_fd, "current_run", content)
+    finally:
+        os.close(root_fd)
+
+
+def _remove_run_dir(run_id: str) -> None:
+    """回滚用：删除刚创建的 run 目录（仅限 fork 失败回滚）。
+
+    只删除本 facade/上游 create_run 会写入的已知文件，不递归删除任意内容。
+    """
+    paths.validate_run_id(run_id)
+    root_fd = paths._open_root()
+    try:
+        try:
+            runs_fd = paths._open_dir_at(root_fd, "runs", "runs")
+        except FacadeError:
+            return
+        try:
+            try:
+                run_fd = paths._open_dir_at(runs_fd, run_id, "run")
+            except FacadeError:
+                return
+            try:
+                for name in (".dsh-workbench.lock", "article.md", "state.yaml",
+                             "sources.yaml", "review-report.json"):
+                    try:
+                        os.unlink(name, dir_fd=run_fd)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+                # 删除 .dsh-workbench 子目录（journal/intent）。
+                try:
+                    jd_fd = paths._open_dir_at(run_fd, _JOURNAL_DIR, "journal")
+                except FacadeError:
+                    pass
+                else:
+                    try:
+                        for name in ("journal.json", "intent.json"):
+                            try:
+                                os.unlink(name, dir_fd=jd_fd)
+                            except FileNotFoundError:
+                                pass
+                            except OSError:
+                                pass
+                    finally:
+                        os.close(jd_fd)
+                    try:
+                        os.rmdir(_JOURNAL_DIR, dir_fd=run_fd)
+                    except OSError:
+                        pass
+            finally:
+                os.close(run_fd)
+            try:
+                os.rmdir(run_id, dir_fd=runs_fd)
+            except OSError:
+                pass
+        finally:
+            os.close(runs_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _rollback_fork(new_run_id: str | None, runs_before: set[str], current_ptr_before: bytes | None) -> None:
+    """fork 失败回滚：删除新建空壳 run 目录，恢复 current_run 指针。"""
+    try:
+        if new_run_id is not None:
+            _remove_run_dir(new_run_id)
+        else:
+            for rid in set(paths.list_run_ids()) - runs_before:
+                _remove_run_dir(rid)
+    finally:
+        _restore_current_run(current_ptr_before)
+
+
 def fork_article(run_id: str, expected_version: str | None) -> dict[str, Any]:
-    """article/fork：复制源 run 正文到新 run。源 run 原文字节不变，parentRunId 可回溯。"""
+    """article/fork：复制源 run 正文到新 run。源 run 原文字节不变，parentRunId 可回溯。
+
+    - 新 run 建好后立即预建 run 锁文件（ensure_run_lock_file），后续 run_lock(create=False) 可用。
+    - 任何失败路径回滚：删除新建空壳 run 目录、恢复 current_run 指针逐字节不变。
+    """
     from wewrite.runs import create_run as _upstream_create
 
     paths.validate_run_id(run_id)
@@ -472,26 +581,34 @@ def fork_article(run_id: str, expected_version: str | None) -> dict[str, Any]:
         content, version = _read_article(run_id)
         if expected_version is not None and version != expected_version:
             raise version_conflict("内容版本冲突，请刷新后重试")
-    # 创建新 run，并把源正文写入新 run（记录 parentRunId）。
-    with home_lock(create=True):
-        state = _upstream_create(topic="", mode="draft", visual_mode="none",
-                                 max_images=4, max_image_cost=None, allow_publish=False)
-    new_run_id = state.get("run_id")
-    if not new_run_id:
-        raise internal("创建 run 失败")
-    with run_lock(new_run_id, create=False):
-        write_run_file(new_run_id, "article.md", content.encode("utf-8"))
-        # 记录 parent 关系到 state.yaml
-        from . import projection
-        new_state, _diags = projection.read_state(new_run_id)
-        new_state["parent_run_id"] = run_id
-        new_state["fork_source_version"] = version
-        new_state["updated"] = projection._now_rfc3339()
-        write_state_yaml(new_run_id, yaml.safe_dump(new_state, allow_unicode=True, sort_keys=False))
+
+    runs_before = set(paths.list_run_ids())
+    current_ptr_before = _current_run_bytes()
+
+    new_run_id: str | None = None
+    try:
+        # 创建新 run（写面，持 home 全局锁）。
+        with home_lock(create=True):
+            state = _upstream_create(topic="", mode="draft", visual_mode="none",
+                                     max_images=4, max_image_cost=None, allow_publish=False)
+        new_run_id = state.get("run_id")
+        if not new_run_id:
+            raise internal("创建 run 失败")
+
+        # 预建新 run 锁文件，使后续 run_lock(create=False) 可用（不得放宽为 create=True）。
+        ensure_run_lock_file(new_run_id)
+
+        with run_lock(new_run_id, create=False):
+            write_run_file(new_run_id, "article.md", content.encode("utf-8"))
+            # 记录 parent 关系到 state.yaml
+            from . import projection
+            new_state, _diags = projection.read_state(new_run_id)
+            new_state["parent_run_id"] = run_id
+            new_state["fork_source_version"] = version
+            new_state["updated"] = projection._now_rfc3339()
+            write_state_yaml(new_run_id, yaml.safe_dump(new_state, allow_unicode=True, sort_keys=False))
+    except BaseException:
+        _rollback_fork(new_run_id, runs_before, current_ptr_before)
+        raise
+
     return {"runId": new_run_id, "parentRunId": run_id, "version": sha256_hex(content.encode("utf-8"))}
-
-
-def _read_article(run_id: str) -> tuple[str, str]:
-    fd, _st = paths.open_artifact(run_id, "article")
-    data = os.fdopen(fd, "rb").read()
-    return data.decode("utf-8"), sha256_hex(data)
