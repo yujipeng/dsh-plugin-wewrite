@@ -7,6 +7,10 @@ settings:
 importers:
 
   .:
+    dependencies:
+      zod:
+        specifier: 3.25.76
+        version: 3.25.76
     devDependencies:
       '@deepseek-ai/cordis':
         specifier: 4.0.5
@@ -35,9 +39,6 @@ importers:
       vitest:
         specifier: ^3.2.7
         version: 3.2.7(@types/node@22.20.5)
-      zod:
-        specifier: 3.25.76
-        version: 3.25.76
 
 packages:
 
