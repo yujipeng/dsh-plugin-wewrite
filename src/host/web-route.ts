@@ -14,6 +14,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ConnectionRpcResult, RpcHandler } from './types';
+import { redactError, truncateMessage } from './redaction';
 
 export interface WebServerRoute {
   readonly kind: 'prefix';
@@ -40,6 +41,16 @@ interface ClientRequestEnvelope {
   readonly rpcId?: unknown;
   readonly method?: unknown;
   readonly payload?: unknown;
+}
+
+interface PeerPrincipal {
+  readonly principal?: { readonly kind?: unknown };
+}
+
+/** 传输错误信封：code 固定 'internal'，真实信息只进脱敏 message。 */
+function hostFailure(error: unknown): ConnectionRpcResult {
+  const message = truncateMessage(redactError(error));
+  return { ok: false, error: { code: 'internal', message, details: {} } };
 }
 
 function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -73,6 +84,11 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
+/** 中文错误信封（不抛异常，不泄漏原文）。 */
+function writeError(res: ServerResponse, status: number, message: string): void {
+  writeJson(res, status, { error: message });
+}
+
 /** 从 pathname 提取 endpoint：/wewrite-python/snapshot → snapshot。 */
 function endpointFromPath(channel: string, pathname: string): string | undefined {
   if (!pathname.startsWith(`${channel}/`)) return undefined;
@@ -102,7 +118,7 @@ export function registerWebRpcRoute(
       const endpoint = endpointFromPath(channel, url.pathname);
 
       if (endpoint === undefined) {
-        writeJson(res, 404, { error: 'not found' });
+        writeError(res, 404, '端点不存在');
         return;
       }
       if (method !== 'POST') {
@@ -116,21 +132,37 @@ export function registerWebRpcRoute(
         res.end(admission.rejection === 401 ? 'unauthorized' : 'forbidden');
         return;
       }
+      // 身份边界（§4）：只接受已认证 owner 浏览器；远端 API principal 一律 403。
+      const peer = admission.peer as PeerPrincipal | null | undefined;
+      if (!peer || peer.principal?.kind !== 'owner') {
+        res.writeHead(403);
+        res.end('forbidden');
+        return;
+      }
       if (req.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') {
-        writeJson(res, 415, { error: 'content type must be application/json' });
+        writeError(res, 415, 'Content-Type 必须是 application/json');
         return;
       }
       let body: unknown;
       try {
         body = await readJsonBody(req);
       } catch (error) {
-        writeJson(res, 400, { error: error instanceof Error ? error.message : 'bad request' });
+        writeError(res, 400, truncateMessage(redactError(error)));
+        return;
+      }
+      // 合法 JSON null 也按中文错误信封返回 400，不抛异常。
+      if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+        writeError(res, 400, '请求体必须是 JSON 对象');
         return;
       }
       const envelope = body as ClientRequestEnvelope;
       const rpcId = typeof envelope.rpcId === 'string' ? envelope.rpcId : null;
       if (envelope.type !== 'client-request' || rpcId === null) {
-        writeJson(res, 400, { type: 'server-response', rpcId: rpcId ?? 'invalid-request', result: { ok: false, error: { code: 'gateway/bad-request', message: 'invalid client-request message', details: {} } } });
+        writeJson(res, 400, {
+          type: 'server-response',
+          rpcId: rpcId ?? 'invalid-request',
+          result: { ok: false, error: { code: 'gateway/bad-request', message: '请求信封不合法', details: {} } },
+        });
         return;
       }
       if (envelope.method !== endpoint) {
@@ -139,7 +171,7 @@ export function registerWebRpcRoute(
           rpcId,
           result: {
             ok: false,
-            error: { code: 'gateway/bad-request', message: `method ${JSON.stringify(envelope.method)} does not match endpoint ${JSON.stringify(endpoint)}`, details: {} },
+            error: { code: 'gateway/bad-request', message: '请求方法与端点不匹配', details: {} },
           },
         });
         return;
@@ -150,9 +182,9 @@ export function registerWebRpcRoute(
       });
       let result: ConnectionRpcResult;
       try {
-        result = await handler(endpoint, envelope.payload ?? {}, abort.signal, admission.peer as never);
+        result = await handler(endpoint, envelope.payload ?? {}, abort.signal, peer as never);
       } catch (error) {
-        result = { ok: false, error: { code: 'internal', message: error instanceof Error ? error.message : String(error), details: {} } };
+        result = hostFailure(error);
       }
       writeJson(res, 200, { type: 'server-response', rpcId, result });
     },

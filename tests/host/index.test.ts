@@ -3,18 +3,32 @@
  */
 
 import { describe, expect, it, vi } from 'vitest';
+import { Context } from '@deepseek-ai/cordis';
 import { detectCapabilities } from '@/host/capabilities';
 import { createHandler } from '@/host/rpc';
 import type { HostContext } from '@/host/types';
 
 describe('detectCapabilities（逐项诊断）', () => {
-  it('服务全缺时逐项 ok=false，diagnostics 非空（明确诊断）', () => {
+  it('服务全缺时宿主服务类 items ok=false，diagnostics 非空（明确诊断）', () => {
     const snapshot = detectCapabilities({}, { pushEnabled: false });
     expect(snapshot.items.length).toBeGreaterThan(0);
-    expect(snapshot.items.every((item) => item.ok === false)).toBe(true);
+    // 宿主服务类（rpc/skills/agent/effect）全缺时必须 ok=false；解释器/数据根不在此列。
+    for (const key of ['rpc', 'skills', 'agent', 'effect']) {
+      expect(snapshot.items.find((i) => i.key === key)!.ok).toBe(false);
+    }
     expect(snapshot.diagnostics.length).toBeGreaterThan(0);
     expect(snapshot.read).toBe(false);
     expect(snapshot.agent).toBe(false);
+  });
+
+  it('能力探测包含解释器路径/版本与数据根（WEWRITE_HOME）两项', () => {
+    const snapshot = detectCapabilities({}, { pushEnabled: false });
+    const interpreter = snapshot.items.find((i) => i.key === 'interpreter');
+    const dataRoot = snapshot.items.find((i) => i.key === 'dataRoot');
+    expect(interpreter).toBeDefined();
+    expect(dataRoot).toBeDefined();
+    expect(interpreter!.detail.length).toBeGreaterThan(0);
+    expect(dataRoot!.detail.length).toBeGreaterThan(0);
   });
 
   it('服务齐全时 read/agent/skills 可用，push 默认关闭', () => {
@@ -43,6 +57,41 @@ describe('detectCapabilities（逐项诊断）', () => {
   });
 });
 
+describe('生命周期：真实 Cordis Context 的 ctx.effect 语义', () => {
+  it('body 返回 disposer → 装载时不执行清理，卸载时逆序执行', async () => {
+    const ctx = new Context();
+    const log: string[] = [];
+    const disposers = [
+      () => { log.push('dispose B'); },
+      () => { log.push('dispose A'); },
+    ];
+    // 正确形态：body 返回清理函数。
+    ctx.effect(() => async () => {
+      for (const d of [...disposers].reverse()) await Promise.resolve(d()).catch(() => undefined);
+    }, 'right');
+    expect(log).toEqual([]);
+
+    // 卸载 fiber（dispose 返回的函数被执行）
+    await ctx.fiber.dispose();
+    expect(log).toEqual(['dispose A', 'dispose B']);
+  });
+
+  it('body 直接执行清理（错误形态）→ 装载时即执行，用于防止回归', async () => {
+    const ctx = new Context();
+    const log: string[] = [];
+    const disposers = [
+      () => { log.push('dispose B'); },
+      () => { log.push('dispose A'); },
+    ];
+    // 错误形态：body 被立即执行，清理动作在装载阶段就跑掉了（类型上返回 void，故用 never 绕过）。
+    ctx.effect((async () => {
+      for (const d of [...disposers].reverse()) await Promise.resolve(d()).catch(() => undefined);
+    }) as never, 'wrong');
+    expect(log).toEqual(['dispose A']);
+    await ctx.fiber.dispose();
+  });
+});
+
 describe('createHandler（RPC 信封契约）', () => {
   const snapshotService = {
     snapshot: vi.fn(async () => ({
@@ -55,14 +104,15 @@ describe('createHandler（RPC 信封契约）', () => {
     })),
   };
 
-  it('snapshot 合法请求 → {ok:true,value}', async () => {
+  it('snapshot 合法请求 → 传输 value 为业务联合 {ok:true,data}', async () => {
     const handler = createHandler(snapshotService);
     const result = (await handler('snapshot', {}, new AbortController().signal, {})) as {
       ok: boolean;
-      value?: unknown;
+      value?: { ok: boolean; data?: unknown };
     };
     expect(result.ok).toBe(true);
-    expect(result.value).toBeDefined();
+    expect(result.value?.ok).toBe(true);
+    expect(result.value?.data).toBeDefined();
   });
 
   it('snapshot 未知字段 → {ok:false,error}，code=internal 且 message 中文不含栈', async () => {

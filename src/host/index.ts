@@ -151,12 +151,16 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
     logger.warn(`dsh-plugin-wewrite: 诊断快照 ${JSON.stringify(redactKeys(snapshot.diagnostics))}`);
   }
 
-  // 生命周期：全部 disposer 登记，卸载时逆序回收。
+  // 生命周期：body 只做登记、返回 disposer（rc.4 Cordis 会立即执行 body 并
+  // 把返回函数当卸载 disposer；清理动作绝不能直接当 body，否则装载时就被回收）。
   if (typeof ctx.effect === 'function') {
-    ctx.effect(async () => {
-      for (const dispose of [...disposers].reverse()) {
-        await Promise.resolve(dispose()).catch(() => undefined);
-      }
-    }, 'dsh-plugin-wewrite: host service');
+    ctx.effect(
+      () => async () => {
+        for (const dispose of [...disposers].reverse()) {
+          await Promise.resolve(dispose()).catch(() => undefined);
+        }
+      },
+      'dsh-plugin-wewrite: host service',
+    );
   }
 }

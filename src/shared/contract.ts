@@ -5,6 +5,7 @@
  */
 
 import { z } from 'zod';
+import { ERROR_CODES } from './constants';
 
 export { ERROR_CODES, ERROR_MESSAGES, RPC_CHANNEL, CONTRACT_VERSION } from './constants';
 export type { ErrorCode } from './constants';
@@ -215,6 +216,13 @@ function base64DecodedBytes(value: string): number {
 
 const TopicField = z.string().max(TOPIC_MAX, `主题不能超过 ${TOPIC_MAX} 字`);
 
+/** 文本产物按 UTF-8 字节数校验（§4：文本产物各 2 MiB，不是字符数）。 */
+const MarkdownField = z
+  .string()
+  .refine((value) => Buffer.byteLength(value, 'utf8') <= TEXT_MAX_BYTES, {
+    message: `文本产物不能超过 ${TEXT_MAX_BYTES} 字节（UTF-8）`,
+  });
+
 // ── 请求 schema 组装 ──────────────────────────────────────────────────────
 
 const EmptyRequest = z.strictObject({});
@@ -225,7 +233,23 @@ const withRequestId = <T extends z.ZodRawShape>(shape: T) =>
 
 const LimitField = z.number().int().min(PAGE_LIMIT_MIN).max(PAGE_LIMIT_MAX);
 
-const SnapshotResponseSchema = z.strictObject({
+/** 业务失败联合（§4：code 固定 17 码，retryable 必填，runId 可选）。 */
+const BusinessErrorSchema = z.strictObject({
+  code: z.enum(ERROR_CODES as unknown as [string, ...string[]]),
+  message: z.string(),
+  retryable: z.boolean(),
+  runId: RunIdSchema.optional(),
+});
+
+/** 业务联合（§4：成功传输 value 内是 {ok:true,data} 或 {ok:false,error}）。 */
+function businessResult<T extends z.ZodTypeAny>(dataSchema: T) {
+  return z.union([
+    z.strictObject({ ok: z.literal(true), data: dataSchema }),
+    z.strictObject({ ok: z.literal(false), error: BusinessErrorSchema }),
+  ]);
+}
+
+const SnapshotDataSchema = z.strictObject({
   runs: z.array(RunSummarySchema),
   nextCursor: IdSchema.nullable(),
   themes: z.array(z.strictObject({ id: z.string(), label: z.string() })),
@@ -257,7 +281,7 @@ const OperationStatusSchema = z.enum(PUSH_STATUSES);
 export const rpcContract = {
   snapshot: {
     request: EmptyRequest,
-    response: SnapshotResponseSchema,
+    response: businessResult(SnapshotDataSchema),
   },
   'run/list': {
     request: z.strictObject({
@@ -352,7 +376,7 @@ export const rpcContract = {
   'article/save': {
     request: withRequestId({
       runId: RunIdSchema,
-      markdown: z.string().max(TEXT_MAX_BYTES, `文本产物不能超过 ${TEXT_MAX_BYTES} 字节`),
+      markdown: MarkdownField,
       expectedVersion: VersionSchema,
       metadata: z.strictObject({
         title: z.string(),

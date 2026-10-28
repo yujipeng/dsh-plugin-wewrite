@@ -71,6 +71,18 @@ describe('redactUrlCredentials（无完整带凭据 URL）', () => {
   it('普通 URL 原样保留', () => {
     expect(redactUrlCredentials('https://api.example.com/x')).toBe('https://api.example.com/x');
   });
+
+  it('查询参数 token/access_token/key 打码', () => {
+    expect(redactUrlCredentials('https://api.example.com/x?token=SECRET123')).toBe(
+      'https://api.example.com/x?token=****',
+    );
+    expect(redactUrlCredentials('https://api.example.com/x?access_token=abc&a=1')).toBe(
+      'https://api.example.com/x?access_token=****&a=1',
+    );
+    expect(redactUrlCredentials('https://api.example.com/x?key=kkk&token=t')).toBe(
+      'https://api.example.com/x?key=****&token=****',
+    );
+  });
 });
 
 describe('redactError（剥栈、去凭据 URL、去 secret、截断）', () => {

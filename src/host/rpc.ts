@@ -30,6 +30,7 @@ function issueText(issue: { path: (string | number)[]; message: string }): strin
 
 /** 宿主传输错误信封：code 固定 'internal'（宿主白名单最通用分支），真实信息只进脱敏 message。 */
 function toHostFailure(error: unknown): { ok: false; error: { code: string; message: string; details: Record<string, never> } } {
+  // redactError 内部已合并 knownSecrets 注册表 + URL 查询参数 token 遮盖。
   const message = truncateMessage(redactError(error));
   return { ok: false, error: { code: 'internal', message, details: {} } };
 }
@@ -47,6 +48,11 @@ export function businessFailure(code: ErrorCode, message?: string, extra?: { ret
   };
 }
 
+/** 业务成功联合（§4：成功传输 value 内，客户端读 value.data）。 */
+export function businessSuccess<T>(data: T): { ok: true; data: T } {
+  return { ok: true, data };
+}
+
 export function createHandler(service: SkeletonService): RpcHandler {
   return async (endpoint, payload) => {
     const entry = CONTRACT[endpoint];
@@ -61,7 +67,8 @@ export function createHandler(service: SkeletonService): RpcHandler {
     try {
       let result: unknown;
       if (endpoint === 'snapshot') {
-        result = await service.snapshot();
+        // snapshot 成功结果包成 §4 业务联合 {ok:true,data:<snapshot>}，再放传输 value。
+        result = businessSuccess(await service.snapshot());
       } else {
         return toHostFailure(
           new WeWriteError('CAPABILITY_UNAVAILABLE', `端点 ${endpoint} 属后续 stage，本骨架仅提供 snapshot 最小诊断版`),

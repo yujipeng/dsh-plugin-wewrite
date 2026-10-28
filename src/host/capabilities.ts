@@ -1,9 +1,11 @@
 /**
- * 能力探测与诊断快照（§1 范围第 4 条：能力探测在缺依赖时给明确诊断，不是静默失败）。
- * 逐项探测：RPC/skills/Agent/审批服务/生命周期，每项给出 ok + 中文诊断。
+ * 能力探测与诊断快照（§1 范围第 4 条 + §3：能力探测在缺依赖时给明确诊断，不是静默失败）。
+ * 逐项探测：解释器路径/版本、数据根（WEWRITE_HOME）可写性、RPC/skills/Agent/审批/生命周期。
  * 全部通过 ctx.get 无副作用读取（不声明 inject、不阻塞），服务未就绪即给诊断。
  */
 
+import { execFileSync } from 'node:child_process';
+import { accessSync, constants } from 'node:fs';
 import type { HostContext } from './types';
 import type { Issue } from '../shared/contract';
 
@@ -25,10 +27,57 @@ export interface CapabilitySnapshot {
   readonly diagnostics: readonly Issue[];
 }
 
+/** 解释器探测：目标 Python 解释器路径（可被 profile 私有覆盖配置替换）。 */
+function pythonInterpreter(): string {
+  return process.env.WEWRITE_PYTHON ?? 'python3';
+}
+
+function probeInterpreter(): CapabilityItem {
+  const interpreter = pythonInterpreter();
+  try {
+    const version = execFileSync(interpreter, ['--version'], { encoding: 'utf8', timeout: 5000 }).trim();
+    return { key: 'interpreter', label: 'Python 解释器', ok: true, detail: `${interpreter}（${version}）` };
+  } catch (error) {
+    return {
+      key: 'interpreter',
+      label: 'Python 解释器',
+      ok: false,
+      detail: `解释器 ${interpreter} 不可用（${error instanceof Error ? error.message : String(error)}）`,
+    };
+  }
+}
+
+/** 数据根（WEWRITE_HOME）可写性探测。 */
+function probeDataRoot(): CapabilityItem {
+  const home = process.env.WEWRITE_HOME;
+  if (!home) {
+    return {
+      key: 'dataRoot',
+      label: '数据根（WEWRITE_HOME）',
+      ok: false,
+      detail: '未配置 WEWRITE_HOME，无法确定数据根（profile 私有覆盖配置须提供）',
+    };
+  }
+  try {
+    accessSync(home, constants.R_OK | constants.W_OK);
+    return { key: 'dataRoot', label: '数据根（WEWRITE_HOME）', ok: true, detail: `${home} 可读写` };
+  } catch (error) {
+    return {
+      key: 'dataRoot',
+      label: '数据根（WEWRITE_HOME）',
+      ok: false,
+      detail: `${home} 不可读写（${error instanceof Error ? error.message : String(error)}）`,
+    };
+  }
+}
+
 /** 逐项探测：任何宿主服务都可缺失，逐项记录而不是整体抛错。 */
 export function detectCapabilities(ctx: HostContext, config: { pushEnabled: boolean }): CapabilitySnapshot {
   const items: CapabilityItem[] = [];
   const get = ctx.get?.bind(ctx) ?? (() => undefined);
+
+  items.push(probeInterpreter());
+  items.push(probeDataRoot());
 
   const connection = get('connection') as { rpc?: { handle?: unknown }; admit?: unknown } | undefined;
   const rpcOk = typeof connection?.admit === 'function';

@@ -48,9 +48,11 @@ function redactValue(value: unknown): unknown {
   return value;
 }
 
-/** 完整带凭据 URL 打码：把 userinfo（user:pass@）整体替换为掩码。 */
+/** 完整带凭据 URL 打码：userinfo（user:pass@）与查询参数中的 token 一律遮盖。 */
 export function redactUrlCredentials(url: string): string {
-  return url.replace(/\/\/[^/@\s]+@/g, '//****@');
+  const noUserinfo = url.replace(/\/\/[^/@\s]+@/g, '//****@');
+  // 遮盖常见敏感查询参数的值：token / access_token / key / secret / password / apikey 等。
+  return noUserinfo.replace(/([?&](?:access_token|token|key|secret|password|apikey|api_key|auth|sig|signature)=)[^&\s#]*/gi, '$1****');
 }
 
 /** 栈剥离：取 Error.message，绝不透传 .stack。 */
@@ -64,8 +66,18 @@ export function truncateMessage(message: string, max = 500): string {
   return message.length <= max ? message : `${message.slice(0, max)}…`;
 }
 
+/** 已知 secret 注册表：生产代码在拿到凭据时登记，所有脱敏调用统一消费。 */
+const knownSecrets: string[] = [];
+
+/** 登记已知 secret 值（幂等去重）。后续 redactError/redactText 默认覆盖。 */
+export function addSecrets(secrets: readonly string[]): void {
+  for (const secret of secrets) {
+    if (secret && !knownSecrets.includes(secret)) knownSecrets.push(secret);
+  }
+}
+
 /** 组合脱敏：剥栈、去 URL 凭据、去已知 secret，再截断。 */
-export function redactError(error: unknown, secrets: readonly string[] = []): string {
+export function redactError(error: unknown, extraSecrets: readonly string[] = []): string {
   const base = redactUrlCredentials(errorMessage(error));
-  return truncateMessage(redactText(base, secrets));
+  return truncateMessage(redactText(base, [...knownSecrets, ...extraSecrets]));
 }

@@ -123,7 +123,7 @@ describe('四类负向：缺字段、未知字段、超限、非法 enum', () =>
     if (!parsed.success) expect(parsed.error.issues[0]!.message).toContain('500');
   });
 
-  it('超限：文本产物 2 MiB 上限（article/save markdown）', () => {
+  it('超限：文本产物 2 MiB 上限（article/save markdown，按 UTF-8 字节）', () => {
     const schema = rpcContract['article/save'].request;
     const base = {
       requestId: 'r1',
@@ -135,6 +135,26 @@ describe('四类负向：缺字段、未知字段、超限、非法 enum', () =>
     const parsed = schema.safeParse({ ...base, markdown: 'x'.repeat(TEXT_MAX_BYTES + 1) });
     expect(parsed.success).toBe(false);
     if (!parsed.success) expect(parsed.error.issues[0]!.message).toContain('字节');
+  });
+
+  it('超限：100 万汉字（3,000,000 UTF-8 字节）拒，ASCII 3 MiB 拒', () => {
+    const schema = rpcContract['article/save'].request;
+    const base = {
+      requestId: 'r1',
+      runId,
+      expectedVersion: hash64,
+      metadata: { title: 't', digest: 'd', themeId: 'th' },
+    };
+    // 100 万汉字：每个汉字 UTF-8 占 3 字节 → 3,000,000 字节，超过 2 MiB (2,097,152)
+    const hanzi = '汉'.repeat(1_000_000);
+    expect(Buffer.byteLength(hanzi, 'utf8')).toBe(3_000_000);
+    expect(schema.safeParse({ ...base, markdown: hanzi }).success).toBe(false);
+    // 3 MiB ASCII 也应拒绝
+    expect(schema.safeParse({ ...base, markdown: 'x'.repeat(3 * 1024 * 1024) }).success).toBe(false);
+    // 恰 2 MiB 的汉字（2,097,152 字节 = 699,050.67 汉字，用 699,050 汉字 = 2,097,150 字节，加 2 个 ASCII）
+    const nearLimit = '汉'.repeat(699_050) + 'ab';
+    expect(Buffer.byteLength(nearLimit, 'utf8')).toBe(2_097_152);
+    expect(schema.safeParse({ ...base, markdown: nearLimit }).success).toBe(true);
   });
 
   it('超限：图片解码后 10 MiB 上限（asset/put base64）', () => {
@@ -225,8 +245,8 @@ describe('四类负向：缺字段、未知字段、超限、非法 enum', () =>
 });
 
 describe('合法请求与响应形状（表驱动抽查）', () => {
-  it('snapshot 空请求，全量响应', () => {
-    const response = {
+  it('snapshot 空请求，响应为业务联合 {ok:true,data}', () => {
+    const data = {
       runs: [],
       nextCursor: null,
       themes: [{ id: 't1', label: '主题一' }],
@@ -247,7 +267,16 @@ describe('合法请求与响应形状（表驱动抽查）', () => {
       },
     };
     expect(rpcContract['snapshot'].request.safeParse({}).success).toBe(true);
-    expect(rpcContract['snapshot'].response.safeParse(response).success).toBe(true);
+    expect(rpcContract['snapshot'].response.safeParse({ ok: true, data }).success).toBe(true);
+    // 裸 data 不再合法（必须包业务联合）
+    expect(rpcContract['snapshot'].response.safeParse(data).success).toBe(false);
+    // 业务失败联合也可通过
+    expect(
+      rpcContract['snapshot'].response.safeParse({
+        ok: false,
+        error: { code: 'INTERNAL', message: '内部错误', retryable: false },
+      }).success,
+    ).toBe(true);
   });
 
   it('run/detail 全量响应（run/binding/steps/artifacts/gate/lastError/push）', () => {
