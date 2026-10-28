@@ -233,7 +233,7 @@ const withRequestId = <T extends z.ZodRawShape>(shape: T) =>
 
 const LimitField = z.number().int().min(PAGE_LIMIT_MIN).max(PAGE_LIMIT_MAX);
 
-/** 业务失败联合（§4：code 固定 17 码，retryable 必填，runId 可选）。 */
+/** 业务失败联合（§4：code 固定 18 码，retryable 必填，runId 可选）。 */
 const BusinessErrorSchema = z.strictObject({
   code: z.enum(ERROR_CODES as unknown as [string, ...string[]]),
   message: z.string(),

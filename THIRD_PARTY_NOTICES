@@ -12,6 +12,16 @@
 - 用途：本插件的设计以该仓库为业务真源。当前 S1 阶段仅记录来源契约（runId 形态、状态/产物、错误码等），
   后续 stage 的 Python facade 将以独立包名 `dsh_wewrite_facade` 复用其公开方法，不修改上游、不放残缺遮蔽包。
 
+### Python facade 复用来源（S2 起）
+
+`python/src/dsh_wewrite_facade/` 是独立包名 `dsh-wewrite-facade` 的受控通道，运行时依赖固定版本
+`wewrite==4.2.1`（来源锁定 `220db1dcf141d92c03ddb704628a774ecd2b79f7`，MIT License）。
+复用的上游公开方法：`runs.create_run` / `runs.mark_step` / `runs.update_run` / `runs.finish_run`
+（写面，显式 run_id）、`commands.content_eval.build_report`（审稿报告）、
+`commands.fetch_hotspots` 的 `fetch_weibo`/`fetch_toutiao`/`fetch_baidu`/`deduplicate`（热榜排序聚合）、
+`toolkit.converter.WeChatConverter`/`preview_html`（排版，无网络上传）。
+真实微信令牌/上传/`draft/add` 属 S4，本 stage 不实现，`draft.send` 只接假 transport。
+
 ## jerryjiao/dsh-wewrite（参考实现）
 
 - 来源仓库：https://github.com/jerryjiao/dsh-wewrite

@@ -4,6 +4,9 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { resolve } from 'node:path';
+import { ERROR_MESSAGES } from '@/shared/constants';
 import {
   ERROR_CODES,
   RPC_CHANNEL,
@@ -35,11 +38,33 @@ describe('RPC 通道与错误码常量（§4）', () => {
     expect(RPC_CHANNEL).toBe('/wewrite-python');
   });
 
-  it('业务错误码全集（§4 固定 18 项，实际列出 17 项）', () => {
-    expect(ERROR_CODES).toHaveLength(17);
+  it('业务错误码全集（§4 固定 18 项）', () => {
+    expect(ERROR_CODES).toHaveLength(18);
     expect(ERROR_CODES).toContain('INVALID_INPUT');
     expect(ERROR_CODES).toContain('PUBLISH_UNKNOWN');
     expect(ERROR_CODES).toContain('INTERNAL');
+    expect(ERROR_CODES).toContain('STATE_CORRUPTED');
+  });
+
+  it('Python 全部业务失败均可由 TS 解析，错误码和中文消息双向一致', () => {
+    // 从真实 Python 错误模块生成信封，避免在测试内复制第三份错误码清单。
+    const output = execFileSync(process.env.FACADE_PYTHON ?? 'python3', ['-c', `
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from dsh_wewrite_facade.errors import ERROR_CODES, ERROR_MESSAGES, business_failure
+print(json.dumps({"codes": ERROR_CODES, "messages": ERROR_MESSAGES,
+                  "failures": [business_failure(code) for code in ERROR_CODES]}))
+`, resolve('python/src')], { encoding: 'utf8' });
+    const python = JSON.parse(output);
+    expect([...python.codes].sort()).toEqual([...ERROR_CODES].sort());
+    expect(python.messages).toEqual(ERROR_MESSAGES);
+    for (const failure of python.failures) {
+      expect(rpcContract.snapshot.response.safeParse(failure).success, failure.error.code).toBe(true);
+    }
+    // 未登记码仍应拒绝，不能通过放宽 schema 掩盖漂移。
+    expect(rpcContract.snapshot.response.safeParse({
+      ok: false, error: { code: 'UNREGISTERED_CODE', message: '未登记错误', retryable: false },
+    }).success).toBe(false);
   });
 
   it('每个端点同时具备 request 与 response schema', () => {
