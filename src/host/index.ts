@@ -187,6 +187,7 @@ function assembleWorkbench(
     onError: (message) => logger.warn(`dsh-plugin-wewrite: 业务错误：${message}`),
     pushEnabled,
     pushArmed,
+    publishTransport: () => config.publishTransport,
     resolveCredentials: async () => {
       // S4：凭据只在通过双闸后从 credentials 取出，经私有 stdin 传给 facade。
       // 这里 resolve 一个引用（WEWRITE_APPID/WEWRITE_SECRET），不缓存、不写日志。
@@ -229,44 +230,40 @@ function assembleWorkbench(
     scopeSetup: (agentCtx) => {
       // 专属写作 Agent 的 scope 装配：注册受控工具 + 继承层 restrict + 单调 guard。
       if (config.agentToolsEnabled === false) return;
+      const ctxLike = agentCtx as { get?: (name: string) => unknown; on?: (name: string, listener: unknown) => () => void };
       const defs = pushEnabled() && approval ? [...toolDefs, pushTool] : toolDefs;
-      pushToolRegistered = pushEnabled() && approval === undefined ? false : pushEnabled() && approval !== undefined;
+      pushToolRegistered = pushEnabled() && approval !== undefined;
       setupAgentScope(
-        agentCtx as { get?: (name: string) => unknown },
+        ctxLike,
         defs,
         (message) => logger.warn(`dsh-plugin-wewrite: ${message}`),
       );
+      // S4 第一闸：为 wewrite_push_draft 武装 tools/pre-execute ask（监听回收则不再注册推送工具）。
+      // 注册在 agent 的 scoped Context（ctxLike.on），waterfall 只在该 Agent 生效。
+      if (pushEnabled() && approval && typeof ctxLike.on === 'function') {
+        stopPreExecute = installPushPreExecute(
+          ctxLike as never,
+          (exec) => {
+            const intentId = intentIdFromArgs(exec.arguments);
+            const summary = intentId ? pushSummaryOf(intentId) : undefined;
+            return pushAskReason({
+              title: summary?.title,
+              accountLabel: summary?.accountLabel,
+              articleVersion: summary?.articleVersion,
+              coverHash: summary?.coverHash,
+              gate: summary?.gate ?? '仅草稿，不群发',
+            });
+          },
+        );
+      } else if (pushEnabled() && approval) {
+        pushToolRegistered = false;
+      }
     },
     homeLabel: home ? '数据根（已配置，不显示路径）' : '数据根未配置',
     mainSkillName: 'wewrite',
     randomId: () => randomUUID(),
     onError: (message) => logger.warn(`dsh-plugin-wewrite: Agent 工作流错误：${message}`),
   });
-
-  // S4 第一闸：为 wewrite_push_draft 武装 tools/pre-execute ask（监听回收则不再注册推送工具）。
-  if (pushEnabled() && approval) {
-    const tools = get('tools') as {
-      on?: (name: string, listener: unknown) => () => void;
-    } | undefined;
-    if (typeof tools?.on === 'function') {
-      stopPreExecute = installPushPreExecute(
-        tools as never,
-        (exec) => {
-          const intentId = intentIdFromArgs(exec.arguments);
-          const summary = intentId ? pushSummaryOf(intentId) : undefined;
-          return pushAskReason({
-            title: summary?.title,
-            accountLabel: summary?.accountLabel,
-            articleVersion: summary?.articleVersion,
-            coverHash: summary?.coverHash,
-            gate: summary?.gate ?? '仅草稿，不群发',
-          });
-        },
-      );
-    } else {
-      pushToolRegistered = false;
-    }
-  }
 
   (service as unknown as { options: { workflow: AgentWorkflow } }).options.workflow = workflow;
 

@@ -4,25 +4,30 @@
  * 覆盖：
  * - pushEnabled=false 时 AGENT_TOOL_NAMES 无 wewrite_push_draft；审批服务缺失时 pushArmed=false。
  * - 第一闸 pre-execute：精确匹配 wewrite_push_draft 返回 ask，其他工具 next，永不 allow。
- * - 两条强制断言（执行令牌不跨 exec 复用 + intentId 幂等）的 host 侧可判定证据。
+ * - 真实调度链两条强制断言（执行令牌不跨 exec 复用 + 第二次独立 asked）。
+ * - 真实 transport 接线（配置 wechat → draft.send 收到 wechat；缺凭据 fail-closed）。
  */
 
 import { describe, expect, it } from 'vitest';
+import { Context } from '@deepseek-ai/cordis';
+import { ToolRuntime, type ToolExecution } from '@deepseek-ai/dsh-tools';
+import { ToolCallId } from '@deepseek-ai/dsh-llm';
+import { createScope, type ScopeKey } from '@deepseek-ai/dsh-scope';
 import {
   PUSH_TOOL_NAME,
   installPushPreExecute,
   probeApproval,
   pushAskReason,
-  recordTokenAudit,
-  type TokenAuditEntry,
 } from '@/host/push-approval';
-import { AGENT_TOOL_NAMES, buildAgentTools, buildPushTool, CONTROLLED_TOOL_SET } from '@/host/tools';
+import { AGENT_TOOL_NAMES, buildAgentTools, buildPushTool, CONTROLLED_TOOL_SET, setupAgentScope } from '@/host/tools';
 import { WorkbenchService } from '@/host/workbench-service';
 import { AgentWorkflow } from '@/host/agent-workflow';
 
 function makeService(pushOpts: {
   pushEnabled?: () => boolean;
   pushArmed?: () => boolean;
+  publishTransport?: () => 'fake' | 'wechat';
+  resolveCredentials?: () => Promise<Record<string, string> | undefined>;
 } = {}) {
   const workflow = new AgentWorkflow({
     runtime: {
@@ -41,7 +46,25 @@ function makeService(pushOpts: {
     randomId: () => 'id',
     pushEnabled: pushOpts.pushEnabled ?? (() => false),
     pushArmed: pushOpts.pushArmed ?? (() => false),
+    publishTransport: pushOpts.publishTransport,
+    resolveCredentials: pushOpts.resolveCredentials,
   });
+}
+
+/** 构造一个真实 ToolRuntime + 专属 Agent scope（与生产 setupAgentScope 同构）。 */
+function makeToolRuntime() {
+  const root = new Context();
+  root.provide('systemPrompt', {
+    tools: () => () => undefined,
+    section: () => () => undefined,
+    getSectionOrder: () => 0,
+  });
+  root.provide('logger', { warn: () => undefined, info: () => undefined, error: () => undefined });
+  const tools = new ToolRuntime(root);
+  const agentKey: ScopeKey = { id: `agent-scope-${Math.random()}` };
+  const scope = createScope(root, agentKey);
+  const scopedTools = scope.ctx.get('tools') as ToolRuntime;
+  return { root, tools, scopedTools, agentKey, scope };
 }
 
 describe('S4 推送工具注册条件（第一闸门禁）', () => {
@@ -70,7 +93,7 @@ describe('S4 推送工具注册条件（第一闸门禁）', () => {
 });
 
 describe('第一闸 pre-execute（ask 永不 allow）', () => {
-  function makeTools() {
+  function makeCtx() {
     const listeners: Record<string, unknown> = {};
     return {
       listeners,
@@ -82,9 +105,9 @@ describe('第一闸 pre-execute（ask 永不 allow）', () => {
   }
 
   it('精确匹配 wewrite_push_draft 返回 ask；其他工具 next()', async () => {
-    const tools = makeTools();
-    installPushPreExecute(tools as never, () => '推送微信草稿（仅草稿）');
-    const listener = tools.listeners['tools/pre-execute'] as (exec: unknown, next: () => Promise<unknown>) => Promise<unknown>;
+    const ctx = makeCtx();
+    installPushPreExecute(ctx as never, () => '推送微信草稿（仅草稿）');
+    const listener = ctx.listeners['tools/pre-execute'] as (exec: unknown, next: () => Promise<unknown>) => Promise<unknown>;
 
     let asked = false;
     const result = await listener({ name: PUSH_TOOL_NAME }, async () => {
@@ -116,26 +139,154 @@ describe('第一闸 pre-execute（ask 永不 allow）', () => {
   });
 });
 
-describe('两条强制断言（host 侧可判定证据）', () => {
-  it('执行令牌不跨 exec 复用：两次 token 不相等 + 第二次独立 asked', () => {
-    const entries: TokenAuditEntry[] = [];
-    const tokenA = Symbol('dsh.tool.execution');
-    const tokenB = Symbol('dsh.tool.execution');
-    recordTokenAudit(entries, tokenA, 'call-1', 'first');
-    recordTokenAudit(entries, tokenB, 'call-2', 'second');
+describe('真实调度链：执行令牌不跨 exec 复用（S4 强制断言 1）', () => {
+  it('同一 run/generation 两次有效 intent，走两次真实 tools.execute，token 不相等 + 第二次独立 asked', async () => {
+    const { root, scopedTools, agentKey, scope } = makeToolRuntime();
+
+    // 真实审批服务：记录每次 ask 的 toolName+callId，返回 allowed-once。
+    const asks: string[] = [];
+    root.provide('approval', {
+      request: async (req: { toolName: string; callId?: unknown }) => {
+        asks.push(`${req.toolName}:${String(req.callId ?? '')}`);
+        return 'allowed-once';
+      },
+    });
+
+    // 生产同构：installPushPreExecute 注册在 scoped Context（agent scope）。
+    const tokens: unknown[] = [];
+    installPushPreExecute(scope.ctx as never, () => '推送微信草稿（仅草稿）');
+
+    // 工具注册进 scoped tools，guard 放行 push 工具。
+    scopedTools.register(buildPushTool(makeService()));
+    // 单调 guard：允许 native 工具 + 记录 exec.token（第二闸入口观察 token）。
+    scopedTools.guard((execution) => {
+      if (execution.name === PUSH_TOOL_NAME) {
+        tokens.push((execution as ToolExecution).token);
+        return undefined;
+      }
+      return CONTROLLED_TOOL_SET.has(execution.name) ? undefined : '拒绝';
+    });
+
+    const input = { runId: '20261029-120000-abcdef', intentId: 'intent-1', expectedVersion: null };
+    const r1 = await scopedTools.execute({
+      callId: ToolCallId('call-1'),
+      name: PUSH_TOOL_NAME,
+      arguments: input,
+      agent: agentKey as never,
+      signal: new AbortController().signal,
+    });
+    const r2 = await scopedTools.execute({
+      callId: ToolCallId('call-2'),
+      name: PUSH_TOOL_NAME,
+      arguments: { ...input, intentId: 'intent-2' },
+      agent: agentKey as never,
+      signal: new AbortController().signal,
+    });
+
+    // 两次都经过 ask → allowed-once → guard → execute（至少两 ask，toolName 一致）。
+    expect(asks).toHaveLength(2);
+    for (const a of asks) expect(a).toContain(PUSH_TOOL_NAME);
+    // 第二次独立 asked（不同 callId）。
+    expect(asks[0]).toContain('call-1');
+    expect(asks[1]).toContain('call-2');
     // 两次 token 不相等（宿主每次 createExecutionToken 新铸）。
-    expect(tokenA).not.toBe(tokenB);
-    expect(entries).toHaveLength(2);
-    expect(entries.every((e) => e.tokenIsSymbol)).toBe(true);
-    // 旧 token 注入不能赋予第二次调用旧执行身份：第二次 label 独立。
-    expect(entries[1].label).toBe('second');
-    expect(entries[0].callId).not.toBe(entries[1].callId);
+    expect(tokens).toHaveLength(2);
+    expect(tokens[0]).not.toBe(tokens[1]);
+    expect(typeof tokens[0]).toBe('symbol');
+    expect(typeof tokens[1]).toBe('symbol');
+    scope.dispose();
+  });
+});
+
+describe('真实 transport 接线（S4 返修 1）', () => {
+  it('配置 wechat → draft.send 收到 transport=wechat；缺凭据 fail-closed（不静默退回 fake）', async () => {
+    const sent: Array<{ transport: unknown; credentials: unknown }> = [];
+    const service = new WorkbenchService({
+      bridge: async (operation, payload) => {
+        if (operation === 'draft.send') {
+          sent.push({ transport: (payload as Record<string, unknown>).transport, credentials: (payload as Record<string, unknown>).credentials });
+          return { ok: true, data: { operationId: 'op-1', status: 'succeeded', mediaId: 'real-media-1', dryRun: false, counters: { wechatApiCalls: 2, remoteFetchCalls: 0 } } };
+        }
+        return { ok: false, error: { code: 'INTERNAL', message: '内部错误', retryable: false } };
+      },
+      workflow: new AgentWorkflow({
+        runtime: { create: async () => { throw new Error('x'); }, resume: async () => { throw new Error('x'); }, get: () => undefined },
+        bridge: async () => ({ ok: false, error: { code: 'INTERNAL', message: 'x', retryable: false } }),
+        homeLabel: '数据根',
+        mainSkillName: 'wewrite',
+        randomId: () => 'id',
+      }),
+      randomId: () => 'id',
+      pushEnabled: () => true,
+      pushArmed: () => true,
+      publishTransport: () => 'wechat',
+      resolveCredentials: async () => ({ appid: 'wx-app', secret: 'wx-secret' }),
+    });
+
+    const result = await service.toolPushDraft(
+      { runId: '20261029-120000-abcdef', intentId: 'intent-1', expectedVersion: null },
+      { runId: '20261029-120000-abcdef', workflowId: 'wf-1', generation: 1 },
+    );
+    expect(result.ok).toBe(true);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].transport).toBe('wechat');
+    expect(sent[0].credentials).toEqual({ appid: 'wx-app', secret: 'wx-secret' });
   });
 
-  it('同一 intent 多次 send 由 facade journal 唯一键强制（host 侧证据由 python 测试覆盖）', () => {
-    // host 侧不重复 draft/add：execute 只经 draft.send 一次，intentId 幂等在 facade journal。
-    // 这里断言 host 第二闸把 intentId 原样传给 facade（不自行加锁/不缓存 allowed-once）。
-    const service = makeService({ pushEnabled: () => true, pushArmed: () => true });
-    expect(typeof service.toolPushDraft).toBe('function');
+  it('wechat 但缺凭据 → fail-closed，不触发 draft.send', async () => {
+    let calls = 0;
+    const service = new WorkbenchService({
+      bridge: async () => { calls += 1; return { ok: true, data: {} }; },
+      workflow: new AgentWorkflow({
+        runtime: { create: async () => { throw new Error('x'); }, resume: async () => { throw new Error('x'); }, get: () => undefined },
+        bridge: async () => ({ ok: false, error: { code: 'INTERNAL', message: 'x', retryable: false } }),
+        homeLabel: '数据根',
+        mainSkillName: 'wewrite',
+        randomId: () => 'id',
+      }),
+      randomId: () => 'id',
+      pushEnabled: () => true,
+      pushArmed: () => true,
+      publishTransport: () => 'wechat',
+      resolveCredentials: async () => undefined,
+    });
+
+    const result = await service.toolPushDraft(
+      { runId: '20261029-120000-abcdef', intentId: 'intent-1', expectedVersion: null },
+      { runId: '20261029-120000-abcdef', workflowId: 'wf-1', generation: 1 },
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe('APPROVAL_UNAVAILABLE');
+    expect(calls).toBe(0);
+  });
+
+  it('未配置 publishTransport（默认 fake）→ draft.send 收到 fake', async () => {
+    const sent: string[] = [];
+    const service = new WorkbenchService({
+      bridge: async (operation, payload) => {
+        if (operation === 'draft.send') {
+          sent.push(String((payload as Record<string, unknown>).transport));
+          return { ok: true, data: { operationId: 'op-1', status: 'succeeded', mediaId: 'fake-media-1', dryRun: true, counters: { wechatApiCalls: 0, remoteFetchCalls: 0 } } };
+        }
+        return { ok: false, error: { code: 'INTERNAL', message: 'x', retryable: false } };
+      },
+      workflow: new AgentWorkflow({
+        runtime: { create: async () => { throw new Error('x'); }, resume: async () => { throw new Error('x'); }, get: () => undefined },
+        bridge: async () => ({ ok: false, error: { code: 'INTERNAL', message: 'x', retryable: false } }),
+        homeLabel: '数据根',
+        mainSkillName: 'wewrite',
+        randomId: () => 'id',
+      }),
+      randomId: () => 'id',
+      pushEnabled: () => true,
+      pushArmed: () => true,
+    });
+
+    const result = await service.toolPushDraft(
+      { runId: '20261029-120000-abcdef', intentId: 'intent-1', expectedVersion: null },
+      { runId: '20261029-120000-abcdef', workflowId: 'wf-1', generation: 1 },
+    );
+    expect(result.ok).toBe(true);
+    expect(sent).toEqual(['fake']);
   });
 });

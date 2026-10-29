@@ -36,6 +36,8 @@ export interface WorkbenchServiceOptions {
   readonly pushArmed?: () => boolean;
   /** S4：经私有 stdin 解析真实微信凭据（仅通过双闸后调用）。 */
   readonly resolveCredentials?: () => Promise<Record<string, string> | undefined>;
+  /** S4：发布 transport 选择（fake/wechat）。dry-run 语义由调用方显式指定 fake 覆盖。 */
+  readonly publishTransport?: () => 'fake' | 'wechat';
   /** S4：把推送请求经 agent.followup 入队（真实 open turn 路径）。 */
   readonly enqueuePushFollowup?: (payload: {
     runId: string;
@@ -241,8 +243,12 @@ export class WorkbenchService {
       return businessFailure('APPROVAL_UNAVAILABLE', '推送审批通道未武装');
     }
     // 凭据只在通过双闸后取出（经私有 stdin 传给 facade；不写会话/日志/argv）。
+    const transport = this.options.publishTransport?.() ?? 'fake';
+    // wechat 但缺凭据：fail-closed，不得静默退回 fake 造成假成功。
     const credentials = this.options.resolveCredentials ? await this.options.resolveCredentials() : undefined;
-    const transport = 'fake';
+    if (transport === 'wechat' && !credentials) {
+      return businessFailure('APPROVAL_UNAVAILABLE', '真实推送未配置微信凭据');
+    }
     return bridgeResult(
       await this.safeBridge('draft.send', {
         requestId: this.options.randomId(),

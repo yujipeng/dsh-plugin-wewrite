@@ -62,9 +62,12 @@ export function probeApproval(approval: unknown): ApprovalRuntime | undefined {
  * - 精确匹配 `wewrite_push_draft` 返回 ask；其他工具 next()。
  * - 永不返回 allow（不允许「始终允许」替代逐次 allowed-once）。
  * - 返回监听 disposer（由宿主登记，监听回收时不再注册推送工具）。
+ *
+ * `ctx` 是 agent 的 scoped Cordis Context：`tools/pre-execute` 是 Context 事件，
+ * 经 `ctx.on('tools/pre-execute', listener)` 注册，不是 ToolRuntime 的方法。
  */
 export function installPushPreExecute(
-  tools: {
+  ctx: {
     on?(name: string, listener: (exec: ToolExecution, next: () => Promise<PreToolDecision>) => Promise<PreToolDecision>): () => void;
   },
   reasonFor: (exec: ToolExecution) => string,
@@ -73,22 +76,10 @@ export function installPushPreExecute(
     if (exec.name !== PUSH_TOOL_NAME) return next();
     return { kind: 'ask', reason: reasonFor(exec) };
   };
-  if (typeof tools.on === 'function') {
-    return tools.on('tools/pre-execute', listener) ?? (() => undefined);
+  if (typeof ctx.on === 'function') {
+    return ctx.on('tools/pre-execute', listener) ?? (() => undefined);
   }
   return () => undefined;
-}
-
-/** 执行令牌审计记录（仅进程内、布尔值与标签；token 不跨 RPC/Python/日志序列化）。 */
-export interface TokenAuditEntry {
-  readonly callId: string;
-  readonly tokenIsSymbol: boolean;
-  readonly label: string;
-}
-
-/** 收集两次推送的执行令牌审计（两次 token 不相等 = 不跨 exec 复用）。 */
-export function recordTokenAudit(entries: TokenAuditEntry[], token: unknown, callId: string, label: string): void {
-  entries.push({ callId, tokenIsSymbol: typeof token === 'symbol', label });
 }
 
 /** 审批服务引用（进程内单例，供装配与测试替换）。 */
