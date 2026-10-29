@@ -506,6 +506,7 @@ export const TOOL_NAMES = [
   'wewrite_review',
   'wewrite_run_finish',
   'wewrite_preview',
+  'wewrite_push_draft',
 ] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
 
@@ -595,6 +596,19 @@ export const toolContract = {
       themeId: IdSchema,
     }),
     response: rpcContract['article/preview'].response,
+  },
+  wewrite_push_draft: {
+    request: z.strictObject({
+      runId: ToolRunId,
+      intentId: IdSchema,
+      expectedVersion: VersionSchema,
+    }),
+    response: toolResult(z.strictObject({
+      operationId: IdSchema,
+      status: OperationStatusSchema,
+      mediaId: z.string().nullable(),
+      dryRun: z.boolean(),
+    })),
   },
 } as const;
 

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-from conftest import call_facade, create_run, make_home, write_article
+from conftest import call_facade, create_run, make_home, make_publishable_run, write_article
 
 
 def _png_bytes() -> bytes:
@@ -30,19 +30,13 @@ def _png_bytes() -> bytes:
 def test_draft_prepare_end_to_end_success(tmp_path):
     home = make_home(tmp_path)
     run_id = create_run(home)
-    # 先写正文，draft.prepare 才能读到 article 并生成 intent。
-    write_article(home, run_id, "# 标题\n\n正文")
-    # 设计修订版二：prepare 需已绑定写作会话（不记录未绑定 run 的 intent）。
-    pub = call_facade(str(home), "binding.publish", {
-        "requestId": "b1", "runId": run_id, "workflowId": "wf-1", "generation": 1,
-        "agentId": "a", "sessionId": "s", "workspaceId": "ws-1", "phase": "writing",
-    })
-    assert pub["ok"] is True, pub
+    # S4 预检口径：200+ 字正文 + 封面 + 通过审稿 + binding。
+    version, cover = make_publishable_run(home, run_id, workflow="wf-1")
     resp = call_facade(str(home), "draft.prepare", {
         "requestId": "p1",
         "runId": run_id,
         "expectedVersion": None,
-        "coverAssetId": "cover-1",
+        "coverAssetId": cover["assetId"],
         "themeId": "professional-clean",
     })
     assert resp["ok"] is True, resp

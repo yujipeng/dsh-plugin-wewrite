@@ -4,7 +4,8 @@ DSH Web 工作台 WeWrite 插件（`dsh-plugin-wewrite`）。
 
 - S1：工程骨架与契约层（`src/shared/contract.ts` 全 RPC schema + 双端契约测试）。
 - S2：Python facade（`python/src/dsh_wewrite_facade/`，独立包名 `dsh-wewrite-facade`）。
-- S3（本阶段）：业务 RPC / Agent 工具 / skills 随包装载 / 工作台 UI。
+- S3：业务 RPC / Agent 工具 / skills 随包装载 / 工作台 UI。
+- S4（本阶段）：微信草稿推送双闸、逐篇确认与安全边界。
 
 ## 模块
 
@@ -44,5 +45,15 @@ PYTHONPATH=python/src .venv/bin/python -m pytest -q   # facade 测试
 
 ## 微信推送（S4）
 
-本阶段 `wechat/prepareDraft` 只做本地预检，`wechat/pushDraft` 转入宿主审批的操作位
-（`pending_approval`），不真发；`draft.send` 只接假 transport，真实微信调用计数恒为零。
+- 双闸：`tools/pre-execute` 对 `wewrite_push_draft` 返回逐次 `ask`（第一闸），工具
+  `execute` 内做业务状态复验（第二闸），不做第二次审批证明。
+- 逐篇确认：`wechat/pushDraft` 把固定 `runId/intentId/expectedVersion` 经
+  `agent.followup` 入队进入真实 open turn，由宿主正常调度走 ask → guard → execute。
+- 发布白名单：仅令牌 / 正文图片上传 / 封面素材上传 / `draft/add` / `draft/get`；
+  无 `freepublish`、`mass/send` 等群发端点。
+- `dry-run`（默认 `publishTransport: fake`）走与真实链路相同的 prepare/ask/复验/journal，
+  结果带明显假 mediaId，真实微信调用计数恒为零。
+- 凭据只在通过双闸后从 credentials 取出，经私有 stdin 传给 facade；不写会话/日志/argv。
+
+真实微信验收需用户单次批准后在公众平台核对（有真实 mediaId、正文/封面可核对、无群发）；
+缺账号条件时该项记「待验证」。

@@ -15,9 +15,11 @@ import { resolveLogger, type Disposer, type HostContext } from './types';
 import { WorkbenchService, type WorkbenchBridge } from './workbench-service';
 import { AgentWorkflow, type DshAgentRuntime } from './agent-workflow';
 import { runFacade, shouldRecoverAfterClose } from './wewrite-bridge';
-import { buildAgentTools, setToolService, controlledToolGuard, setupAgentScope, INHERITED_TOOL_ALLOWLIST } from './tools';
+import { buildAgentTools, buildPushTool, setToolService, controlledToolGuard, setupAgentScope, INHERITED_TOOL_ALLOWLIST } from './tools';
+import { installPushPreExecute, probeApproval, pushAskReason, setApprovalRuntime, PUSH_TOOL_NAME, intentIdFromArgs, pushSummaryOf } from './push-approval';
 import { buildProvider, defaultManifestPath, PROVIDER_NAME } from './skills-provider';
 import { randomUUID } from 'node:crypto';
+import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 
 export const name = 'dsh-plugin-wewrite';
@@ -28,9 +30,30 @@ export type { DshAgentRuntime } from './agent-workflow';
 export { WorkbenchService } from './workbench-service';
 export type { WorkbenchBridge } from './workbench-service';
 export { runFacade } from './wewrite-bridge';
-export { buildAgentTools, setToolService, controlledToolGuard, setupAgentScope, INHERITED_TOOL_ALLOWLIST } from './tools';
+export { buildAgentTools, buildPushTool, setToolService, controlledToolGuard, setupAgentScope, INHERITED_TOOL_ALLOWLIST } from './tools';
+export { installPushPreExecute, probeApproval, pushAskReason, PUSH_TOOL_NAME } from './push-approval';
 export { createHandler } from './rpc';
 export { RPC_CHANNEL } from '../shared/contract';
+
+/** S4：组装推送 followup 文案（固定 runId/intentId/expectedVersion，真实 open turn）。 */
+function pushFollowupText(
+  payload: { runId: string; intentId: string; expectedVersion: string | null },
+  binding: import('../shared/contract').Binding,
+): string {
+  return [
+    '请调用 wewrite_push_draft 推送微信草稿（仅草稿，不群发）。',
+    `runId: ${payload.runId}`,
+    `intentId: ${payload.intentId}`,
+    `expectedVersion: ${payload.expectedVersion ?? ''}`,
+    `workflowId: ${binding.workflowId}`,
+    `generation: ${binding.generation}`,
+  ].join('\n');
+}
+
+/** S4：agentToolsEnabled 辅助（与 config 默认一致）。 */
+function agentToolsEnabled(config: PluginConfig): boolean {
+  return config.agentToolsEnabled !== false;
+}
 
 /** 顶层不阻塞等待任何可选服务；具体能力在子 fiber 内装配。 */
 export const inject: readonly string[] = [];
@@ -146,15 +169,56 @@ function assembleWorkbench(
 
   const runtime = agentRuntimeFrom(ctx);
 
+  // S4：审批服务探测（缺审批服务不注册推送工具）。
+  const approval = probeApproval(get('approval'));
+  setApprovalRuntime(approval);
+
+  const pushEnabled = () => config.pushEnabled === true && agentToolsEnabled(config);
+  const pushArmed = () => approval !== undefined && pushToolRegistered;
+
+  let pushToolRegistered = false;
+  let stopPreExecute: (() => void) | undefined;
+
   const service = new WorkbenchService({
     bridge,
     workflow: undefined as unknown as AgentWorkflow,
     randomId: () => randomUUID(),
     replay: new Map(),
     onError: (message) => logger.warn(`dsh-plugin-wewrite: 业务错误：${message}`),
+    pushEnabled,
+    pushArmed,
+    publishTransport: () => config.publishTransport,
+    resolveCredentials: async () => {
+      // S4：凭据只在通过双闸后从 credentials 取出，经私有 stdin 传给 facade。
+      // 这里 resolve 一个引用（WEWRITE_APPID/WEWRITE_SECRET），不缓存、不写日志。
+      const credentials = get('credentials') as {
+        resolve?: (ref: unknown) => Promise<{ value: string } | undefined>;
+      } | undefined;
+      if (typeof credentials?.resolve !== 'function') return undefined;
+      const appid = await credentials.resolve('WEWRITE_APPID' as never).catch(() => undefined);
+      const secret = await credentials.resolve('WEWRITE_SECRET' as never).catch(() => undefined);
+      if (!appid?.value || !secret?.value) return undefined;
+      return { appid: appid.value, secret: secret.value };
+    },
+    enqueuePushFollowup: async (payload) => {
+      // 真实 open turn 路径：agent.followup(UserMessage) 入队固定 runId/intentId/expectedVersion。
+      const binding = workflow.bindingOf(payload.runId);
+      if (!binding) return { ok: false, error: { code: 'RUN_BUSY', message: '该写作任务没有活跃会话' } };
+      const handle = workflow.agentHandleOf(payload.runId);
+      const agent = handle?.agent;
+      if (!agent) return { ok: false, error: { code: 'RUN_BUSY', message: '该写作任务没有活跃会话' } };
+      const message = createUserMessage({
+        content: [{ type: 'text', text: pushFollowupText(payload, binding) }],
+        source: { kind: 'user' },
+      });
+      agent.followup(message);
+      return { ok: true };
+    },
   });
 
   const toolDefs = buildAgentTools(service);
+  // S4：仅在 pushEnabled + 审批服务就绪 + ask 监听/guard 已武装时把推送工具加进注册表。
+  const pushTool = buildPushTool(service);
 
   const workflow = new AgentWorkflow({
     runtime: runtime ?? {
@@ -164,13 +228,36 @@ function assembleWorkbench(
     },
     bridge,
     scopeSetup: (agentCtx) => {
-      // 专属写作 Agent 的 scope 装配：注册 8 个受控工具 + 继承层 restrict + 单调 guard。
+      // 专属写作 Agent 的 scope 装配：注册受控工具 + 继承层 restrict + 单调 guard。
       if (config.agentToolsEnabled === false) return;
+      const ctxLike = agentCtx as { get?: (name: string) => unknown; on?: (name: string, listener: unknown) => () => void };
+      const defs = pushEnabled() && approval ? [...toolDefs, pushTool] : toolDefs;
+      pushToolRegistered = pushEnabled() && approval !== undefined;
       setupAgentScope(
-        agentCtx as { get?: (name: string) => unknown },
-        toolDefs,
+        ctxLike,
+        defs,
         (message) => logger.warn(`dsh-plugin-wewrite: ${message}`),
       );
+      // S4 第一闸：为 wewrite_push_draft 武装 tools/pre-execute ask（监听回收则不再注册推送工具）。
+      // 注册在 agent 的 scoped Context（ctxLike.on），waterfall 只在该 Agent 生效。
+      if (pushEnabled() && approval && typeof ctxLike.on === 'function') {
+        stopPreExecute = installPushPreExecute(
+          ctxLike as never,
+          (exec) => {
+            const intentId = intentIdFromArgs(exec.arguments);
+            const summary = intentId ? pushSummaryOf(intentId) : undefined;
+            return pushAskReason({
+              title: summary?.title,
+              accountLabel: summary?.accountLabel,
+              articleVersion: summary?.articleVersion,
+              coverHash: summary?.coverHash,
+              gate: summary?.gate ?? '仅草稿，不群发',
+            });
+          },
+        );
+      } else if (pushEnabled() && approval) {
+        pushToolRegistered = false;
+      }
     },
     homeLabel: home ? '数据根（已配置，不显示路径）' : '数据根未配置',
     mainSkillName: 'wewrite',
@@ -182,7 +269,7 @@ function assembleWorkbench(
 
   setToolService(service);
 
-  return { service, workflow, bridge, interpreter, home, runtime };
+  return { service, workflow, bridge, interpreter, home, runtime, stopPreExecute };
 }
 
 /** 生产装配结果注册表（供真实 profile 装载后的取证/宿主探针读取，不进入 client 面）。 */
@@ -221,6 +308,9 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
   const getAssembledOnce = (fiberCtx: HostContext, get: (name: string) => unknown) => {
     if (!assembledCache) {
       assembledCache = assembleWorkbench(fiberCtx, config, logger, get);
+      if (typeof assembledCache.stopPreExecute === 'function') {
+        disposers.push(assembledCache.stopPreExecute);
+      }
       const record: AssembledWorkbench = {
         service: assembledCache.service,
         workflow: assembledCache.workflow,

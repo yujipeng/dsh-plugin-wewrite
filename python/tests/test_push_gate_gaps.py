@@ -16,7 +16,7 @@ import json
 import struct
 import zlib
 
-from conftest import call_facade, create_run, make_home, write_article
+from conftest import call_facade, create_run, make_home, make_publishable_run, write_article
 
 
 def _png_bytes() -> bytes:
@@ -105,12 +105,8 @@ def _intent(home, run_id, intent_id):
 
 
 def _setup(home, run_id):
-    version = write_article(home, run_id, "# 标题\n\n正文内容")
-    assert _publish(home, run_id, 1)["ok"] is True
-    cover = _put_cover(home, run_id)
-    assert cover["ok"] is True, cover
-    _write_review(home, run_id, version, True)
-    return version, cover["data"]
+    version, cover = make_publishable_run(home, run_id)
+    return version, cover
 
 
 def _send_inproc(dispatch, run_id, intent_id, version):
@@ -285,7 +281,9 @@ def test_red_probe_summary_reverify_is_load_bearing(tmp_path, monkeypatch):
     assert resp_a["ok"] is False, resp_a
 
     # 相 2：注入回退（等价于修复前无此项比对），改审稿后发送恢复成功。
+    # S4 prepare 要求审稿通过，故先恢复通过→prepare，再改不通过→发送。
     monkeypatch.setattr(draft_dispatch, "_verify_summary", lambda *a, **k: True)
+    _write_review(home, run_id, version, True)
     iid_b = new_intent()
     _write_review(home, run_id, version, False)
     resp_b = _send_inproc(draft_dispatch, run_id, iid_b, version)

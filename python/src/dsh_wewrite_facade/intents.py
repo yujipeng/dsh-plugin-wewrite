@@ -101,6 +101,8 @@ def record_intent(
     account_ref: str = "",
     account_version: str | None = None,
     cover_asset_id: str = "",
+    title: str = "",
+    digest: str = "",
 ) -> dict[str, Any]:
     """在 run 锁内登记一个新 intent（op_draft_prepare 调用），state=prepared。
 
@@ -134,6 +136,8 @@ def record_intent(
         "accountRef": account_ref,
         "accountVersion": account_version,
         "coverAssetId": cover_asset_id,
+        "title": title,
+        "digest": digest,
     }
     intents.append(entry)
     _write_intents(run_id, intents)

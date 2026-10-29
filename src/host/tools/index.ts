@@ -1,9 +1,9 @@
 /**
- * tools/（设计 §5 范围第 4 条）：8 个受控 Agent 工具。
+ * tools/（设计 §5 范围第 4 条 + S4 §7）：8 个常驻受控 Agent 工具 + 条件注册的推送工具。
  *
  * - 工具仅装在专属写作 Agent 的 scope（setup 内注册）。
  * - 每次工具执行从真实 exec.agent 查绑定；generation 取服务端绑定，不信模型自报。
- * - `wewrite_push_draft` 本 stage 不注册（S4）。
+ * - `wewrite_push_draft` 仅在 pushEnabled + 审批服务就绪 + ask 监听/guard 已武装时注册（S4）。
  * - 工具成功结构 {ok:true,data}，失败 {ok:false,error}，与业务契约一致。
  */
 
@@ -12,8 +12,9 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools';
 import type { ToolBindingContext } from '../../shared/contract';
 import type { WorkbenchService } from '../workbench-service';
+import { PUSH_TOOL_NAME } from '../push-approval';
 
-/** 工具名 → schema 名称（供 service 路由）。 */
+/** 工具名 → schema 名称（供 service 路由）。8 个常驻写作工具；推送工具条件注册。 */
 export const AGENT_TOOL_NAMES = [
   'wewrite_run_start',
   'wewrite_run_detail',
@@ -27,8 +28,11 @@ export const AGENT_TOOL_NAMES = [
 
 export type AgentToolName = (typeof AGENT_TOOL_NAMES)[number];
 
+/** 全部原生插件工具名（含条件注册的推送工具），guard 放行集。 */
+export const NATIVE_TOOL_NAMES: readonly string[] = [...AGENT_TOOL_NAMES, PUSH_TOOL_NAME];
+
 /** 工具白名单：guard 只放行这些工具，其余（含 run_code/shell/通用写入/代码执行/委派）一律 deny。 */
-export const CONTROLLED_TOOL_SET: ReadonlySet<string> = new Set(AGENT_TOOL_NAMES);
+export const CONTROLLED_TOOL_SET: ReadonlySet<string> = new Set(NATIVE_TOOL_NAMES);
 
 /** reserved `run_code`（PTC 传输）名称。 */
 export const RUN_CODE_NAME = 'run_code';
@@ -293,4 +297,33 @@ export function buildAgentTools(service: WorkbenchService): ToolDefinition[] {
   );
 
   return defs;
+}
+
+/**
+ * S4 推送工具：`wewrite_push_draft`（第二闸在 execute 内做业务状态复验）。
+ * 参数含 runId/intentId/expectedVersion；execute 内查真实绑定 + 校验 armed/pushEnabled。
+ */
+export function buildPushTool(service: WorkbenchService): ToolDefinition {
+  return defineTool({
+    name: PUSH_TOOL_NAME,
+    description: '推送微信草稿（逐篇确认，仅草稿不群发）。',
+    parameters: {
+      runId: { type: 'string' as const, description: '写作任务 runId（服务端绑定校验）' },
+      intentId: { type: 'string' as const, description: 'prepare 产出的 intentId' },
+      expectedVersion: { oneOf: [{ type: 'string' as const }, { type: 'null' as const }] },
+    } as never,
+    output: {
+      schema: { type: 'json' as const },
+      render: (_args, value) => [renderResult(value)],
+    },
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      const service2 = serviceRef;
+      if (!service2) throw new Error('工作台服务不可用');
+      const agentId = exec.agent?.id;
+      if (!agentId) throw new Error('推送工具只能在专属写作会话中调用');
+      const ctx = toolContextOf(service2, agentId, args as Record<string, unknown>);
+      return (await service2.toolPushDraft(args as never, ctx)) as never;
+    },
+  });
 }
