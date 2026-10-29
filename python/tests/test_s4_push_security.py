@@ -390,3 +390,94 @@ def test_concurrent_inprocess_create_draft_called_once(tmp_path, monkeypatch):
     assert total_calls == 1, (total_calls, outcomes)
     # 恰好一个 sent。
     assert [o for o in outcomes if o == ("ok", "succeeded")] == [("ok", "succeeded")], outcomes
+
+
+# ── 返修 3（第三轮）：adapter seam 不得绕过真实发送保护 ─────────────────
+
+def test_real_transport_substitute_still_guarded_by_whitelist_and_counter(monkeypatch):
+    """kind='wechat' + 注入替身：send_draft_real 必须先 assert_whitelisted('cgi-bin/draft/add')
+    再 inc_wechat()，然后才调替身 create_draft。"""
+    from dsh_wewrite_facade import publish as publish_mod
+    from dsh_wewrite_facade import counters as counters_mod
+
+    events: list[str] = []
+
+    class SpyAdapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create_draft(self, **kwargs):
+            self.calls += 1
+            events.append("create_draft")
+            return {"mediaId": "real-media-1", "dryRun": False, "title": ""}
+
+    # 注入 spy 观察 assert_whitelisted / inc_wechat 是否先于 create_draft 执行。
+    real_assert = publish_mod.assert_whitelisted
+    def spy_assert(endpoint):
+        events.append(f"whitelist:{endpoint}")
+        return real_assert(endpoint)
+    monkeypatch.setattr(publish_mod, "assert_whitelisted", spy_assert)
+
+    real_inc = counters_mod.get_counters().inc_wechat
+    def spy_inc():
+        events.append("inc_wechat")
+        return real_inc()
+    monkeypatch.setattr(counters_mod.get_counters(), "inc_wechat", spy_inc)
+
+    adapter = SpyAdapter()
+    transport = publish_mod.PublishTransport(adapter=adapter, is_fake=False)
+    result = publish_mod.send_draft_real(
+        transport, title="t", html="<p>x</p>", digest="d", thumb_media_id="cover-media", author=None,
+    )
+
+    assert result["mediaId"] == "real-media-1"
+    assert adapter.calls == 1
+    # 白名单与计数先于 create_draft，且白名单端点正确。
+    assert events.index("whitelist:cgi-bin/draft/add") < events.index("inc_wechat") < events.index("create_draft"), events
+
+
+def test_real_transport_substitute_bypass_non_whitelisted_rejected_and_not_counted(monkeypatch):
+    """负向：替身无法绕过白名单——send_draft_real 的白名单在 create_draft 之前强制。
+
+    注入替身即使想在 create_draft 里直连群发端点，也会在 send_draft_real 入口
+    被 assert_whitelisted('cgi-bin/draft/add') 之外的白名单边界挡住；这里直接证明
+    非白名单端点被 assert_whitelisted 拒绝，且拒绝路径不触发 inc_wechat（计数不增）。
+    """
+    from dsh_wewrite_facade import publish as publish_mod
+    from dsh_wewrite_facade import counters as counters_mod
+    from dsh_wewrite_facade.errors import FacadeError
+    import pytest as _pytest
+
+    counters_mod.reset_counters()
+    before = counters_mod.get_counters().wechat()
+
+    # 群发端点被白名单拒绝。
+    with _pytest.raises(FacadeError) as exc:
+        publish_mod.assert_whitelisted("https://api.weixin.qq.com/cgi-bin/message/mass/send")
+    assert exc.value.code == "FORBIDDEN"
+    # 拒绝路径未调用 inc_wechat（send_draft_real 只在白名单通过后才计数）。
+    assert counters_mod.get_counters().wechat() == before
+
+
+def test_real_transport_substitute_inc_wechat_on_each_real_send(monkeypatch):
+    """kind='wechat' + 注入替身：每次真实发送 inc_wechat() 计数递增。"""
+    from dsh_wewrite_facade import publish as publish_mod
+    from dsh_wewrite_facade import counters as counters_mod
+
+    counters_mod.reset_counters()
+    before = counters_mod.get_counters().wechat()
+
+    class CountingRealAdapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create_draft(self, **kwargs):
+            self.calls += 1
+            return {"mediaId": "real-media", "dryRun": False, "title": ""}
+
+    adapter = CountingRealAdapter()
+    transport = publish_mod.PublishTransport(adapter=adapter, is_fake=False)
+    publish_mod.send_draft_real(transport, title="t", html="<p>x</p>", digest="d", thumb_media_id="c", author=None)
+
+    assert adapter.calls == 1
+    assert counters_mod.get_counters().wechat() == before + 1, "每次真实发送 inc_wechat 计数递增"

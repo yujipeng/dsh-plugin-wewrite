@@ -115,10 +115,7 @@ class RealPublisher:
         #    首版只处理已登记本地资源；无本地图片引用时跳过（不产生外连）。
         html = self._upload_inline_images(token, html)
 
-        # 3) 建草稿（白名单 + 计数）。
-        assert_whitelisted("cgi-bin/draft/add")
-        get_counters().inc_wechat()
-        self.calls += 1
+        # 3) 建草稿（白名单 + 计数由 send_draft_real 统一施加，任何 adapter/替身都绕不过）。
         try:
             result = _upstream_create_draft(
                 access_token=token,
@@ -199,7 +196,15 @@ def send_draft_fake(transport: PublishTransport, *, title: str, html: str, diges
 
 def send_draft_real(transport: PublishTransport, *, title: str, html: str, digest: str,
                     thumb_media_id: str | None, author: str | None) -> dict:
-    """走真实 transport 发送草稿（每个外部调用已过白名单 + 计数）。"""
+    """走真实 transport 发送草稿。
+
+    白名单校验与微信调用计数在 adapter 之上统一施加，任何注入替身都绕不过：
+    - 先 `assert_whitelisted('cgi-bin/draft/add')` 放行真实草稿端点；
+    - 再 `get_counters().inc_wechat()` 计入真实微信调用；
+    - 最后才调用 adapter 的 `create_draft`（HTTP/调用出口）。
+    """
+    assert_whitelisted("cgi-bin/draft/add")
+    get_counters().inc_wechat()
     return transport.adapter.create_draft(
         title=title, html=html, digest=digest,
         thumb_media_id=thumb_media_id, author=author,
