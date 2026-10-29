@@ -435,6 +435,36 @@ def _update_state_metadata(run_id: str, metadata: dict[str, Any]) -> None:
     write_state_yaml(run_id, yaml.safe_dump(state, allow_unicode=True, sort_keys=False))
 
 
+def patch_state_editorial_review(run_id: str, *, decision: Any, publishable: bool) -> None:
+    """审稿通过后就地补丁 state.editorial.decision/publishable（finish_run 封存校验需要）。
+
+    调用方须已持 run 锁。基于磁盘原始 state 就地补丁，其余字段原样保留；
+    损坏即拒绝，绝不写回合成状态。正文未变时旧审稿仍有效，正文变更由 article_save 使旧审稿失效。
+    """
+    ensure_writable_state(run_id)
+    fd, _st = paths.open_state(run_id)
+    with os.fdopen(fd, "rb") as f:
+        raw = f.read()
+    try:
+        state = yaml.safe_load(raw.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise state_corrupted("状态不可读，禁止编辑") from exc
+    if not isinstance(state, dict):
+        raise state_corrupted("状态不可读，禁止编辑")
+    if state.get("run_id") != run_id:
+        raise forbidden("state 与 runId 不符")
+
+    editorial = state.get("editorial")
+    if not isinstance(editorial, dict):
+        editorial = {}
+    editorial["decision"] = decision
+    editorial["publishable"] = publishable
+    state["editorial"] = editorial
+    from . import projection
+    state["updated"] = projection._now_rfc3339()
+    write_state_yaml(run_id, yaml.safe_dump(state, allow_unicode=True, sort_keys=False))
+
+
 def create_run(*, topic: str, mode: str, visual_mode: str, theme_id: str, request_id: str) -> dict[str, Any]:
     """调用上游 create_run（写面，持 home 全局锁）。副作用清单由调用方与测试逐项断言。
 

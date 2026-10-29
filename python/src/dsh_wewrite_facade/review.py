@@ -11,7 +11,7 @@ import json
 from typing import Any
 
 from .errors import FacadeError, invalid_input, not_found
-from . import binding, projection, storage
+from . import binding, projection, sanitize, storage
 
 
 def build_review(*, run_id: str, article_version: str | None, draft_version: str | None,
@@ -47,6 +47,8 @@ def build_review(*, run_id: str, article_version: str | None, draft_version: str
     report["assessment_source"] = "facade"
 
     # 落盘审稿报告（写面，显式写操作）：review-report.json 绑定 article_hash。
+    # 同时把 decision/publishable 就地补丁进 state.editorial（finish_run 的封存校验同时读
+    # editorial.decision/publishable 与 report.decision/publishable，两者都必须 pass/true）。
     with storage.run_lock(run_id, create=False):
         storage.ensure_writable_state(run_id)
         if context:
@@ -54,6 +56,11 @@ def build_review(*, run_id: str, article_version: str | None, draft_version: str
         report["article_hash"] = article_actual
         storage.write_run_file(run_id, "review-report.json",
                                json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"))
+        storage.patch_state_editorial_review(
+            run_id,
+            decision=report.get("decision"),
+            publishable=bool(report.get("publishable")),
+        )
     report_version = storage.sha256_hex(json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"))
 
     gate = {
@@ -94,6 +101,10 @@ def render_preview(*, run_id: str, kind: str, expected_version: str | None, them
         html = result.html
     except Exception as exc:
         raise FacadeError("INTERNAL", f"预览转换失败：{type(exc).__name__}") from exc
+
+    # 返修 5：返回前做 HTML 白名单清洗 + CSP（剔除 script/事件属性/iframe/远程 URL，
+    # 远程图片改写为 data 占位，CSP 禁外连）。
+    html = sanitize.sanitize_html(html)
 
     return {
         "runId": run_id,

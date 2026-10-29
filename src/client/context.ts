@@ -1,6 +1,6 @@
 /**
- * 客户端入口位类型（S1 占位面）。真实面板属后续 stage。
- * 形状对标本机 DSH 0.2.1-rc.4 的 ctx.slots（SlotRegistry）最小消费面。
+ * 客户端入口位类型（S1 占位面 → S3 真实接线）。
+ * 形状对标本机 DSH 0.2.1-rc.4 的 ctx.slots / ctx.connection / ctx.workspaces。
  */
 
 /** 注册一个入口位：rc.4 只对「已声明」的 slot 生效，未声明直接抛错。 */
@@ -19,19 +19,35 @@ export interface ClientSlots {
   inject?(slot: ClientSlotOptions['name'], callback: () => () => void): () => void;
 }
 
+/** 宿主 Connection client 面（dsh-client-connection rc.4 ClientConnectionRpc）。 */
+export interface ClientConnection {
+  readonly rpc: {
+    call(channel: string, endpoint: string, payload: unknown, signal?: AbortSignal): Promise<{
+      readonly ok: boolean;
+      readonly value?: unknown;
+      readonly error?: { readonly code: string; readonly message: string; readonly details: object };
+    }>;
+  };
+}
+
+/** 宿主 Workspaces client 面（dsh-api-workspace-controller rc.4 IWorkspaces）。 */
+export interface ClientWorkspaces {
+  readonly list: {
+    getSnapshot(): {
+      readonly items: ReadonlyArray<{ readonly workspaceId: string; readonly path: string; readonly title: string }>;
+    };
+  };
+}
+
 export interface ClientContext {
   readonly slots?: ClientSlots;
+  readonly connection?: ClientConnection;
+  readonly workspaces?: ClientWorkspaces;
   readonly effect?: (factory: () => void | (() => void), label?: string) => void;
 }
 
-/**
- * 宿主注入的 RPC 请求通道（dsh-client-connection 的 Web client 面）。
- * 由 slot inject 在 conversation.view 注入时挂到 globalThis，供面板发起 RPC。
- * 仅浏览器端存在；SSR/测试无此全局时面板显示「RPC 通道不可用」。
- */
-declare global {
-  // eslint-disable-next-line no-var
-  var __wewriteRpc:
-    | ((channel: string, endpoint: string, payload: unknown) => Promise<unknown>)
-    | undefined;
+/** 当前选中工作区 id（由 apply 时从 ctx.workspaces 解析后写入，供面板发起 run/start 使用）。 */
+export interface ClientRuntime {
+  readonly connection: ClientConnection;
+  readonly workspaceId: string | null;
 }

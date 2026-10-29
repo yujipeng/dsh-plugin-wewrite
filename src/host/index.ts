@@ -15,11 +15,19 @@ import { resolveLogger, type Disposer, type HostContext } from './types';
 import { WorkbenchService, type WorkbenchBridge } from './workbench-service';
 import { AgentWorkflow, type DshAgentRuntime } from './agent-workflow';
 import { runFacade } from './wewrite-bridge';
-import { buildAgentTools, setToolService, CONTROLLED_TOOL_SET, RUN_CODE_NAME } from './tools';
+import { buildAgentTools, setToolService, controlledToolGuard, INHERITED_TOOL_ALLOWLIST } from './tools';
 import { buildProvider, defaultManifestPath, PROVIDER_NAME } from './skills-provider';
 import { randomUUID } from 'node:crypto';
 
 export const name = 'dsh-plugin-wewrite';
+
+// 供真实 Agent e2e 证据脚本复用（不进入 client 面）。
+export { AgentWorkflow } from './agent-workflow';
+export type { DshAgentRuntime } from './agent-workflow';
+export { WorkbenchService } from './workbench-service';
+export type { WorkbenchBridge } from './workbench-service';
+export { runFacade } from './wewrite-bridge';
+export { buildAgentTools, setToolService, controlledToolGuard, INHERITED_TOOL_ALLOWLIST } from './tools';
 
 /** 顶层不阻塞等待任何可选服务；具体能力在子 fiber 内装配。 */
 export const inject: readonly string[] = [];
@@ -113,11 +121,14 @@ function assembleWorkbench(
     },
     bridge,
     scopeSetup: (agentCtx) => {
-      // 专属写作 Agent 的 scope 装配：注册 8 个受控工具 + 单调 guard。
-      // restrict 只过滤继承层；自身层与 reserved run_code 由 guard 拒绝（设计 §5 两条路径）。
+      // 专属写作 Agent 的 scope 装配：注册 8 个受控工具 + 继承层 restrict + 单调 guard。
+      // 设计 §5 两条路径分别落实：
+      // 1) 继承层：restrict({allow: 空清单}) 只过滤继承的全局/祖先层工具（shell/通用写入/代码执行/委派），
+      //    不把 scope-local 名称、未知名称或 reserved `run_code` 传给 restrict。
+      // 2) 自身层与 reserved：guard 显式拒绝 run_code/自身层危险工具，native 插件工具仍可执行。
       if (config.agentToolsEnabled === false) return;
       const agentTools = (agentCtx as { get?: (name: string) => unknown }).get?.('tools') as
-        | { register?: (d: unknown) => () => void; guard?: (g: unknown) => () => void }
+        | { register?: (d: unknown) => () => void; restrict?: (f: unknown) => () => void; guard?: (g: unknown) => () => void }
         | undefined;
       if (typeof agentTools?.register !== 'function') return;
       for (const def of toolDefs) {
@@ -127,14 +138,16 @@ function assembleWorkbench(
           logger.warn(`dsh-plugin-wewrite: 工具 ${def.name} scope 注册失败：${redactError(error)}`);
         }
       }
+      if (typeof agentTools.restrict === 'function') {
+        try {
+          agentTools.restrict({ allow: [...INHERITED_TOOL_ALLOWLIST] });
+        } catch (error) {
+          logger.warn(`dsh-plugin-wewrite: tools.restrict 继承层过滤失败：${redactError(error)}`);
+        }
+      }
       if (typeof agentTools.guard === 'function') {
         try {
-          agentTools.guard((execution: Readonly<{ name?: string }>) => {
-            const toolName = execution?.name ?? '';
-            if (toolName === RUN_CODE_NAME) return 'run_code 在本写作工作流中被禁用';
-            if (CONTROLLED_TOOL_SET.has(toolName)) return undefined;
-            return `工具 ${toolName} 不在受控写作清单内`;
-          });
+          agentTools.guard(controlledToolGuard);
         } catch (error) {
           logger.warn(`dsh-plugin-wewrite: tools.guard scope 注册失败：${redactError(error)}`);
         }
@@ -187,7 +200,25 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
     }
   }
 
-  // ── RPC + Agent 工具：子 fiber 内装配（需要 connection + webServer）──────────────
+  // ── Agent 工具 + skills：独立于 Web RPC 层装配（返修 7：真实 Agent 闭环在 headless
+  //    profile 也需要受控工具；连接/Web 只影响 client 面板 RPC 路由，不影响 Agent 工具面）。──────────────
+  // assembleWorkbench 需要 agents 服务；这里在 ['agents'] 子 fiber 里组装，工具随 startRun 的
+  // Agent setup 注册（scope 层）。RPC 路由单独在 connection/webServer 子 fiber 里挂。
+  if (typeof ctx.inject === 'function') {
+    try {
+      ctx.inject(['agents'], (agentsCtx) => {
+        const get = agentsCtx.get?.bind(agentsCtx) ?? (() => undefined);
+        const { workflow } = assembleWorkbench(agentsCtx, config, logger, get);
+        // 持有 workflow 引用，防止 GC；实际工具注册发生在 Agent setup 内。
+        void workflow;
+        refresh();
+      });
+    } catch (error) {
+      logger.warn(`dsh-plugin-wewrite: Agent 工具子 fiber 装配失败：${redactError(error)}`);
+    }
+  }
+
+  // ── RPC：子 fiber 内装配（需要 connection + webServer）──────────────
   if (typeof ctx.inject === 'function') {
     try {
       ctx.inject(['connection', 'webServer'], (rpcCtx) => {
@@ -199,7 +230,7 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
           return;
         }
 
-        const { service, workflow } = assembleWorkbench(rpcCtx, config, logger, get);
+        const { service } = assembleWorkbench(rpcCtx, config, logger, get);
 
         try {
           const stopRpc = registerWebRpcRoute(
@@ -213,12 +244,6 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
         } catch (error) {
           logger.warn(`dsh-plugin-wewrite: RPC 注册失败：${redactError(error)}`);
         }
-
-        // Agent 工具：在专属写作 Agent 的 setup 里注册（scope 层，由 assembleWorkbench 的
-        // scopeSetup 闭包完成）。scope 限制两条路径（设计 §5）：
-        // 1) 继承层工具由部署 preset 用 restrict({allow}) 过滤；
-        // 2) 自身层与 reserved run_code 由 scope 内单调 guard 拒绝。
-        void workflow;
 
         refresh();
       });

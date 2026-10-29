@@ -21,8 +21,10 @@ interface FakeAgent {
 
 function makeRuntime() {
   const agents = new Map<string, FakeAgent>();
+  const calls: Array<'create' | 'resume'> = [];
   const runtime: DshAgentRuntime = {
     async create(options) {
+      calls.push('create');
       const agent: FakeAgent = {
         id: options.sessionId,
         cancelled: [],
@@ -42,13 +44,29 @@ function makeRuntime() {
       return handle;
     },
     async resume(options) {
-      return runtime.create({ sessionId: options.resumeSessionId });
+      calls.push('resume');
+      const agent: FakeAgent = {
+        id: options.resumeSessionId,
+        cancelled: [],
+        followed: [],
+        cancel(cause: unknown) {
+          this.cancelled.push(cause);
+        },
+        followup(message: unknown) {
+          this.followed.push(JSON.stringify(message));
+        },
+      };
+      agents.set(options.resumeSessionId, agent);
+      return {
+        agent: agent as never,
+        dispose: async () => { agents.delete(options.resumeSessionId); },
+      } as AgentHandle;
     },
     get(id: string) {
       return (agents.get(id)?.id ? { id } : undefined) as never;
     },
   };
-  return { runtime, agents };
+  return { runtime, agents, calls };
 }
 
 function makeBridge(bindings: Map<string, { generation: number; workflowId: string; agentId: string; sessionId: string }>) {
@@ -82,7 +100,7 @@ function makeBridge(bindings: Map<string, { generation: number; workflowId: stri
 }
 
 function makeWorkflow(bridge: ReturnType<typeof makeBridge>) {
-  const { runtime, agents } = makeRuntime();
+  const { runtime, agents, calls } = makeRuntime();
   const workflow = new AgentWorkflow({
     runtime,
     bridge,
@@ -90,7 +108,7 @@ function makeWorkflow(bridge: ReturnType<typeof makeBridge>) {
     mainSkillName: 'wewrite',
     randomId: (() => { let n = 0; return () => `id-${++n}`; })(),
   });
-  return { workflow, agents };
+  return { workflow, agents, calls };
 }
 
 const runId = '20261028-120000-abcdef';
@@ -123,7 +141,7 @@ describe('AgentWorkflow（接管栅栏 + 句柄/取消参数）', () => {
   it('resumeRun 接管：expectedGeneration CAS 成功、新 workflowId、旧记录撤销', async () => {
     const bindings = new Map();
     const bridge = makeBridge(bindings as never);
-    const { workflow, agents } = makeWorkflow(bridge);
+    const { workflow, agents, calls } = makeWorkflow(bridge);
     await workflow.startRun({ runId, workspaceId: 'ws', topic: 't', mode: 'draft', visualMode: 'none', themeId: 't' });
 
     const oldAgentId = workflow.bindingOf(runId)!.agentId;
@@ -134,6 +152,9 @@ describe('AgentWorkflow（接管栅栏 + 句柄/取消参数）', () => {
       expect(result.data.binding.workflowId).not.toBe('id-2'); // 新 workflowId（id-3）
       expect(result.data.binding.agentId).not.toBe(oldAgentId);
     }
+    // 返修 3：接管走 runtime.resume 而非 create。
+    expect(calls.filter((c) => c === 'resume')).toHaveLength(1);
+    expect(calls.filter((c) => c === 'create')).toHaveLength(1); // 仅首次 startRun 用 create
     // 旧 Agent 被钩子取消（判别联合，非裸字符串）。
     const oldAgent = agents.get(oldAgentId);
     if (oldAgent) {

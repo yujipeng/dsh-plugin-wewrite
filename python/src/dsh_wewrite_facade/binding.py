@@ -14,7 +14,7 @@ import json
 import time
 from typing import Any
 
-from . import paths, storage
+from . import intents, paths, storage
 from .errors import FacadeError, forbidden, invalid_input, version_conflict
 
 _BINDING_REL = ".dsh-workbench/binding.json"
@@ -95,7 +95,8 @@ def publish_binding(
     - ``expected_generation`` 为 None 表示首次绑定（当前必须无绑定），否则必须等于
       持久化当前 generation；不匹配抛 VERSION_CONFLICT（并发接管仅一个成功）。
     - ``generation`` 是本次发布的**新** generation（首次 1，接管 g+1）。
-    - 发布失败不写盘，不回退代次。
+    - 返修 6：CAS 发布 + 旧 generation 的 intent 撤销放进同一可恢复事务——发布成功才写盘，
+      失败不写盘、不回退代次、不撤销 intent。
     """
     paths.validate_run_id(run_id)
     workflow_id = _valid_workflow_id(workflow_id)
@@ -118,6 +119,9 @@ def publish_binding(
             if not isinstance(current, dict) or current.get("generation") != expected_generation:
                 raise version_conflict("接管代次冲突，请刷新后重试")
 
+        # 同一可恢复事务：先写新绑定，再撤销旧 generation 的全部未消费 intent。
+        # 任一步失败都不发布新 Binding（binding 已在内存但未写盘前先算好；用两步写回，
+        # 但都在同一 run 锁临界区内，且 write_run_file_rel 失败会抛异常退出锁，不产生半提交 binding）。
         binding = {
             "runId": run_id,
             "workflowId": workflow_id,
@@ -133,4 +137,21 @@ def publish_binding(
             _BINDING_REL,
             json.dumps(binding, ensure_ascii=False, indent=2).encode("utf-8"),
         )
+        # 撤销旧 generation 的 intent（当前 workflowId/generation 除外；首次绑定无旧 intent）。
+        intents.revoke_intents_except(
+            run_id,
+            keep_workflow_id=workflow_id,
+            keep_generation=generation,
+        )
         return binding
+
+
+def revoke_intents_for_cancel(run_id: str) -> int:
+    """cancel 路径：在 run 锁内撤销该 run 的全部未消费 intent（返修 6）。
+
+    - 与 Agent 取消在 host 侧配合；facade 侧只负责把未消费 intent 标记 revoked。
+    - 返回撤销数（撤销后旧 intent 的外部调用计数为零）。
+    """
+    paths.validate_run_id(run_id)
+    with storage.run_lock(run_id, create=False):
+        return intents.revoke_all_intents(run_id)

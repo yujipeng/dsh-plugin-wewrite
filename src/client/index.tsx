@@ -1,15 +1,15 @@
 /**
- * dsh-plugin-wewrite 客户端入口（S1：仅注册入口位并渲染占位面板，验证装载链路通）。
+ * dsh-plugin-wewrite 客户端入口（S3：真实工作台面板 + 宿主 RPC 接线）。
  * 三个入口：conversation.view（会话内 tab）/ sidebar.footer.action（侧栏 footer）/ shell.overlay（全屏浮层）。
  *
- * rc.4 实测：slots.register() 只对「已声明」的 slot 生效，未声明直接抛错；
- * 正确形态是用 ctx.slots.inject() 包裹，等 slot 声明后再注册（与 dsh-client-ui-chat/
- * dsh-client-ui-cordis 官方范本一致）。裸 register 会把「未声明」错误吞进降级路径，
- * 页面看起来正常但入口位静默消失——这是质检与页面取证共同暴露的缺陷。
+ * rc.4 实测：
+ * - slots.register() 只对「已声明」的 slot 生效，未声明直接抛错；正确形态是 ctx.slots.inject()。
+ * - RPC 走宿主真实通道 ctx.connection.rpc.call(channel, endpoint, payload, signal?)（ClientConnectionRpc
+ *   的正式方法），connection 服务由 dsh-client-connection 的 client half 提供。
  */
 
-import { useEffect, useMemo, useState } from 'react';
-import type { ClientContext, ClientSlotOptions } from './context';
+import { useMemo, useState } from 'react';
+import type { ClientContext, ClientRuntime, ClientSlotOptions } from './context';
 import { WeWriteClient } from './rpc';
 import { RunsPanel } from './panels/Runs';
 import { TopicsPanel } from './panels/Topics';
@@ -37,20 +37,59 @@ function recordPending(slot: string): void {
 
 type ViewKey = 'runs' | 'topics' | 'editor' | 'review' | 'settings';
 
+/** 「写这个」完整两跳流程（返修 2 可判定单元）：runCreate 成功后必须 runStart，成功才交付 runId。 */
+export async function startWriting(
+  topic: string,
+  themeId: string,
+  workspaceId: string | null,
+  client: WeWriteClient,
+  randomId: () => string,
+): Promise<{ ok: true; runId: string } | { ok: false; message: string }> {
+  const created = await client.runCreate({
+    requestId: randomId(),
+    topic,
+    mode: 'draft',
+    visualMode: 'none',
+    themeId,
+  });
+  if (!created.ok) {
+    return { ok: false, message: created.error.message };
+  }
+  const { runId } = created.data as { runId: string };
+
+  if (!workspaceId) {
+    return { ok: false, message: '当前没有可用工作区，无法启动写作会话' };
+  }
+  const started = await client.runStart({
+    requestId: randomId(),
+    runId,
+    workspaceId,
+  });
+  if (!started.ok) {
+    return { ok: false, message: started.error.message };
+  }
+  return { ok: true, runId };
+}
+
+/** 从 ctx.workspaces 解析当前工作区 id（首个可用工作区；无则 null）。 */
+function resolveWorkspaceId(ctx: ClientContext): string | null {
+  const workspaces = ctx.workspaces;
+  if (!workspaces) return null;
+  try {
+    const items = workspaces.list.getSnapshot().items;
+    if (items.length > 0) return items[0].workspaceId;
+  } catch {
+    // 忽略：工作区服务未就绪时 workspaceId=null，run/start 会因缺 workspaceId 拒绝。
+  }
+  return null;
+}
+
 /** 真实工作台面板：任务列表/选题/编辑器/审稿/设置。 */
-function WorkbenchPanel(): JSX.Element {
+function WorkbenchPanel({ runtime }: { runtime: ClientRuntime }): JSX.Element {
   const [view, setView] = useState<ViewKey>('runs');
   const [runId, setRunId] = useState<string | null>(null);
-  const client = useMemo(
-    () =>
-      new WeWriteClient({
-        connection: {
-          // 宿主注入的 connection 客户端由 slot inject 提供，这里从全局 module 读取。
-          request: (channel, endpoint, payload) => globalThis.__wewriteRpc?.(channel, endpoint, payload) as Promise<unknown>,
-        },
-      }),
-    [],
-  );
+  const [actionError, setActionError] = useState<string | null>(null);
+  const client = useMemo(() => new WeWriteClient(runtime.connection), [runtime.connection]);
 
   return (
     <div className="ww-workbench" data-testid="wewrite-workbench">
@@ -67,24 +106,23 @@ function WorkbenchPanel(): JSX.Element {
           </button>
         ))}
       </nav>
+      {actionError ? (
+        <div className="ww-state ww-state--error" data-testid="ww-action-error">{actionError}</div>
+      ) : null}
       <div className="ww-workbench__body">
         {view === 'runs' && <RunsPanel client={client} onSelect={setRunId} />}
         {view === 'topics' && (
           <TopicsPanel
             client={client}
             onWrite={async (topic, themeId) => {
-              const result = await client.runCreate({
-                requestId: crypto.randomUUID(),
-                topic,
-                mode: 'draft',
-                visualMode: 'none',
-                themeId,
-              });
-              if (result.ok) {
-                const created = result.data as { runId: string };
-                setRunId(created.runId);
-                setView('runs');
+              setActionError(null);
+              const result = await startWriting(topic, themeId, runtime.workspaceId, client, () => crypto.randomUUID());
+              if (!result.ok) {
+                setActionError(result.message);
+                return;
               }
+              setRunId(result.runId);
+              setView('runs');
             }}
           />
         )}
@@ -96,17 +134,17 @@ function WorkbenchPanel(): JSX.Element {
   );
 }
 
-function ConversationView(): JSX.Element {
-  return <WorkbenchPanel />;
+function ConversationView({ runtime }: { runtime: ClientRuntime }): JSX.Element {
+  return <WorkbenchPanel runtime={runtime} />;
 }
 
-function SidebarFooterAction({ wide }: { wide: boolean }): JSX.Element {
+function SidebarFooterAction({ wide, runtime }: { wide: boolean; runtime: ClientRuntime }): JSX.Element {
   void wide;
-  return <WorkbenchPanel />;
+  return <WorkbenchPanel runtime={runtime} />;
 }
 
-function ShellOverlay(): JSX.Element {
-  return <WorkbenchPanel />;
+function ShellOverlay({ runtime }: { runtime: ClientRuntime }): JSX.Element {
+  return <WorkbenchPanel runtime={runtime} />;
 }
 
 /** 三个入口位的注册选项。conversation.view 的 inject 返回视图 props（session 相关，占位为最小面）。 */
@@ -145,6 +183,12 @@ export function apply(ctx: ClientContext): void {
     return;
   }
 
+  // 返修 1：RPC 走宿主真实通道 ctx.connection.rpc.call（不再使用无赋值点的 globalThis.__wewriteRpc）。
+  const runtime: ClientRuntime = {
+    connection: ctx.connection ?? { rpc: { call: async () => ({ ok: false, error: { code: 'CAPABILITY_UNAVAILABLE', message: 'RPC 通道不可用', details: {} } }) } },
+    workspaceId: resolveWorkspaceId(ctx),
+  };
+
   // 收集每个 slot 的 wait disposer（ctx.slots.inject 返回）与 register disposer。
   const waitDisposers: Array<() => void> = [];
   const registerDisposers: Array<() => void> = [];
@@ -154,18 +198,23 @@ export function apply(ctx: ClientContext): void {
     if (typeof slots.inject === 'function') {
       try {
         const wait = slots.inject(slot, () => {
-          const dispose = slots.register(slotOptions(slot), slotComponent(slot));
+          const component = slotComponent(slot) as (props: { runtime: ClientRuntime } & Record<string, unknown>) => JSX.Element;
+          const dispose = slots.register(
+            { ...slotOptions(slot), inject: (...args: unknown[]) => ({ runtime, ...(slot === 'conversation.view' ? { sessionId: args[0] } : {}) }) },
+            component,
+          );
           registerDisposers.push(dispose);
           registered.add(slot);
           return dispose;
         });
         waitDisposers.push(wait);
-        // 若 slot 此刻尚未声明，inject 会等待声明；记录 pending 供自检（不视为失败）。
-        // 注意：rc.4 SlotRegistry.inject 在 slot 已声明时同步回调并返回 wait；未声明时仅登记等待。
-        // 无法同步区分二者，故 pending 记录仅在「未注册且无错误」时于 effect 卸载前统一结算。
       } catch (error) {
         try {
-          const dispose = slots.register(slotOptions(slot), slotComponent(slot));
+          const component = slotComponent(slot) as (props: { runtime: ClientRuntime } & Record<string, unknown>) => JSX.Element;
+          const dispose = slots.register(
+            { ...slotOptions(slot), inject: (...args: unknown[]) => ({ runtime, ...(slot === 'conversation.view' ? { sessionId: args[0] } : {}) }) },
+            component,
+          );
           registerDisposers.push(dispose);
           registered.add(slot);
         } catch (registerError) {
@@ -174,7 +223,8 @@ export function apply(ctx: ClientContext): void {
       }
     } else {
       try {
-        const dispose = slots.register(slotOptions(slot), slotComponent(slot));
+        const component = slotComponent(slot) as (props: { runtime: ClientRuntime } & Record<string, unknown>) => JSX.Element;
+        const dispose = slots.register({ ...slotOptions(slot), inject: (...args: unknown[]) => ({ runtime, ...(slot === 'conversation.view' ? { sessionId: args[0] } : {}) }) }, component);
         registerDisposers.push(dispose);
         registered.add(slot);
       } catch (error) {

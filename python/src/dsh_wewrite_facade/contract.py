@@ -32,6 +32,7 @@ OPERATIONS = (
     "asset.get",
     "binding.publish",
     "binding.get",
+    "binding.revoke-intents",
     "draft.prepare",
     "draft.send",
     "draft.status",
@@ -333,6 +334,10 @@ def _v_binding_get(p: dict) -> dict:
     return {"runId": _require_run_id(p.get("runId"))}
 
 
+def _v_binding_revoke_intents(p: dict) -> dict:
+    return {"runId": _require_run_id(p.get("runId"))}
+
+
 def _v_draft_prepare(p: dict) -> dict:
     request_id = _require_request_id(p.get("requestId"))
     run_id = _require_run_id(p.get("runId"))
@@ -377,6 +382,7 @@ _VALIDATORS = {
     "asset.get": _v_asset_get,
     "binding.publish": _v_binding_publish,
     "binding.get": _v_binding_get,
+    "binding.revoke-intents": _v_binding_revoke_intents,
     "draft.prepare": _v_draft_prepare,
     "draft.send": _v_draft_send,
     "draft.status": _v_draft_status,

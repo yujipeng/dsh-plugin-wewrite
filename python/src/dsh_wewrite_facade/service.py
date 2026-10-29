@@ -13,7 +13,7 @@ import os
 import uuid
 from typing import Any
 
-from . import assets, binding, contract, counters, hotspots as hotspots_mod, paths, projection, publish, review as review_mod, storage
+from . import assets, binding, contract, counters, hotspots as hotspots_mod, intents, paths, projection, publish, review as review_mod, storage
 from .errors import (
     FacadeError,
     business_failure,
@@ -273,6 +273,8 @@ def op_artifact_write(payload: dict) -> dict[str, Any]:
         if current != expected:
             from .errors import version_conflict
             raise version_conflict("内容版本冲突，请刷新后重试")
+        # JSON/YAML 产物必须解析为对应结构，不能任意 blob 写入（设计 §4）。
+        _validate_structured_artifact(kind, content)
         storage.write_run_file(run_id, paths.KIND_FILES[kind], content.encode("utf-8"))
         new_version = storage.sha256_hex(content.encode("utf-8"))
     return business_success({
@@ -290,6 +292,26 @@ def _current_version(run_id: str, kind: str) -> str | None:
             return None
         raise
     return storage.sha256_hex(os.fdopen(fd, "rb").read())
+
+
+def _validate_structured_artifact(kind: str, content: str) -> None:
+    """JSON/YAML 产物写入前必须解析为对应结构（设计 §4），否则 INVALID_INPUT。"""
+    import yaml
+
+    if kind in ("review_report", "images_manifest"):
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            raise invalid_input("产物必须是合法 JSON")
+        if not isinstance(data, dict):
+            raise invalid_input("产物必须是 JSON 对象")
+    elif kind in ("brief", "claims", "sources"):
+        try:
+            data = yaml.safe_load(content)
+        except yaml.YAMLError:
+            raise invalid_input("产物必须是合法 YAML")
+        if not isinstance(data, dict):
+            raise invalid_input("产物必须是 YAML 对象")
 
 
 def op_article_save(payload: dict) -> dict[str, Any]:
@@ -372,6 +394,12 @@ def op_binding_get(payload: dict) -> dict[str, Any]:
     })
 
 
+def op_binding_revoke_intents(payload: dict) -> dict[str, Any]:
+    """cancel 路径：撤销该 run 全部未消费 intent（返修 6）。"""
+    revoked = binding.revoke_intents_for_cancel(payload["runId"])
+    return business_success({"runId": payload["runId"], "revoked": revoked})
+
+
 def op_draft_prepare(payload: dict) -> dict[str, Any]:
     """本地预检，不取令牌/不上传。"""
     run_id = payload["runId"]
@@ -381,13 +409,21 @@ def op_draft_prepare(payload: dict) -> dict[str, Any]:
         from .errors import version_conflict
         raise version_conflict("正文版本已变化，请刷新后重试")
     gate = projection.build_gate({}, run_id)
-    # 生成 intent（内存 + 落盘到 .dsh-workbench，写面如实）。
+    # 生成 intent（绑定当前 binding 的 workflowId/generation，用于接管/取消撤销）。
+    current_binding = binding.read_binding(run_id)
+    workflow_id = current_binding.get("workflowId", "") if isinstance(current_binding, dict) else ""
+    generation = current_binding.get("generation", 1) if isinstance(current_binding, dict) else 1
     intent_id = uuid.uuid4().hex
     with storage.run_lock(run_id, create=False):
         storage.ensure_writable_state(run_id)
-        storage.write_run_file_rel(run_id, ".dsh-workbench/intent.json",
-                                   json.dumps({"intentId": intent_id, "runId": run_id,
-                                               "articleVersion": version}, ensure_ascii=False).encode("utf-8"))
+        intents.record_intent(
+            run_id,
+            intent_id=intent_id,
+            workflow_id=workflow_id,
+            generation=generation,
+            article_version=version,
+            expires_at="",
+        )
     summary = {
         "runId": run_id,
         "title": "",
@@ -461,6 +497,7 @@ _DISPATCH = {
     "asset.get": op_asset_get,
     "binding.publish": op_binding_publish,
     "binding.get": op_binding_get,
+    "binding.revoke-intents": op_binding_revoke_intents,
     "draft.prepare": op_draft_prepare,
     "draft.send": op_draft_send,
     "draft.status": op_draft_status,

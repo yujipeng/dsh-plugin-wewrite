@@ -82,6 +82,11 @@ export class AgentWorkflow {
     return this.records.get(runId)?.binding;
   }
 
+  /** 测试/证据用：取某 run 的真实 Agent 句柄（生产代码不暴露）。 */
+  agentHandleOf(runId: string): AgentHandle | undefined {
+    return this.records.get(runId)?.handle;
+  }
+
   allBindings(): Binding[] {
     return [...this.records.values()].map((r) => r.binding);
   }
@@ -200,8 +205,10 @@ export class AgentWorkflow {
       const newWorkflowId = this.options.randomId();
       const newSessionId = this.options.randomId();
 
-      const handle = await this.options.runtime.create({
-        sessionId: newSessionId,
+      // 返修 3：接管必须走 runtime.resume（恢复执行所有权），create 只用于首次绑定。
+      // resumeSessionId 由持久化 binding 提供；宿主在 resume 的 setup 里重建 scope（工具/guard/restrict）。
+      const handle = await this.options.runtime.resume({
+        resumeSessionId: newSessionId,
         setup: (agentCtx, agent) => this.options.scopeSetup?.(agentCtx, agent),
       });
       const agent = handle.agent;
@@ -253,6 +260,8 @@ export class AgentWorkflow {
     } catch (error) {
       this.options.onError?.(redactError(error));
     }
+    // 返修 6：cancel 路径撤销该 run 的全部未消费 intent（facade 侧在同一 run 锁内）。
+    await this.options.bridge('binding.revoke-intents', { runId: input.runId }).catch(() => undefined);
     this.records.delete(input.runId);
     return businessSuccess({ runId: input.runId, phase: 'cancelled', generation: input.generation });
   }

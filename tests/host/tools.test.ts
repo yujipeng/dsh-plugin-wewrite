@@ -1,11 +1,18 @@
 /**
- * Agent 工具测试（设计 §5 两条路径 + 工具白名单）。
- * - 继承层 restrict 只过滤继承层（本插件不擅自枚举宿主 preset，部署配置 allowlist）。
- * - 自身层与 reserved run_code 由单调 guard 拒绝，副作用为零。
+ * Agent 工具测试（设计 §5 两条路径 + 工具白名单 + 继承层 restrict）。
+ * - 路径 1：继承层危险工具 restrict({allow:[]}) 后不可见且不可执行。
+ * - 路径 2：自身层注入的危险工具与 reserved run_code 被 guard 拒绝，副作用为零，native 插件工具仍可执行。
  */
 
 import { describe, expect, it } from 'vitest';
-import { AGENT_TOOL_NAMES, CONTROLLED_TOOL_SET, RUN_CODE_NAME, buildAgentTools } from '@/host/tools';
+import {
+  AGENT_TOOL_NAMES,
+  CONTROLLED_TOOL_SET,
+  INHERITED_TOOL_ALLOWLIST,
+  RUN_CODE_NAME,
+  buildAgentTools,
+  controlledToolGuard,
+} from '@/host/tools';
 import { WorkbenchService } from '@/host/workbench-service';
 import { AgentWorkflow } from '@/host/agent-workflow';
 
@@ -54,12 +61,35 @@ describe('Agent 工具（设计 §5 表格）', () => {
     }
   });
 
-  it('guard 白名单：受控工具放行，reserved run_code 与任意工具拒绝', () => {
+  it('继承层 allowlist 为空：不把 scope-local/reserved 名传给 restrict', () => {
+    // 路径 1：allow 清单只含核实过的继承只读工具；本工作流不需要任何继承层工具 → 空清单。
+    expect(INHERITED_TOOL_ALLOWLIST).toEqual([]);
+    // 不包含 scope-local 名与 reserved run_code。
+    expect(INHERITED_TOOL_ALLOWLIST).not.toContain('wewrite_run_start');
+    expect(INHERITED_TOOL_ALLOWLIST).not.toContain(RUN_CODE_NAME);
+  });
+});
+
+describe('controlledToolGuard（路径 2：自身层与 reserved 拒绝）', () => {
+  it('native 插件受控工具放行（返回 undefined）', () => {
     for (const name of AGENT_TOOL_NAMES) {
-      expect(CONTROLLED_TOOL_SET.has(name)).toBe(true);
+      expect(controlledToolGuard({ name })).toBeUndefined();
     }
-    expect(CONTROLLED_TOOL_SET.has(RUN_CODE_NAME)).toBe(false);
-    expect(CONTROLLED_TOOL_SET.has('bash')).toBe(false);
-    expect(CONTROLLED_TOOL_SET.has('wewrite_push_draft')).toBe(false);
+  });
+
+  it('reserved run_code 被显式拒绝', () => {
+    expect(controlledToolGuard({ name: RUN_CODE_NAME })).toContain('run_code');
+  });
+
+  it('shell/通用写入/代码执行/委派等危险工具被拒绝，副作用为零', () => {
+    for (const name of ['bash', 'write', 'edit', 'str_replace_editor', 'subagent', 'delegate', 'run_code']) {
+      expect(controlledToolGuard({ name })).toBeTruthy();
+    }
+    // guard 不产生副作用：纯函数，多次调用同结果。
+    expect(controlledToolGuard({ name: 'bash' })).toBe(controlledToolGuard({ name: 'bash' }));
+  });
+
+  it('未知工具被拒绝（fail-closed）', () => {
+    expect(controlledToolGuard({ name: 'unknown-tool' })).toBeTruthy();
   });
 });

@@ -33,6 +33,25 @@ export const CONTROLLED_TOOL_SET: ReadonlySet<string> = new Set(AGENT_TOOL_NAMES
 /** reserved `run_code`（PTC 传输）名称。 */
 export const RUN_CODE_NAME = 'run_code';
 
+/**
+ * 继承层 restrict 的最小面（设计 §5 第 1 点）：专属写作工作流不需要任何继承层工具，
+ * 因此 allow 为空清单——继承的 shell/通用写入/代码执行/委派等全局/祖先层工具全部不可见。
+ * 不把 scope-local 名称、未知名称或 reserved `run_code` 传给 restrict。
+ */
+export const INHERITED_TOOL_ALLOWLIST: readonly string[] = [];
+
+/**
+ * scope 内单调 guard（设计 §5 第 2 点）：实际调用名称不在受控执行清单即 deny，
+ * 显式拒绝 reserved `run_code`、shell、通用文件写入、代码执行和委派。
+ * 自身层受控插件工具也受相同 run/generation 检查（由 WorkbenchService 在 execute 内复核）。
+ */
+export function controlledToolGuard(execution: Readonly<{ name?: string }>): string | undefined {
+  const toolName = execution?.name ?? '';
+  if (toolName === RUN_CODE_NAME) return 'run_code 在本写作工作流中被禁用';
+  if (CONTROLLED_TOOL_SET.has(toolName)) return undefined;
+  return `工具 ${toolName} 不在受控写作清单内`;
+}
+
 /** 装配期注入的 WorkbenchService（模块级引用，工具 execute 时读取）。 */
 let serviceRef: WorkbenchService | undefined;
 
@@ -67,11 +86,17 @@ function renderResult(value: unknown): { type: 'text'; text: string } {
 }
 
 /** 从执行上下文解析真实绑定上下文：agent 必填（工具只在 Agent scope 注册）。 */
-export function toolContextOf(service: WorkbenchService, agentId: string): ToolBindingContext {
+export function toolContextOf(service: WorkbenchService, agentId: string, args: Record<string, unknown>): ToolBindingContext {
+  // 每次工具执行从真实 exec.agent 查绑定：先按 agentId 找到绑定，再校验参数 runId 与绑定 runId 一致。
   const binding = service.bindingForAgent(agentId);
   if (!binding) {
     throw new Error('该写作会话无有效 run 绑定');
   }
+  const argRunId = args.runId;
+  if (typeof argRunId === 'string' && argRunId !== binding.runId) {
+    throw new Error('跨 run 参数被拒');
+  }
+  // generation 取服务端绑定（内存投影），不信模型自报。
   return { runId: binding.runId, workflowId: binding.workflowId, generation: binding.generation };
 }
 
@@ -125,7 +150,7 @@ function tool(
       if (!service) throw new Error('工作台服务不可用');
       const agentId = exec.agent?.id;
       if (!agentId) throw new Error('工具只能在专属写作会话中调用');
-      const ctx = toolContextOf(service, agentId);
+      const ctx = toolContextOf(service, agentId, args as Record<string, unknown>);
       return (await run(args as Record<string, unknown>, ctx, exec)) as never;
     },
   });
@@ -181,7 +206,30 @@ export function buildAgentTools(service: WorkbenchService): ToolDefinition[] {
       runId: runIdParam(),
       articleVersion: nullableHashParam('正文版本哈希或 null'),
       draftVersion: nullableHashParam('初稿版本哈希或 null'),
-      assessment: { type: 'json' as const, description: '五维审稿评估' },
+      assessment: {
+        type: 'object' as const,
+        additionalProperties: true,
+        description: '审稿评估（decision=pass/revise/needs_input，pass_number=1|2，dimensions 五维 accuracy/viewpoint/usefulness/voice/readability 各 1–5 整数，blockers/major_issues 字符串数组，notes 字符串）',
+        properties: {
+          decision: { type: 'string' as const, enum: ['pass', 'revise', 'needs_input'], required: true },
+          pass_number: { type: 'integer' as const, enum: [1, 2], required: true },
+          dimensions: {
+            type: 'object' as const,
+            additionalProperties: false,
+            required: true,
+            properties: {
+              accuracy: { type: 'integer' as const, required: true },
+              viewpoint: { type: 'integer' as const, required: true },
+              usefulness: { type: 'integer' as const, required: true },
+              voice: { type: 'integer' as const, required: true },
+              readability: { type: 'integer' as const, required: true },
+            },
+          },
+          blockers: { type: 'array' as const, items: { type: 'string' as const }, required: true },
+          major_issues: { type: 'array' as const, items: { type: 'string' as const }, required: true },
+          notes: { type: 'string' as const, required: true },
+        },
+      },
     }, (args, ctx) => service.toolReview(args as never, ctx)),
   );
 
