@@ -1,26 +1,31 @@
-"""验收 8：draft.send 走假 transport 成功，wechatApiCalls === 0。"""
+"""验收 8：draft.send 走假 transport 成功，wechatApiCalls === 0。
+
+S4 更新：正文/封面/审稿按 S4 预检口径构造（200+ 字正文 + 真实封面资产 + 通过审稿）。
+"""
 
 from __future__ import annotations
 
-from conftest import call_facade, create_run, make_home, write_article
+from conftest import (
+    call_facade,
+    create_run,
+    make_home,
+    make_publishable_run,
+)
+
+
+def _prepare(home, run_id, cover_asset_id, theme="professional-clean"):
+    return call_facade(str(home), "draft.prepare", {
+        "requestId": "p1", "runId": run_id, "expectedVersion": None,
+        "coverAssetId": cover_asset_id, "themeId": theme,
+    })
 
 
 def test_draft_send_fake_transport_zero_wechat(tmp_path):
     home = make_home(tmp_path)
     run_id = create_run(home)
-    version = write_article(home, run_id, "# 标题\n\n正文内容")
+    version, cover = make_publishable_run(home, run_id)
 
-    # 四轮：draft.send 读正文前必须先复验 intent（active_intent_for）。
-    # 先发布 binding + 登记 intent，再发送。
-    pub = call_facade(str(home), "binding.publish", {
-        "requestId": "b1", "runId": run_id, "workflowId": "wf-1", "generation": 1,
-        "agentId": "a", "sessionId": "s", "workspaceId": "ws-1", "phase": "writing",
-    })
-    assert pub["ok"] is True, pub
-    prep = call_facade(str(home), "draft.prepare", {
-        "requestId": "p1", "runId": run_id, "expectedVersion": None,
-        "coverAssetId": "cover-1", "themeId": "professional-clean",
-    })
+    prep = _prepare(home, run_id, cover["assetId"])
     assert prep["ok"] is True, prep
     intent_id = prep["data"]["intentId"]
 
@@ -29,7 +34,8 @@ def test_draft_send_fake_transport_zero_wechat(tmp_path):
         "runId": run_id,
         "intentId": intent_id,
         "expectedVersion": version,
-        "context": {"runId": run_id, "workflowId": "wf-1", "generation": 1},
+        "transport": "fake",
+        "context": {"runId": run_id, "workflowId": "wf-a", "generation": 1},
     })
     assert resp["ok"] is True, resp
     data = resp["data"]
@@ -42,20 +48,12 @@ def test_draft_send_fake_transport_zero_wechat(tmp_path):
 
 
 def test_draft_send_rejects_revoked_intent_zero_wechat(tmp_path):
-    """四轮：intent 被 binding 撤销集合覆盖时，draft.send 拒且假 transport 计数零。"""
+    """intent 被 binding 撤销集合覆盖时，draft.send 拒且假 transport 计数零。"""
     home = make_home(tmp_path)
     run_id = create_run(home)
-    version = write_article(home, run_id, "# 标题\n\n正文内容")
+    version, cover = make_publishable_run(home, run_id)
 
-    pub = call_facade(str(home), "binding.publish", {
-        "requestId": "b1", "runId": run_id, "workflowId": "wf-1", "generation": 1,
-        "agentId": "a", "sessionId": "s", "workspaceId": "ws-1", "phase": "writing",
-    })
-    assert pub["ok"] is True, pub
-    prep = call_facade(str(home), "draft.prepare", {
-        "requestId": "p1", "runId": run_id, "expectedVersion": None,
-        "coverAssetId": "cover-1", "themeId": "professional-clean",
-    })
+    prep = _prepare(home, run_id, cover["assetId"])
     intent_id = prep["data"]["intentId"]
 
     # 接管到 generation=2，binding 撤销集合覆盖旧 intent。
@@ -68,7 +66,7 @@ def test_draft_send_rejects_revoked_intent_zero_wechat(tmp_path):
 
     resp = call_facade(str(home), "draft.send", {
         "requestId": "p2", "runId": run_id, "intentId": intent_id, "expectedVersion": version,
-        "context": {"runId": run_id, "workflowId": "wf-1", "generation": 1},
+        "context": {"runId": run_id, "workflowId": "wf-a", "generation": 1},
     })
     assert resp["ok"] is False, resp
     assert resp["error"]["code"] == "CANCELLED", resp
@@ -78,16 +76,9 @@ def test_draft_send_rejects_missing_context(tmp_path):
     """裁定 B：context 是内部必填字段，缺失即 INVALID_INPUT（浏览器/模型不能自报执行身份）。"""
     home = make_home(tmp_path)
     run_id = create_run(home)
-    version = write_article(home, run_id, "# 标题\n\n正文内容")
-    pub = call_facade(str(home), "binding.publish", {
-        "requestId": "b1", "runId": run_id, "workflowId": "wf-1", "generation": 1,
-        "agentId": "a", "sessionId": "s", "workspaceId": "ws-1", "phase": "writing",
-    })
-    assert pub["ok"] is True, pub
-    prep = call_facade(str(home), "draft.prepare", {
-        "requestId": "p1", "runId": run_id, "expectedVersion": None,
-        "coverAssetId": "cover-1", "themeId": "professional-clean",
-    })
+    version, cover = make_publishable_run(home, run_id)
+
+    prep = _prepare(home, run_id, cover["assetId"])
     intent_id = prep["data"]["intentId"]
 
     resp = call_facade(str(home), "draft.send", {
@@ -101,30 +92,31 @@ def test_draft_send_rejects_context_runid_mismatch(tmp_path):
     """裁定 B：context.runId 必须等于 runId，否则拒绝。"""
     home = make_home(tmp_path)
     run_id = create_run(home)
-    version = write_article(home, run_id, "# 标题\n\n正文内容")
-    pub = call_facade(str(home), "binding.publish", {
-        "requestId": "b1", "runId": run_id, "workflowId": "wf-1", "generation": 1,
-        "agentId": "a", "sessionId": "s", "workspaceId": "ws-1", "phase": "writing",
-    })
-    assert pub["ok"] is True, pub
-    prep = call_facade(str(home), "draft.prepare", {
-        "requestId": "p1", "runId": run_id, "expectedVersion": None,
-        "coverAssetId": "cover-1", "themeId": "professional-clean",
-    })
+    version, cover = make_publishable_run(home, run_id)
+
+    prep = _prepare(home, run_id, cover["assetId"])
     intent_id = prep["data"]["intentId"]
 
     resp = call_facade(str(home), "draft.send", {
         "requestId": "p2", "runId": run_id, "intentId": intent_id, "expectedVersion": version,
-        "context": {"runId": "20261028-120000-abcdef", "workflowId": "wf-1", "generation": 1},
+        "context": {"runId": "20261028-120000-abcdef", "workflowId": "wf-a", "generation": 1},
     })
     assert resp["ok"] is False, resp
     assert resp["error"]["code"] == "INVALID_INPUT", resp
 
 
-def test_draft_send_rejects_real_transport(tmp_path):
+def test_build_transport_whitelist(tmp_path):
+    """S4：真实 transport 可构造但需凭据；白名单守卫拒绝群发端点。"""
     from dsh_wewrite_facade import publish
-    import pytest
     from dsh_wewrite_facade.errors import FacadeError
+    import pytest
+
+    # 真实 transport 需要凭据。
     with pytest.raises(FacadeError) as exc:
         publish.build_transport("wechat")
-    assert exc.value.code == "CAPABILITY_UNAVAILABLE"
+    assert exc.value.code == "FORBIDDEN"
+
+    with pytest.raises(FacadeError) as exc:
+        publish.build_transport("wechat", {"appid": "a", "secret": "s"})
+        publish.assert_whitelisted("cgi-bin/message/mass/send")
+    assert exc.value.code == "FORBIDDEN"

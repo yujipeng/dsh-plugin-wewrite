@@ -13,7 +13,7 @@ import os
 
 import pytest
 
-from conftest import call_facade, create_run, make_home, write_article
+from conftest import call_facade, create_run, make_home, make_publishable_run, write_article
 
 
 def _publish(home, run_id, generation, workflow="wf-a", expected=None):
@@ -30,20 +30,24 @@ def _publish(home, run_id, generation, workflow="wf-a", expected=None):
     })
 
 
-def _prepare(home, run_id):
+def _prepare(home, run_id, cover_asset_id):
     return call_facade(str(home), "draft.prepare", {
         "requestId": "p1", "runId": run_id, "expectedVersion": None,
-        "coverAssetId": "cover-1", "themeId": "professional-clean",
+        "coverAssetId": cover_asset_id, "themeId": "professional-clean",
     })
+
+
+def _setup(home, run_id, workflow="wf-a"):
+    """返回 (version, cover)。S4 预检口径：200+ 字正文 + 封面 + 通过审稿 + 指定 workflow 绑定。"""
+    return make_publishable_run(home, run_id, workflow=workflow)
 
 
 def test_takeover_rejects_old_intent_send_zero_calls(tmp_path):
     """audit_race 同构：接管后旧 intent 发送被拒，假 adapter 零调用。"""
     home = make_home(tmp_path)
     run_id = create_run(home)
-    version = write_article(home, run_id, "# 标题\n\n正文内容")
-    assert _publish(home, run_id, 1, workflow="wf-old")["ok"] is True
-    intent_id = _prepare(home, run_id)["data"]["intentId"]
+    version, cover = _setup(home, run_id, workflow="wf-old")
+    intent_id = _prepare(home, run_id, cover["assetId"])["data"]["intentId"]
 
     # 接管到 generation=2。
     assert _publish(home, run_id, 2, workflow="wf-new", expected=1)["ok"] is True
@@ -62,9 +66,8 @@ def test_send_full_chain_claim_dispatching_sent(tmp_path):
     """send 全链：prepared→claimed→dispatching→sent，operationId 唯一。"""
     home = make_home(tmp_path)
     run_id = create_run(home)
-    version = write_article(home, run_id, "# 标题\n\n正文内容")
-    assert _publish(home, run_id, 1, workflow="wf-1")["ok"] is True
-    intent_id = _prepare(home, run_id)["data"]["intentId"]
+    version, cover = _setup(home, run_id, workflow="wf-1")
+    intent_id = _prepare(home, run_id, cover["assetId"])["data"]["intentId"]
 
     resp = call_facade(str(home), "draft.send", {
         "requestId": "s1", "runId": run_id, "intentId": intent_id, "expectedVersion": version,
@@ -100,9 +103,8 @@ def test_takeover_run_busy_while_send_in_adapter_window(tmp_path, monkeypatch):
 
     home = make_home(tmp_path)
     run_id = create_run(home)
-    version = write_article(home, run_id, "# 标题\n\n正文内容")
-    assert _publish(home, run_id, 1, workflow="wf-1")["ok"] is True
-    intent_id = _prepare(home, run_id)["data"]["intentId"]
+    version, cover = _setup(home, run_id, workflow="wf-1")
+    intent_id = _prepare(home, run_id, cover["assetId"])["data"]["intentId"]
     monkeypatch.setenv("WEWRITE_HOME", str(home))
 
     entered = threading.Event()
@@ -175,9 +177,8 @@ def test_recover_claimed_to_revoked(tmp_path):
     """recover：claimed→revoked（显式写恢复）。"""
     home = make_home(tmp_path)
     run_id = create_run(home)
-    version = write_article(home, run_id, "# 标题\n\n正文内容")
-    assert _publish(home, run_id, 1, workflow="wf-1")["ok"] is True
-    intent_id = _prepare(home, run_id)["data"]["intentId"]
+    version, cover = _setup(home, run_id, workflow="wf-1")
+    intent_id = _prepare(home, run_id, cover["assetId"])["data"]["intentId"]
 
     # 手动把 intent 置为 claimed（模拟发送 claim 后卡住）。
     from dsh_wewrite_facade import intents as intents_mod
@@ -212,9 +213,8 @@ def test_recover_dispatching_to_unknown(tmp_path):
     """recover：dispatching→unknown。"""
     home = make_home(tmp_path)
     run_id = create_run(home)
-    version = write_article(home, run_id, "# 标题\n\n正文内容")
-    assert _publish(home, run_id, 1, workflow="wf-1")["ok"] is True
-    intent_id = _prepare(home, run_id)["data"]["intentId"]
+    version, cover = _setup(home, run_id, workflow="wf-1")
+    intent_id = _prepare(home, run_id, cover["assetId"])["data"]["intentId"]
 
     p = home / "runs" / run_id / ".dsh-workbench" / "intents.json"
     data = json.loads(p.read_text(encoding="utf-8"))

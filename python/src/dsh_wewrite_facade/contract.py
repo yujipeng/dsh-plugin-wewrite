@@ -371,9 +371,21 @@ def _v_draft_send(p: dict) -> dict:
     generation = context.get("generation")
     if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
         raise invalid_input("context.generation 不合法")
-    return {"requestId": request_id, "runId": run_id, "intentId": intent_id,
-            "expectedVersion": expected_version,
-            "context": {"runId": run_id, "workflowId": workflow_id, "generation": generation}}
+    # S4：transport 与 credentials 是内部 draft.send 协议字段（host 经私有 stdin 注入）。
+    # 公开 wechat/pushDraft 不加这两项；严格拒绝浏览器/模型自报。
+    transport = p.get("transport")
+    if transport is not None and transport not in ("fake", "wechat"):
+        raise invalid_input("transport 不合法")
+    credentials = p.get("credentials")
+    if credentials is not None and not isinstance(credentials, dict):
+        raise invalid_input("credentials 不合法")
+    out: dict = {"requestId": request_id, "runId": run_id, "intentId": intent_id,
+                 "expectedVersion": expected_version,
+                 "context": {"runId": run_id, "workflowId": workflow_id, "generation": generation},
+                 "transport": transport if transport is not None else "fake"}
+    if credentials is not None:
+        out["credentials"] = credentials
+    return out
 
 
 def _v_draft_status(p: dict) -> dict:
