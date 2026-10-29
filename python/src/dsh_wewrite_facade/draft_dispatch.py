@@ -48,10 +48,25 @@ def prepare(payload: dict) -> dict[str, Any]:
             raise version_conflict("正文版本已变化，请刷新后重试")
         gate = projection.build_gate({}, run_id)
         current_binding = binding.read_binding(run_id)
-        workflow_id = current_binding.get("workflowId", "") if isinstance(current_binding, dict) else ""
-        generation = current_binding.get("generation", 1) if isinstance(current_binding, dict) else 1
+        if not isinstance(current_binding, dict):
+            raise forbidden("run 未绑定写作会话，无法预检推送")
+        # 九轮-2/9：prepare 拒绝 cancelling/cancelled 的 binding。
+        if current_binding.get("phase") in ("cancelling", "cancelled"):
+            raise forbidden("run 已取消，无法预检推送")
+        workflow_id = current_binding.get("workflowId", "")
+        generation = current_binding.get("generation", 1)
         if not workflow_id:
             raise forbidden("run 未绑定写作会话，无法预检推送")
+        # 九轮-9：摘要字段一并写入 intent（reportVersion/publishable/coverHash/themeId/account）。
+        report_version = None
+        publishable = None
+        try:
+            _, rv = projection.read_artifact_content(run_id, "review_report")
+            report_version = rv
+        except FacadeError:
+            report_version = None
+        if isinstance(gate, dict):
+            publishable = bool(gate.get("publishable"))
         intents.record_intent(
             run_id,
             intent_id=intent_id,
@@ -59,6 +74,11 @@ def prepare(payload: dict) -> dict[str, Any]:
             generation=generation,
             article_version=version,
             expires_at=str(expires_at),
+            report_version=report_version,
+            publishable=publishable,
+            cover_hash="",
+            theme_id=payload["themeId"],
+            account_ref="",
         )
 
     summary = {
@@ -298,7 +318,10 @@ def recover(payload: dict) -> dict[str, Any]:
 
 
 def _verify_context(run_id: str, item: dict[str, Any], context: dict[str, Any]) -> bool:
-    """二次复验 context 与 binding/intent 的 runId/workflowId/generation 一致。"""
+    """二次复验 context 与 binding/intent 的 runId/workflowId/generation 一致（fail-closed）。
+
+    九轮-3：binding 不存在/不可读时返回 False，不得跳过核对。
+    """
     if context.get("runId") != run_id:
         return False
     if item.get("workflowId") != context.get("workflowId"):
@@ -306,13 +329,26 @@ def _verify_context(run_id: str, item: dict[str, Any], context: dict[str, Any]) 
     if item.get("generation") != context.get("generation"):
         return False
     current_binding = binding.read_binding(run_id)
-    if isinstance(current_binding, dict):
-        if current_binding.get("workflowId") != context.get("workflowId"):
-            return False
-        if current_binding.get("generation") != context.get("generation"):
-            return False
-        revoked = current_binding.get("revokedIntentIds")
-        if isinstance(revoked, list) and item.get("intentId") in revoked:
+    if not isinstance(current_binding, dict):
+        # binding 缺失/损坏：fail-closed，不放行。
+        return False
+    if current_binding.get("workflowId") != context.get("workflowId"):
+        return False
+    if current_binding.get("generation") != context.get("generation"):
+        return False
+    # phase fence（九轮-2）：cancelling/cancelled 一律拒。
+    if current_binding.get("phase") in ("cancelling", "cancelled"):
+        return False
+    revoked = current_binding.get("revokedIntentIds")
+    if isinstance(revoked, list) and item.get("intentId") in revoked:
+        return False
+    # TTL（九轮-1）：过期即拒。
+    expires = item.get("expiresAt")
+    if isinstance(expires, str) and expires:
+        try:
+            if int(expires) <= int(time.time()):
+                return False
+        except ValueError:
             return False
     return True
 

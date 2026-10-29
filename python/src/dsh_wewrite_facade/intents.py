@@ -45,12 +45,19 @@ def _parse_intents(raw: bytes) -> list[dict[str, Any]]:
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        # 损坏：调用方按 STATE_CORRUPTED 处理，不能覆盖。
         raise state_corrupted("推送记录损坏")
     if not isinstance(data, dict):
         raise state_corrupted("推送记录损坏")
     items = data.get("intents", [])
-    return items if isinstance(items, list) else []
+    # 九轮-5：结构错误 fail-closed——intents 非 list、条目非 dict、缺 intentId 一律 STATE_CORRUPTED。
+    if not isinstance(items, list):
+        raise state_corrupted("推送记录结构损坏")
+    for item in items:
+        if not isinstance(item, dict):
+            raise state_corrupted("推送记录结构损坏")
+        if not isinstance(item.get("intentId"), str) or not item.get("intentId"):
+            raise state_corrupted("推送记录结构损坏")
+    return items
 
 
 def _write_intents(run_id: str, intents: list[dict[str, Any]]) -> None:
@@ -77,8 +84,16 @@ def record_intent(
     generation: int,
     article_version: str | None,
     expires_at: str,
+    report_version: str | None = None,
+    publishable: bool | None = None,
+    cover_hash: str = "",
+    theme_id: str = "",
+    account_ref: str = "",
 ) -> dict[str, Any]:
-    """在 run 锁内登记一个新 intent（op_draft_prepare 调用），state=prepared。"""
+    """在 run 锁内登记一个新 intent（op_draft_prepare 调用），state=prepared。
+
+    九轮-9：摘要字段（reportVersion/publishable/coverHash/themeId/account）一并写入。
+    """
     paths.validate_run_id(run_id)
     intents = read_intents(run_id)
     intents = [i for i in intents if isinstance(i, dict)]
@@ -98,6 +113,11 @@ def record_intent(
         "dispatchStartedAt": None,
         "result": None,
         "issue": None,
+        "reportVersion": report_version,
+        "publishable": publishable,
+        "coverHash": cover_hash,
+        "themeId": theme_id,
+        "accountRef": account_ref,
     }
     intents.append(entry)
     _write_intents(run_id, intents)

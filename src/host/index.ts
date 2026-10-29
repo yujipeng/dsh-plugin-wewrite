@@ -295,14 +295,9 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
         const assembled = getAssembledOnce(rpcCtx, get);
 
         try {
-          // 七轮-5：记录实际注册到路由的 handler（e2e 走这一个，不再重新 createHandler）。
+          // 九轮-7：先 registerWebRpcRoute 注册，成功后才把 handler 存到 assembled/global。
+          // 删除路由注册这段，handler 不应暴露，e2e 必须失败。
           const registeredHandler = createHandler(assembled.service);
-          const record = assembledByProfile.get('default');
-          if (record) {
-            assembledByProfile.set('default', { ...record, handler: registeredHandler });
-            (globalThis as unknown as { __wewriteAssembled?: AssembledWorkbench }).__wewriteAssembled =
-              { ...record, handler: registeredHandler };
-          }
           const stopRpc = registerWebRpcRoute(
             webServer as never,
             connection as never,
@@ -311,6 +306,13 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
           );
           logger.info('dsh-plugin-wewrite: RPC 通道已注册 /wewrite-python');
           if (typeof stopRpc === 'function') disposers.push(() => Promise.resolve(stopRpc()).catch(() => undefined));
+          // 注册成功后才记录 handler（供取证）。
+          const record = assembledByProfile.get('default');
+          if (record) {
+            assembledByProfile.set('default', { ...record, handler: registeredHandler });
+            (globalThis as unknown as { __wewriteAssembled?: AssembledWorkbench }).__wewriteAssembled =
+              { ...record, handler: registeredHandler };
+          }
         } catch (error) {
           logger.warn(`dsh-plugin-wewrite: RPC 注册失败：${redactError(error)}`);
         }

@@ -87,6 +87,7 @@ def require_active_binding(run_id: str, workflow_id: Any, generation: Any) -> No
     - 无绑定 → FORBIDDEN（未绑定 run 不允许 Agent/受控写入）。
     - workflowId 不同 → FORBIDDEN（跨工作流/跨 run 参数被拒）。
     - generation 不同 → CANCELLED（旧写租约已被新接管撤销）。
+    - phase 为 cancelling/cancelled → FORBIDDEN（九轮-2：取消/已取消一律拒写）。
     调用方必须已持 run 锁。
     """
     workflow_id = _valid_workflow_id(workflow_id)
@@ -94,6 +95,8 @@ def require_active_binding(run_id: str, workflow_id: Any, generation: Any) -> No
     binding = read_binding(run_id)
     if not isinstance(binding, dict):
         raise forbidden("run 未绑定写作会话")
+    if binding.get("phase") in ("cancelling", "cancelled"):
+        raise forbidden("run 已取消，禁止写入")
     if binding.get("workflowId") != workflow_id:
         raise forbidden("工作流与当前 run 绑定不符")
     if binding.get("generation") != generation:
@@ -142,7 +145,8 @@ def publish_binding(
                 if not isinstance(current, dict) or current.get("generation") != expected_generation:
                     raise version_conflict("接管代次冲突，请刷新后重试")
 
-            # 返修二轮-3：binding + 旧 generation 撤销集合合成单一原子提交记录。
+            # 返修二轮-3 + 九轮-4：binding + 撤销集合合成单一原子提交记录。
+            # 九轮-4：撤销集合 = 旧 binding.revokedIntentIds ∪ 本次重算（并集，墓碑不丢）。
             binding = {
                 "runId": run_id,
                 "workflowId": workflow_id,
@@ -153,11 +157,15 @@ def publish_binding(
                 "phase": phase,
                 "updated": int(time.time()),
             }
-            revoked_ids = intents.revoked_intent_ids_except(
+            new_revoked = intents.revoked_intent_ids_except(
                 run_id,
                 keep_workflow_id=workflow_id,
                 keep_generation=generation,
             )
+            old_revoked = current.get("revokedIntentIds") if isinstance(current, dict) else []
+            if not isinstance(old_revoked, list):
+                old_revoked = []
+            revoked_ids = sorted(set(old_revoked) | set(new_revoked))
             return _commit_binding_and_revocations(run_id, binding, revoked_ids)
 
 
