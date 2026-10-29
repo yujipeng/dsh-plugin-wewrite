@@ -29,6 +29,7 @@ from .errors import FacadeError, forbidden, internal, invalid_input, not_found, 
 
 _HOME_LOCK_NAME = ".dsh-workbench.lock"
 _RUN_LOCK_NAME = ".dsh-workbench.lock"
+_SEND_LOCK_NAME = "send.lock"
 
 # 锁顺序记账（线程内）：固定顺序 home → run；run → home 反序在获取 home 前被拒绝。
 # 每个 facade 子进程单请求单响应，跨进程不出现同一线程同时持两把锁的 run→home 反序。
@@ -102,9 +103,9 @@ def home_lock(*, create: bool) -> Iterator[None]:
     锁顺序：home 必须最先获取（栈为空时才能取 home），拒绝 run→home 反序。
     """
     stack = _lock_stack()
-    if "run" in stack:
-        # 反序获取：先持 run 再取 home，违反固定顺序。
-        raise forbidden("锁顺序违规：不能先持 run 锁再取全局锁")
+    if "run" in stack or "send" in stack:
+        # 反序获取：先持 run 或 send 再取 home，违反固定顺序（禁止 send → home → run）。
+        raise forbidden("锁顺序违规：不能先持 run/send 锁再取全局锁")
     root = paths.home()
     if create:
         # 写路径允许预建数据根（create_run 的副作用清单含 home 目录）。
@@ -150,6 +151,61 @@ def run_lock(run_id: str, *, create: bool) -> Iterator[None]:
         fcntl.flock(fd, fcntl.LOCK_EX)
         stack = _lock_stack()
         stack.append("run")
+        try:
+            yield
+        finally:
+            stack.pop()
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _open_send_lock_fd(run_id: str, *, create: bool) -> int:
+    """打开 `.dsh-workbench/send.lock` 的 fd（O_NOFOLLOW + 安全目录 fd）。create=False 不建。"""
+    run_fd, _exists = paths._open_run_dir_fd(run_id, create=False)
+    try:
+        try:
+            wb_fd = paths._open_dir_at(run_fd, ".dsh-workbench", "workbench")
+        except FacadeError as exc:
+            if not create:
+                raise FacadeError("CAPABILITY_UNAVAILABLE", "发送门闩不可用，需先创建 run") from exc
+            os.mkdir(".dsh-workbench", dir_fd=run_fd)
+            wb_fd = paths._open_dir_at(run_fd, ".dsh-workbench", "workbench")
+    finally:
+        os.close(run_fd)
+    try:
+        return os.open(_SEND_LOCK_NAME, (os.O_RDWR if create else os.O_RDONLY) | paths._O_NOFOLLOW
+                       | (os.O_CREAT if create else 0), 0o600, dir_fd=wb_fd)
+    finally:
+        os.close(wb_fd)
+
+
+@contextmanager
+def send_lock(run_id: str, *, create: bool) -> Iterator[None]:
+    """独立 send 门闩（每 run 一个）。`LOCK_EX | LOCK_NB`，竞争立即 RUN_BUSY。
+
+    锁序：send 门闩必须在 run 锁之前获取（门闩 → run）；发送/恢复全程不取 home。
+    """
+    paths.validate_run_id(run_id)
+    stack = _lock_stack()
+    if "run" in stack:
+        raise forbidden("锁顺序违规：不能先持 run 锁再取发送门闩")
+    try:
+        fd = _open_send_lock_fd(run_id, create=create)
+    except FacadeError as exc:
+        if exc.code == "CAPABILITY_UNAVAILABLE":
+            raise FacadeError("RUN_BUSY", "发送门闩不可用", retryable=True, run_id=run_id) from exc
+        raise
+    except OSError as exc:
+        raise forbidden(f"发送门闩不可用（{paths._os_reason(exc)}）") from exc
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise FacadeError("RUN_BUSY", "草稿正在发送，请稍后重试", retryable=True, run_id=run_id)
+        stack.append("send")
         try:
             yield
         finally:

@@ -29,6 +29,7 @@ def test_draft_send_fake_transport_zero_wechat(tmp_path):
         "runId": run_id,
         "intentId": intent_id,
         "expectedVersion": version,
+        "context": {"runId": run_id, "workflowId": "wf-1", "generation": 1},
     })
     assert resp["ok"] is True, resp
     data = resp["data"]
@@ -67,9 +68,57 @@ def test_draft_send_rejects_revoked_intent_zero_wechat(tmp_path):
 
     resp = call_facade(str(home), "draft.send", {
         "requestId": "p2", "runId": run_id, "intentId": intent_id, "expectedVersion": version,
+        "context": {"runId": run_id, "workflowId": "wf-1", "generation": 1},
     })
     assert resp["ok"] is False, resp
     assert resp["error"]["code"] == "CANCELLED", resp
+
+
+def test_draft_send_rejects_missing_context(tmp_path):
+    """裁定 B：context 是内部必填字段，缺失即 INVALID_INPUT（浏览器/模型不能自报执行身份）。"""
+    home = make_home(tmp_path)
+    run_id = create_run(home)
+    version = write_article(home, run_id, "# 标题\n\n正文内容")
+    pub = call_facade(str(home), "binding.publish", {
+        "requestId": "b1", "runId": run_id, "workflowId": "wf-1", "generation": 1,
+        "agentId": "a", "sessionId": "s", "workspaceId": "ws-1", "phase": "writing",
+    })
+    assert pub["ok"] is True, pub
+    prep = call_facade(str(home), "draft.prepare", {
+        "requestId": "p1", "runId": run_id, "expectedVersion": None,
+        "coverAssetId": "cover-1", "themeId": "professional-clean",
+    })
+    intent_id = prep["data"]["intentId"]
+
+    resp = call_facade(str(home), "draft.send", {
+        "requestId": "p2", "runId": run_id, "intentId": intent_id, "expectedVersion": version,
+    })
+    assert resp["ok"] is False, resp
+    assert resp["error"]["code"] == "INVALID_INPUT", resp
+
+
+def test_draft_send_rejects_context_runid_mismatch(tmp_path):
+    """裁定 B：context.runId 必须等于 runId，否则拒绝。"""
+    home = make_home(tmp_path)
+    run_id = create_run(home)
+    version = write_article(home, run_id, "# 标题\n\n正文内容")
+    pub = call_facade(str(home), "binding.publish", {
+        "requestId": "b1", "runId": run_id, "workflowId": "wf-1", "generation": 1,
+        "agentId": "a", "sessionId": "s", "workspaceId": "ws-1", "phase": "writing",
+    })
+    assert pub["ok"] is True, pub
+    prep = call_facade(str(home), "draft.prepare", {
+        "requestId": "p1", "runId": run_id, "expectedVersion": None,
+        "coverAssetId": "cover-1", "themeId": "professional-clean",
+    })
+    intent_id = prep["data"]["intentId"]
+
+    resp = call_facade(str(home), "draft.send", {
+        "requestId": "p2", "runId": run_id, "intentId": intent_id, "expectedVersion": version,
+        "context": {"runId": "20261028-120000-abcdef", "workflowId": "wf-1", "generation": 1},
+    })
+    assert resp["ok"] is False, resp
+    assert resp["error"]["code"] == "INVALID_INPUT", resp
 
 
 def test_draft_send_rejects_real_transport(tmp_path):

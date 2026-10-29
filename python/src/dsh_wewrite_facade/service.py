@@ -259,24 +259,42 @@ def op_artifact_get(payload: dict) -> dict[str, Any]:
     })
 
 
+# 改写审批摘要的 kind：article/draft/review_report 必须取 send 门闩（设计 §4 第 96 行）。
+_SEND_LATCHED_KINDS = frozenset({"article", "draft", "review_report"})
+
+
 def op_artifact_write(payload: dict) -> dict[str, Any]:
     run_id = payload["runId"]
     kind = payload["kind"]
     content = payload["content"]
     expected = payload["expectedVersion"]
+
+    # 裁定 A：article/draft/review_report 取 send 门闩（门闩 → run 锁）；其余 kind 只取 run 短锁。
+    if kind in _SEND_LATCHED_KINDS:
+        with storage.send_lock(run_id, create=True):
+            with storage.run_lock(run_id, create=False):
+                return _artifact_write_locked(payload)
     with storage.run_lock(run_id, create=False):
-        storage.ensure_writable_state(run_id)
-        if payload.get("context"):
-            binding.require_active_binding(run_id, payload["context"]["workflowId"],
-                                           payload["context"]["generation"])
-        current = _current_version(run_id, kind)
-        if current != expected:
-            from .errors import version_conflict
-            raise version_conflict("内容版本冲突，请刷新后重试")
-        # JSON/YAML 产物必须解析为对应结构，不能任意 blob 写入（设计 §4）。
-        _validate_structured_artifact(kind, content)
-        storage.write_run_file(run_id, paths.KIND_FILES[kind], content.encode("utf-8"))
-        new_version = storage.sha256_hex(content.encode("utf-8"))
+        return _artifact_write_locked(payload)
+
+
+def _artifact_write_locked(payload: dict) -> dict[str, Any]:
+    run_id = payload["runId"]
+    kind = payload["kind"]
+    content = payload["content"]
+    expected = payload["expectedVersion"]
+    storage.ensure_writable_state(run_id)
+    if payload.get("context"):
+        binding.require_active_binding(run_id, payload["context"]["workflowId"],
+                                       payload["context"]["generation"])
+    current = _current_version(run_id, kind)
+    if current != expected:
+        from .errors import version_conflict
+        raise version_conflict("内容版本冲突，请刷新后重试")
+    # JSON/YAML 产物必须解析为对应结构，不能任意 blob 写入（设计 §4）。
+    _validate_structured_artifact(kind, content)
+    storage.write_run_file(run_id, paths.KIND_FILES[kind], content.encode("utf-8"))
+    new_version = storage.sha256_hex(content.encode("utf-8"))
     return business_success({
         "runId": run_id,
         "kind": kind,
@@ -315,23 +333,27 @@ def _validate_structured_artifact(kind: str, content: str) -> None:
 
 
 def op_article_save(payload: dict) -> dict[str, Any]:
-    result = storage.article_save(
-        payload["runId"],
-        payload["markdown"],
-        payload["expectedVersion"],
-        payload["metadata"],
-    )
+    # 裁定 A：正文保存参与 send 门闩（门闩 → run 锁），发送在途时 RUN_BUSY。
+    with storage.send_lock(payload["runId"], create=True):
+        result = storage.article_save(
+            payload["runId"],
+            payload["markdown"],
+            payload["expectedVersion"],
+            payload["metadata"],
+        )
     return business_success(result)
 
 
 def op_review_build(payload: dict) -> dict[str, Any]:
-    result = review_mod.build_review(
-        run_id=payload["runId"],
-        article_version=payload["articleVersion"],
-        draft_version=payload["draftVersion"],
-        assessment=payload["assessment"],
-        context=payload.get("context"),
-    )
+    # 裁定 A：报告替换参与 send 门闩（门闩 → run 锁），发送在途时 RUN_BUSY。
+    with storage.send_lock(payload["runId"], create=True):
+        result = review_mod.build_review(
+            run_id=payload["runId"],
+            article_version=payload["articleVersion"],
+            draft_version=payload["draftVersion"],
+            assessment=payload["assessment"],
+            context=payload.get("context"),
+        )
     return business_success(result)
 
 
@@ -346,13 +368,24 @@ def op_preview_render(payload: dict) -> dict[str, Any]:
 
 
 def op_asset_put(payload: dict) -> dict[str, Any]:
-    result = assets.put_asset(
-        run_id=payload["runId"],
-        role=payload["role"],
-        media_type=payload["mediaType"],
-        base64_text=payload["base64"],
-        expected_article_version=payload["expectedArticleVersion"],
-    )
+    # 裁定 A：封面(role=cover)参与 send 门闩（coverHash 进审批摘要）；inline 只取 run 短锁。
+    if payload["role"] == "cover":
+        with storage.send_lock(payload["runId"], create=True):
+            result = assets.put_asset(
+                run_id=payload["runId"],
+                role=payload["role"],
+                media_type=payload["mediaType"],
+                base64_text=payload["base64"],
+                expected_article_version=payload["expectedArticleVersion"],
+            )
+    else:
+        result = assets.put_asset(
+            run_id=payload["runId"],
+            role=payload["role"],
+            media_type=payload["mediaType"],
+            base64_text=payload["base64"],
+            expected_article_version=payload["expectedArticleVersion"],
+        )
     return business_success(result)
 
 
@@ -446,17 +479,14 @@ def op_draft_prepare(payload: dict) -> dict[str, Any]:
 def op_draft_send(payload: dict) -> dict[str, Any]:
     """draft.send 只接假 transport：真实微信调用计数恒为零。
 
-    四轮：读正文之前必须先在 run 锁内调用 active_intent_for 复验（binding 撤销集合唯一权威）；
-    未通过即拒（CANCELLED），假 transport 调用计数保持零。
+    四轮 + 裁定 B：context 来自 host 可信绑定（不反填），读正文前在 run 锁内复验 intent。
     """
     run_id = payload["runId"]
     intent_id = payload["intentId"]
+    ctx = payload["context"]
     with storage.run_lock(run_id, create=False):
-        # 读正文前先复验 intent（占用前 fence）。
-        current_binding = binding.read_binding(run_id)
-        workflow_id = current_binding.get("workflowId", "") if isinstance(current_binding, dict) else ""
-        generation = current_binding.get("generation", 1) if isinstance(current_binding, dict) else 1
-        if intents.active_intent_for(run_id, intent_id, workflow_id=workflow_id, generation=generation) is None:
+        # 读正文前先复验 intent（用 host 传入的可信 context 的 workflowId/generation）。
+        if intents.active_intent_for(run_id, intent_id, workflow_id=ctx["workflowId"], generation=ctx["generation"]) is None:
             from .errors import cancelled
             raise cancelled("推送意图已失效，需重新预检", run_id=run_id)
         content, version = projection.read_artifact_content(run_id, "article")

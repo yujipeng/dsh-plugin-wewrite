@@ -353,8 +353,22 @@ def _v_draft_send(p: dict) -> dict:
     run_id = _require_run_id(p.get("runId"))
     intent_id = _require_str(p.get("intentId"), "intentId")
     expected_version = _require_optional_version(p.get("expectedVersion"))
+    # 裁定 B：context 是内部字段，只存在于内部 draft.send 协议；严格校验 context.runId === runId。
+    context = p.get("context")
+    if context is None:
+        raise invalid_input("context 缺失（内部发送协议必填）")
+    if not isinstance(context, dict):
+        raise invalid_input("context 不合法")
+    ctx_run_id = _require_run_id(context.get("runId"))
+    if ctx_run_id != run_id:
+        raise invalid_input("context.runId 与 runId 不一致")
+    workflow_id = _require_str(context.get("workflowId"), "context.workflowId")
+    generation = context.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise invalid_input("context.generation 不合法")
     return {"requestId": request_id, "runId": run_id, "intentId": intent_id,
-            "expectedVersion": expected_version}
+            "expectedVersion": expected_version,
+            "context": {"runId": run_id, "workflowId": workflow_id, "generation": generation}}
 
 
 def _v_draft_status(p: dict) -> dict:
