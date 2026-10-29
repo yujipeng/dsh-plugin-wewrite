@@ -67,6 +67,17 @@ function makeToolRuntime() {
   return { root, tools, scopedTools, agentKey, scope };
 }
 
+/** 注册一个只走 ask→guard→execute 的推送工具 stub（正常返回，不触发第二闸业务复验）。 */
+function registerPushStub(scopedTools: ToolRuntime) {
+  scopedTools.register({
+    name: PUSH_TOOL_NAME,
+    description: '推送微信草稿（逐篇确认，仅草稿不群发）。',
+    parameters: { type: 'object', properties: {} },
+    output: { schema: { type: 'string' as const }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },
+    execute: async () => 'ok',
+  } as never);
+}
+
 describe('S4 推送工具注册条件（第一闸门禁）', () => {
   it('pushEnabled=false 时 AGENT_TOOL_NAMES 不含 wewrite_push_draft', () => {
     expect([...AGENT_TOOL_NAMES]).not.toContain(PUSH_TOOL_NAME);
@@ -157,7 +168,7 @@ describe('真实调度链：执行令牌不跨 exec 复用（S4 强制断言 1�
     installPushPreExecute(scope.ctx as never, () => '推送微信草稿（仅草稿）');
 
     // 工具注册进 scoped tools，guard 放行 push 工具。
-    scopedTools.register(buildPushTool(makeService()));
+    registerPushStub(scopedTools);
     // 单调 guard：允许 native 工具 + 记录 exec.token（第二闸入口观察 token）。
     scopedTools.guard((execution) => {
       if (execution.name === PUSH_TOOL_NAME) {
@@ -194,6 +205,121 @@ describe('真实调度链：执行令牌不跨 exec 复用（S4 强制断言 1�
     expect(tokens[0]).not.toBe(tokens[1]);
     expect(typeof tokens[0]).toBe('symbol');
     expect(typeof tokens[1]).toBe('symbol');
+    scope.dispose();
+  });
+
+  it('旧 token/旧执行身份注入被忽略：宿主重铸新 Symbol，第二次独立 asked，执行正常完成', async () => {
+    const { root, scopedTools, agentKey, scope } = makeToolRuntime();
+
+    const asks: string[] = [];
+    root.provide('approval', {
+      request: async (req: { toolName: string; callId?: unknown }) => {
+        asks.push(`${req.toolName}:${String(req.callId ?? '')}`);
+        return 'allowed-once';
+      },
+    });
+
+    const tokens: unknown[] = [];
+    installPushPreExecute(scope.ctx as never, () => '推送微信草稿（仅草稿）');
+    registerPushStub(scopedTools);
+    scopedTools.guard((execution) => {
+      if (execution.name === PUSH_TOOL_NAME) {
+        tokens.push((execution as ToolExecution).token);
+        return undefined;
+      }
+      return CONTROLLED_TOOL_SET.has(execution.name) ? undefined : '拒绝';
+    });
+
+    const input = { runId: '20261029-120000-000001', intentId: 'intent-1', expectedVersion: null };
+    // 第一次真实执行，拿到旧 token。
+    await scopedTools.execute({
+      callId: ToolCallId('call-1'),
+      name: PUSH_TOOL_NAME,
+      arguments: input,
+      agent: agentKey as never,
+      signal: new AbortController().signal,
+    });
+    const oldToken = tokens[0];
+
+    // 第二次执行：在 ToolExecutionInput 里强塞旧 token + 伪造旧 callId（as never 绕过类型）。
+    const injected = {
+      callId: ToolCallId('call-2'),
+      name: PUSH_TOOL_NAME,
+      arguments: { ...input, intentId: 'intent-2' },
+      agent: agentKey as never,
+      signal: new AbortController().signal,
+      // 强塞旧执行身份（ToolExecutionInput 无 token 字段，宿主不读它）。
+      token: oldToken,
+      rootCallId: ToolCallId('call-1'),
+      parent: oldToken,
+    } as never;
+    const r2 = await scopedTools.execute(injected);
+
+    // 注入被忽略：guard 观察到的 token 是宿主新铸的 Symbol，不等于旧 token。
+    expect(tokens).toHaveLength(2);
+    expect(tokens[1]).not.toBe(oldToken);
+    expect(tokens[1]).not.toBe(tokens[0]);
+    expect(typeof tokens[1]).toBe('symbol');
+
+    // 第二次依然独立 asked（旧身份不能免掉审批）。
+    expect(asks).toHaveLength(2);
+    expect(asks[1]).toContain('call-2');
+
+    // 执行仍正常完成（证明「注入被忽略」而非「整个请求抛异常」）。
+    expect(r2.isError).toBe(false);
+    scope.dispose();
+  });
+
+  it('反向断言：旧 token 不能作为绕过路径直接进入 guard/execute（不被承认）', async () => {
+    const { root, scopedTools, agentKey, scope } = makeToolRuntime();
+
+    const asks: string[] = [];
+    root.provide('approval', {
+      request: async (req: { toolName: string; callId?: unknown }) => {
+        asks.push(`${req.toolName}:${String(req.callId ?? '')}`);
+        return 'allowed-once';
+      },
+    });
+
+    const tokens: unknown[] = [];
+    installPushPreExecute(scope.ctx as never, () => '推送微信草稿（仅草稿）');
+    registerPushStub(scopedTools);
+    scopedTools.guard((execution) => {
+      if (execution.name === PUSH_TOOL_NAME) {
+        tokens.push((execution as ToolExecution).token);
+        return undefined;
+      }
+      return CONTROLLED_TOOL_SET.has(execution.name) ? undefined : '拒绝';
+    });
+
+    const input = { runId: '20261029-120000-000002', intentId: 'intent-1', expectedVersion: null };
+    await scopedTools.execute({
+      callId: ToolCallId('call-1'),
+      name: PUSH_TOOL_NAME,
+      arguments: input,
+      agent: agentKey as never,
+      signal: new AbortController().signal,
+    });
+    const oldToken = tokens[0];
+
+    // 反向：用旧 token 走一条「绕过 ask」的路径——直接以旧 token 作为 parent 的嵌套调用，
+    // 仍必须经过 pre-execute（ask）而非被承认旧身份跳过审批。
+    const bypass = {
+      callId: ToolCallId('call-bypass'),
+      name: PUSH_TOOL_NAME,
+      arguments: { ...input, intentId: 'intent-bypass' },
+      agent: agentKey as never,
+      signal: new AbortController().signal,
+      parent: oldToken, // 旧 token 作为父执行身份注入
+    } as never;
+    const rBypass = await scopedTools.execute(bypass);
+
+    // 旧身份不被承认：第三次执行仍然触发了新的 ask（asks 长度 +1），token 也全新。
+    expect(asks).toHaveLength(2);
+    expect(tokens).toHaveLength(2);
+    expect(tokens[1]).not.toBe(oldToken);
+    // 调用仍正常完成（未因旧身份直接放行，而是重新走 ask→allowed-once→execute）。
+    expect(rBypass.isError).toBe(false);
     scope.dispose();
   });
 });

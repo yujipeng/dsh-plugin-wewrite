@@ -154,13 +154,36 @@ class PublishTransport:
     is_fake: bool
 
 
-def build_transport(kind: str, credentials: dict[str, Any] | None = None) -> PublishTransport:
-    """构造 transport。``fake``/``wechat`` 之外一律拒绝；真实 transport 必须有凭据。"""
+# 可注入的 adapter 工厂 seam（测试替身用，生产默认不变）。
+# 形状：(kind, credentials) -> PublisherAdapter。替换后 draft.send 的
+# assert_whitelisted / wechatApiCalls 仍生效（它们在 send 路径上，不在工厂内）。
+_adapter_factory: "Any" = None
+
+
+def set_adapter_factory(factory: Any) -> None:
+    """测试注入 adapter 工厂：`(kind, credentials) -> PublisherAdapter`。传 None 恢复默认。"""
+    global _adapter_factory
+    _adapter_factory = factory
+
+
+def _default_adapter(kind: str, credentials: dict[str, Any] | None) -> PublisherAdapter:
     if kind == "fake":
-        return PublishTransport(adapter=FakePublisher(), is_fake=True)
+        return FakePublisher()
     if kind == "wechat":
-        return PublishTransport(adapter=RealPublisher(credentials or {}), is_fake=False)
+        return RealPublisher(credentials or {})
     raise invalid_input("publishTransport 不合法")
+
+
+def build_transport(kind: str, credentials: dict[str, Any] | None = None) -> PublishTransport:
+    """构造 transport。``fake``/``wechat`` 之外一律拒绝；真实 transport 必须有凭据。
+
+    若注册了测试 adapter 工厂，则经工厂构造 adapter（测试替身）；白名单/计数
+    逻辑在 send 路径上，不因替换 adapter 而绕过。
+    """
+    if _adapter_factory is not None:
+        adapter = _adapter_factory(kind, credentials)
+        return PublishTransport(adapter=adapter, is_fake=(kind != "wechat"))
+    return PublishTransport(adapter=_default_adapter(kind, credentials), is_fake=(kind != "wechat"))
 
 
 def send_draft_fake(transport: PublishTransport, *, title: str, html: str, digest: str,

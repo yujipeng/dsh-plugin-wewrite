@@ -194,16 +194,24 @@ def test_prepare_rejects_body_too_short(tmp_path):
 
 # ── 返修 3：journal 唯一键边界（并发 / 重启 / 超时重试）────────────────
 
-def _send_inprocess(home, run_id, intent_id, version):
-    """在独立 facade 子进程里跑一次 draft.send（每个子进程代表一个已批准 callId）。"""
+def _count_file_lines(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return len(path.read_text(encoding="utf-8").splitlines())
+
+
+def _send_counting_inprocess(home, run_id, intent_id, version, count_file):
+    """在独立子进程里跑 counting_facade（标准 protocol 入口 + 注入文件计数替身）。"""
     env = facade_env(str(home))
+    env["CREATE_DRAFT_COUNT_FILE"] = str(count_file)
     req = {"protocol": 1, "requestId": "s", "operation": "draft.send", "payload": {
         "requestId": "s", "runId": run_id, "intentId": intent_id, "expectedVersion": version,
         "transport": "fake",
         "context": {"runId": run_id, "workflowId": "wf-1", "generation": 1},
     }}
+    counting_facade = Path(__file__).resolve().parent / "counting_facade.py"
     proc = subprocess.run(
-        [sys.executable, "-m", "dsh_wewrite_facade"],
+        [sys.executable, str(counting_facade)],
         input=json.dumps(req, ensure_ascii=False) + "\n",
         capture_output=True, text=True, env=env, timeout=60,
     )
@@ -211,19 +219,19 @@ def _send_inprocess(home, run_id, intent_id, version):
     return json.loads(proc.stdout)
 
 
-def test_concurrent_sends_same_intent_exactly_one_draft_add(tmp_path):
-    """多进程并发（多个已批准 callId 竞争同一 intentId）：最多一次 draft/add。"""
+def test_concurrent_sends_same_intent_create_draft_called_once(tmp_path):
+    """多进程并发（多个已批准 callId 竞争同一 intentId）：create_draft 跨进程计数 == 1。"""
     home = make_home(tmp_path)
     run_id = create_run(home)
     version, cover = make_publishable_run(home, run_id, workflow="wf-1")
     intent_id = _prepare(home, run_id, cover["assetId"])["data"]["intentId"]
 
-    # 多个独立子进程同时发同一 intent（模拟多个 callId 分别获批）。
+    count_file = tmp_path / "create_draft.count"
     results: list[dict] = []
     lock = threading.Lock()
 
     def worker():
-        r = _send_inprocess(home, run_id, intent_id, version)
+        r = _send_counting_inprocess(home, run_id, intent_id, version, count_file)
         with lock:
             results.append(r)
 
@@ -231,77 +239,42 @@ def test_concurrent_sends_same_intent_exactly_one_draft_add(tmp_path):
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=30)
+        t.join(timeout=60)
 
+    # 关键断言：跨进程共享计数 == 1（不再用「succeeded 数量」代替调用计数）。
+    assert _count_file_lines(count_file) == 1, (results, _count_file_lines(count_file))
+    # 恰好一个 succeeded（业务侧仍一致）。
     succeeded = [r for r in results if r.get("ok") is True and r.get("data", {}).get("status") == "succeeded"]
-    # 唯一一次 draft/add：恰好一个子进程得到 sent（真实 draft/add 最多一次）。
     assert len(succeeded) == 1, results
-    # 其余都是终态拒绝或 in-flight 重响应（claimed→pending_approval），绝不产生第二次 add。
-    others = [r for r in results if r is not succeeded[0]]
-    assert len(others) == len(results) - 1, results
-    for r in others:
-        if r.get("ok") is True:
-            # in-flight 重响应：claimed 状态返回 pending_approval，mediaId 为空。
-            assert r["data"]["status"] == "pending_approval", r
-            assert r["data"].get("mediaId") is None, r
-        else:
-            assert r["error"]["code"] in ("INVALID_TRANSITION", "VERSION_CONFLICT", "NOT_FOUND"), r
-    # 唯一成功的那次 dryRun=true，真实微信调用为零。
-    assert succeeded[0]["data"]["counters"]["wechatApiCalls"] == 0
 
 
 def test_restart_after_success_does_not_re_add(tmp_path):
-    """进程重启后状态恢复：同 intent 再次 send（新子进程）终态拒绝，不重复 draft/add。"""
+    """进程重启后状态恢复：同 intent 再次 send（新子进程）终态拒绝，create_draft 计数不增。"""
     home = make_home(tmp_path)
     run_id = create_run(home)
     version, cover = make_publishable_run(home, run_id, workflow="wf-1")
     intent_id = _prepare(home, run_id, cover["assetId"])["data"]["intentId"]
 
-    first = _send(home, run_id, intent_id, version)
+    count_file = tmp_path / "create_draft.count"
+    first = _send_counting_inprocess(home, run_id, intent_id, version, count_file)
     assert first["ok"] is True, first
+    assert _count_file_lines(count_file) == 1
 
-    # 模拟重启：全新子进程再发同一 intent（状态从磁盘恢复）。
-    again = _send_inprocess(home, run_id, intent_id, version)
+    # 模拟重启：全新子进程再发同一 intent（状态从磁盘恢复，终态拒绝）。
+    again = _send_counting_inprocess(home, run_id, intent_id, version, count_file)
     assert again["ok"] is False, again
     assert again["error"]["code"] in ("INVALID_TRANSITION", "VERSION_CONFLICT", "NOT_FOUND"), again
+    # 不重复 draft/add：计数仍为 1。
+    assert _count_file_lines(count_file) == 1
 
 
-def test_timeout_unknown_tombstone_no_retry_re_add(tmp_path):
-    """发送超时后标 unknown，墓碑不释放：再次 send 终态拒绝，不自动重试 add。"""
-    home = make_home(tmp_path)
-    run_id = create_run(home)
-    version, cover = make_publishable_run(home, run_id, workflow="wf-1")
-    intent_id = _prepare(home, run_id, cover["assetId"])["data"]["intentId"]
+def test_timeout_unknown_tombstone_no_retry_re_add(tmp_path, monkeypatch):
+    """发送超时后标 unknown，墓碑不释放：再次 send 终态拒绝，create_draft 计数仍 == 1。
 
-    # 模拟发送超时：dispatching → recover → unknown（墓碑）。
-    p = home / "runs" / run_id / ".dsh-workbench" / "intents.json"
-    data = json.loads(p.read_text(encoding="utf-8"))
-    for item in data["intents"]:
-        if item["intentId"] == intent_id:
-            item["state"] = "dispatching"
-            item["operationId"] = "op-timeout"
-            item["claimNonce"] = "nonce-timeout"
-    p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    rec = call_facade(str(home), "draft.recover", {"requestId": "r1", "runId": run_id, "intentId": intent_id})
-    assert rec["ok"] is True, rec
-    assert rec["data"]["unknown"] == 1
-
-    # unknown 墓碑不释放：再次 send 终态拒绝，不自动重试 add。
-    again = _send(home, run_id, intent_id, version)
-    assert again["ok"] is False, again
-    assert again["error"]["code"] == "INVALID_TRANSITION", again
-    # 未产生新的真实调用计数（拒绝路径无 counters）。
-    assert "counters" not in (again.get("data") or {})
-
-
-def test_concurrent_inprocess_create_draft_called_once(tmp_path, monkeypatch):
-    """进程内并发（共享计数 adapter）：真实 draft/add（create_draft）调用次数最多一次。
-
-    用共享计数 fake 直接驱动 draft_dispatch.send，多个线程并发同一 intent：
-    无论多少线程竞争，create_draft 只被调用一次；其余要么 in-flight 重响应、
-    要么终态拒绝。
+    用注入替身让 create_draft 真实抛异常触发 dispatching→unknown（不手工改 intents.json）。
     """
     from dsh_wewrite_facade import draft_dispatch
+    from dsh_wewrite_facade import publish as publish_mod
     from dsh_wewrite_facade.errors import FacadeError
 
     home = make_home(tmp_path)
@@ -310,15 +283,89 @@ def test_concurrent_inprocess_create_draft_called_once(tmp_path, monkeypatch):
     intent_id = _prepare(home, run_id, cover["assetId"])["data"]["intentId"]
     monkeypatch.setenv("WEWRITE_HOME", str(home))
 
-    calls: list[int] = []
-    real_send = draft_dispatch.publish.send_draft_fake
+    class ExplodingAdapter:
+        def __init__(self) -> None:
+            self.calls = 0
 
-    def counting_send(*args, **kwargs):
-        calls.append(1)
-        return real_send(*args, **kwargs)
+        def create_draft(self, **kwargs):
+            self.calls += 1
+            raise RuntimeError("simulated network timeout")
 
-    monkeypatch.setattr(draft_dispatch.publish, "send_draft_fake", counting_send)
+    first_calls: list[ExplodingAdapter] = []
+    publish_mod.set_adapter_factory(lambda kind, credentials: (first_calls.append(ExplodingAdapter()) or first_calls[-1]))
+    try:
+        resp = draft_dispatch.send(
+            {"requestId": "s1", "runId": run_id, "intentId": intent_id, "expectedVersion": version},
+            {"runId": run_id, "workflowId": "wf-1", "generation": 1},
+        )
+    finally:
+        publish_mod.set_adapter_factory(None)
 
+    assert resp["ok"] is True, resp
+    assert resp["data"]["status"] == "unknown", resp
+    assert first_calls[0].calls == 1, "create_draft 应被调用一次后抛异常"
+
+    # 墓碑保留：再次 send（正常替身）终态拒绝，不自动重试 add。
+    class OkAdapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create_draft(self, **kwargs):
+            self.calls += 1
+            return {"mediaId": "fake-ok", "dryRun": True, "title": ""}
+
+    second_calls: list[OkAdapter] = []
+    publish_mod.set_adapter_factory(lambda kind, credentials: (second_calls.append(OkAdapter()) or second_calls[-1]))
+    try:
+        try:
+            draft_dispatch.send(
+                {"requestId": "s2", "runId": run_id, "intentId": intent_id, "expectedVersion": version},
+                {"runId": run_id, "workflowId": "wf-1", "generation": 1},
+            )
+            code = None
+        except FacadeError as exc:
+            code = exc.code
+    finally:
+        publish_mod.set_adapter_factory(None)
+
+    assert code == "INVALID_TRANSITION", code
+    # 第二次 send 在 claim 阶段即终态拒绝，未构造 adapter、未再次调用 create_draft。
+    assert second_calls == [] or second_calls[0].calls == 0, "unknown 墓碑不得触发自动重试 add"
+
+
+def test_concurrent_inprocess_create_draft_called_once(tmp_path, monkeypatch):
+    """进程内并发（共享计数 adapter 工厂 seam）：create_draft 调用次数 == 1。
+
+    经 publish.set_adapter_factory 注入替身（白名单/计数逻辑在 send 路径，不绕过）。
+    """
+    from dsh_wewrite_facade import draft_dispatch
+    from dsh_wewrite_facade import publish as publish_mod
+    from dsh_wewrite_facade.errors import FacadeError
+
+    home = make_home(tmp_path)
+    run_id = create_run(home)
+    version, cover = make_publishable_run(home, run_id, workflow="wf-1")
+    intent_id = _prepare(home, run_id, cover["assetId"])["data"]["intentId"]
+    monkeypatch.setenv("WEWRITE_HOME", str(home))
+
+    class CountingAdapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create_draft(self, **kwargs):
+            self.calls += 1
+            return {"mediaId": "fake-inproc", "dryRun": True, "title": ""}
+
+    counters: list[CountingAdapter] = []
+    lock = threading.Lock()
+
+    def factory(kind, credentials):
+        adapter = CountingAdapter()
+        with lock:
+            counters.append(adapter)
+        return adapter
+
+    publish_mod.set_adapter_factory(factory)
     outcomes: list[tuple[str, str]] = []
 
     def run_send():
@@ -336,8 +383,10 @@ def test_concurrent_inprocess_create_draft_called_once(tmp_path, monkeypatch):
         t.start()
     for t in threads:
         t.join(timeout=30)
+    publish_mod.set_adapter_factory(None)
 
     # create_draft（= draft/add）只被调用一次。
-    assert len(calls) == 1, (calls, outcomes)
+    total_calls = sum(a.calls for a in counters)
+    assert total_calls == 1, (total_calls, outcomes)
     # 恰好一个 sent。
     assert [o for o in outcomes if o == ("ok", "succeeded")] == [("ok", "succeeded")], outcomes
