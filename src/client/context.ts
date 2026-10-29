@@ -34,7 +34,7 @@ export interface ClientConnection {
 export interface ClientWorkspaces {
   readonly list: {
     getSnapshot(): {
-      readonly items: ReadonlyArray<{ readonly workspaceId: string; readonly path: string; readonly title: string }>;
+      readonly items: ReadonlyArray<{ readonly workspaceId: string; readonly path: string; readonly title: string; readonly sessionIds: readonly string[] }>;
     };
   };
 }
@@ -46,8 +46,13 @@ export interface ClientContext {
   readonly effect?: (factory: () => void | (() => void), label?: string) => void;
 }
 
-/** 当前选中工作区 id（由 apply 时从 ctx.workspaces 解析后写入，供面板发起 run/start 使用）。 */
+/** 当前写作工作区上下文（由 apply 解析后写入，供面板发起 run/start）。 */
 export interface ClientRuntime {
   readonly connection: ClientConnection;
+  /** 当前选中会话（conversation.view slot 提供；非会话入口为 null）。 */
+  readonly sessionId: string | null;
+  /** 由 sessionId 推导的工作区 id；无当前会话或服务未就绪为 null。 */
   readonly workspaceId: string | null;
+  /** 服务是否就绪（未就绪时面板走「加载」态，不是「错误」态）。 */
+  readonly ready: boolean;
 }

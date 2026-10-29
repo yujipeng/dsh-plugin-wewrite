@@ -127,14 +127,13 @@ async function main() {
 
   // 观察 session 事件：记录 tool_call 名称，作为「工具实际执行记录」证据。
   const toolCalls = [];
-  const sessions = ctx.get('sessions');
-  if (sessions?.on) {
-    sessions.on('session/event', (session, event) => {
-      if (event?.type === 'tool/call') {
-        toolCalls.push(event?.toolName ?? event?.data?.name ?? '');
-      }
-    });
-  }
+  const stopToolCalls = typeof ctx.on === 'function'
+    ? ctx.on('session/event', (session, event) => {
+        if (event?.type === 'tool/call') {
+          toolCalls.push(event?.toolName ?? event?.data?.name ?? '');
+        }
+      })
+    : undefined;
 
   // 4) followup 主 skill 指令，等待真实 Agent 完成（工具执行 → finish → ready）。
   const message = createUserMessage({
@@ -178,6 +177,7 @@ async function main() {
   const ok = kinds.every((k) => nonEmpty(k)) && run.phase === 'ready' && gate?.publishable === true;
   log(ok ? 'info' : 'error', ok ? 'RESULT=通过' : 'RESULT=未通过');
   log('info', `toolCalls=${JSON.stringify(toolCalls)}`);
+  stopToolCalls?.();
 
   await ctx.fiber.dispose();
   process.exit(ok ? 0 : 2);

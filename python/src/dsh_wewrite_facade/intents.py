@@ -119,6 +119,41 @@ def revoke_all_intents(run_id: str) -> int:
     return changed
 
 
+def revoked_intent_ids_except(run_id: str, *, keep_workflow_id: str, keep_generation: int) -> list[str]:
+    """返回不属于 (workflowId, generation) 的未撤销 intentId 集合（只读，不写盘）。
+
+    供 binding.publish 把它与新绑定合成**单一提交记录**（返修二轮-3：跨文件原子性）。
+    """
+    ids: list[str] = []
+    for item in read_intents(run_id):
+        if not isinstance(item, dict):
+            continue
+        if item.get("revoked") is True:
+            continue
+        if item.get("workflowId") == keep_workflow_id and item.get("generation") == keep_generation:
+            continue
+        iid = item.get("intentId")
+        if isinstance(iid, str) and iid:
+            ids.append(iid)
+    return ids
+
+
+def apply_revocations(run_id: str, revoked_ids: list[str]) -> int:
+    """幂等重放撤销：把指定 intentId 集合标记 revoked（commit 记录重放用）。调用方须已持 run 锁。"""
+    if not revoked_ids:
+        return 0
+    ids = set(revoked_ids)
+    intents = read_intents(run_id)
+    changed = 0
+    for item in intents:
+        if isinstance(item, dict) and item.get("revoked") is not True and item.get("intentId") in ids:
+            item["revoked"] = True
+            changed += 1
+    if changed:
+        _write_intents(run_id, intents)
+    return changed
+
+
 def active_intent_for(run_id: str, intent_id: str, *, workflow_id: str, generation: int) -> dict[str, Any] | None:
     """复验：仅返回未撤销且绑定一致的 intent；否则 None。draft.send 占用前必须调用。"""
     for item in read_intents(run_id):

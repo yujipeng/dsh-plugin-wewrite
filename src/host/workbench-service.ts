@@ -98,13 +98,18 @@ export class WorkbenchService {
   }
 
   async runResume(payload: { requestId: string; runId: string; expectedGeneration: number; workspaceId: string }): Promise<BusinessResult<unknown>> {
-    return this.withReplay(payload.requestId, () =>
-      this.options.workflow.resumeRun({
+    return this.withReplay(payload.requestId, async () => {
+      const result = await this.options.workflow.resumeRun({
         runId: payload.runId,
         expectedGeneration: payload.expectedGeneration,
         workspaceId: payload.workspaceId,
-      }),
-    );
+      });
+      // run/resume 契约响应只有 {binding}；resumedExisting 是 host 内部观测值，不进 RPC。
+      if (result.ok) {
+        return businessSuccess({ binding: (result.data as { binding: unknown }).binding });
+      }
+      return result;
+    });
   }
 
   async runDetail(payload: { runId: string }): Promise<BusinessResult<unknown>> {

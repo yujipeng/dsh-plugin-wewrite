@@ -18,7 +18,7 @@ import { ReviewPanel } from './panels/Review';
 import { SettingsPanel } from './panels/Settings';
 
 export const name = 'dsh-plugin-wewrite-client';
-export const inject = ['slots'];
+export const inject = ['slots', 'connection', 'workspaces'];
 
 const PANEL_TITLE = 'WeWrite 写作台';
 
@@ -71,15 +71,18 @@ export async function startWriting(
   return { ok: true, runId };
 }
 
-/** 从 ctx.workspaces 解析当前工作区 id（首个可用工作区；无则 null）。 */
-function resolveWorkspaceId(ctx: ClientContext): string | null {
+/** 从当前选中 sessionId 推导工作区 id（返修二轮-4：不取 items[0]，由宿主当前会话定位）。 */
+export function resolveWorkspaceIdBySession(ctx: ClientContext, sessionId: string | null): string | null {
+  if (!sessionId) return null;
   const workspaces = ctx.workspaces;
   if (!workspaces) return null;
   try {
     const items = workspaces.list.getSnapshot().items;
-    if (items.length > 0) return items[0].workspaceId;
+    for (const item of items) {
+      if (item.sessionIds.includes(sessionId)) return item.workspaceId;
+    }
   } catch {
-    // 忽略：工作区服务未就绪时 workspaceId=null，run/start 会因缺 workspaceId 拒绝。
+    // 服务未就绪/快照未加载：返回 null（面板走加载态）。
   }
   return null;
 }
@@ -90,6 +93,11 @@ function WorkbenchPanel({ runtime }: { runtime: ClientRuntime }): JSX.Element {
   const [runId, setRunId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const client = useMemo(() => new WeWriteClient(runtime.connection), [runtime.connection]);
+
+  // 返修二轮-4：connection/workspaces 未就绪是「加载」态，不是「错误」态。
+  if (!runtime.ready) {
+    return <div className="ww-state ww-state--loading" data-testid="ww-loading">加载中…</div>;
+  }
 
   return (
     <div className="ww-workbench" data-testid="wewrite-workbench">
@@ -183,10 +191,20 @@ export function apply(ctx: ClientContext): void {
     return;
   }
 
-  // 返修 1：RPC 走宿主真实通道 ctx.connection.rpc.call（不再使用无赋值点的 globalThis.__wewriteRpc）。
-  const runtime: ClientRuntime = {
-    connection: ctx.connection ?? { rpc: { call: async () => ({ ok: false, error: { code: 'CAPABILITY_UNAVAILABLE', message: 'RPC 通道不可用', details: {} } }) } },
-    workspaceId: resolveWorkspaceId(ctx),
+  // 返修二轮-4：connection/workspaces 未就绪时是「加载」态，不是「错误」态。
+  // sessionId 由 conversation.view slot 在会话内注入；无当前会话时 workspaceId=null。
+  const makeRuntime = (sessionId: unknown): ClientRuntime => {
+    const sid = typeof sessionId === 'string' && sessionId ? sessionId : null;
+    const hasConnection = typeof ctx.connection?.rpc?.call === 'function';
+    const hasWorkspaces = ctx.workspaces !== undefined;
+    return {
+      connection: hasConnection
+        ? (ctx.connection as ClientRuntime['connection'])
+        : { rpc: { call: async () => ({ ok: false, error: { code: 'CAPABILITY_UNAVAILABLE', message: 'RPC 通道不可用', details: {} } }) } },
+      sessionId: sid,
+      workspaceId: resolveWorkspaceIdBySession(ctx, sid),
+      ready: hasConnection && hasWorkspaces,
+    };
   };
 
   // 收集每个 slot 的 wait disposer（ctx.slots.inject 返回）与 register disposer。
@@ -200,7 +218,7 @@ export function apply(ctx: ClientContext): void {
         const wait = slots.inject(slot, () => {
           const component = slotComponent(slot) as (props: { runtime: ClientRuntime } & Record<string, unknown>) => JSX.Element;
           const dispose = slots.register(
-            { ...slotOptions(slot), inject: (...args: unknown[]) => ({ runtime, ...(slot === 'conversation.view' ? { sessionId: args[0] } : {}) }) },
+            { ...slotOptions(slot), inject: (...args: unknown[]) => makeRuntime(args[0]) },
             component,
           );
           registerDisposers.push(dispose);
@@ -212,7 +230,7 @@ export function apply(ctx: ClientContext): void {
         try {
           const component = slotComponent(slot) as (props: { runtime: ClientRuntime } & Record<string, unknown>) => JSX.Element;
           const dispose = slots.register(
-            { ...slotOptions(slot), inject: (...args: unknown[]) => ({ runtime, ...(slot === 'conversation.view' ? { sessionId: args[0] } : {}) }) },
+            { ...slotOptions(slot), inject: (...args: unknown[]) => makeRuntime(args[0]) },
             component,
           );
           registerDisposers.push(dispose);
@@ -224,7 +242,7 @@ export function apply(ctx: ClientContext): void {
     } else {
       try {
         const component = slotComponent(slot) as (props: { runtime: ClientRuntime } & Record<string, unknown>) => JSX.Element;
-        const dispose = slots.register({ ...slotOptions(slot), inject: (...args: unknown[]) => ({ runtime, ...(slot === 'conversation.view' ? { sessionId: args[0] } : {}) }) }, component);
+        const dispose = slots.register({ ...slotOptions(slot), inject: (...args: unknown[]) => makeRuntime(args[0]) }, component);
         registerDisposers.push(dispose);
         registered.add(slot);
       } catch (error) {

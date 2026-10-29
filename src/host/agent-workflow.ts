@@ -189,10 +189,12 @@ export class AgentWorkflow {
     }
   }
 
-  async resumeRun(input: ResumeRunInput): Promise<BusinessResult<{ binding: Binding }>> {
+  async resumeRun(input: ResumeRunInput): Promise<BusinessResult<{ binding: Binding; resumedExisting: boolean }>> {
     try {
       const record = this.records.get(input.runId);
-      const currentGeneration = record?.binding.generation ?? (await this.persistedGeneration(input.runId));
+      // 返修二轮-2：从持久化 binding 取原 sessionId（重启后 records 清空，只有 facade 持久化）。
+      const persisted = await this.persistedBinding(input.runId);
+      const currentGeneration = record?.binding.generation ?? persisted?.generation ?? null;
       if (currentGeneration === null) {
         return businessFailure('FORBIDDEN', 'run 未绑定写作会话');
       }
@@ -203,12 +205,13 @@ export class AgentWorkflow {
       // 接管栅栏：新 workflowId + generation+1；先停旧 Agent（钩子取消），再发布新 Binding。
       const newGeneration = currentGeneration + 1;
       const newWorkflowId = this.options.randomId();
-      const newSessionId = this.options.randomId();
+      // 接管恢复执行所有权：resumeSessionId 必须用持久化原 sessionId（不是随机新 id）。
+      // 确无原 sessionId 时才按新会话处理（并在 binding 上明确标注）。
+      const resumeSessionId = persisted?.sessionId ?? this.options.randomId();
+      const resumedExisting = persisted?.sessionId !== undefined;
 
-      // 返修 3：接管必须走 runtime.resume（恢复执行所有权），create 只用于首次绑定。
-      // resumeSessionId 由持久化 binding 提供；宿主在 resume 的 setup 里重建 scope（工具/guard/restrict）。
       const handle = await this.options.runtime.resume({
-        resumeSessionId: newSessionId,
+        resumeSessionId,
         setup: (agentCtx, agent) => this.options.scopeSetup?.(agentCtx, agent),
       });
       const agent = handle.agent;
@@ -220,7 +223,7 @@ export class AgentWorkflow {
           workflowId: newWorkflowId,
           generation: newGeneration,
           agentId: agent.id,
-          sessionId: newSessionId,
+          sessionId: resumeSessionId,
           workspaceId: input.workspaceId,
           phase: 'starting',
           expectedGeneration: currentGeneration,
@@ -239,7 +242,8 @@ export class AgentWorkflow {
       }
 
       this.records.set(input.runId, { binding, handle, revokedIntents: new Set() });
-      return businessSuccess({ binding });
+      // 返回是否复用了原 session（供测试与宿主观测）。
+      return businessSuccess({ binding, resumedExisting });
     } catch (error) {
       this.options.onError?.(redactError(error));
       return businessFailure('INTERNAL', '恢复写作会话失败');
@@ -260,8 +264,11 @@ export class AgentWorkflow {
     } catch (error) {
       this.options.onError?.(redactError(error));
     }
-    // 返修 6：cancel 路径撤销该 run 的全部未消费 intent（facade 侧在同一 run 锁内）。
-    await this.options.bridge('binding.revoke-intents', { runId: input.runId }).catch(() => undefined);
+    // 返修二轮-3：取消路径撤销失败不得吞掉——撤销失败返回失败并保留活跃记录，不能报 cancelled。
+    const revokeResp = await this.options.bridge('binding.revoke-intents', { runId: input.runId });
+    if (revokeResp.ok === false) {
+      return businessFailure('INTERNAL', '撤销未消费推送意图失败，任务仍处于取消中');
+    }
     this.records.delete(input.runId);
     return businessSuccess({ runId: input.runId, phase: 'cancelled', generation: input.generation });
   }
@@ -277,10 +284,16 @@ export class AgentWorkflow {
   }
 
   private async persistedGeneration(runId: string): Promise<number | null> {
+    const binding = await this.persistedBinding(runId);
+    return binding?.generation ?? null;
+  }
+
+  /** 从 facade 持久化 binding 读取完整绑定（含 sessionId，重启恢复用）。 */
+  private async persistedBinding(runId: string): Promise<Binding | null> {
     const resp = await this.options.bridge('binding.get', { runId });
     if (resp.ok === false) return null;
-    const data = resp.data as { binding?: { generation?: number } | null };
-    return data.binding?.generation ?? null;
+    const data = resp.data as { binding?: Binding | null };
+    return data.binding ?? null;
   }
 
   /** 资源卸载：全部 Agent 按 disposed 语义回收（最终 handle.dispose）。 */

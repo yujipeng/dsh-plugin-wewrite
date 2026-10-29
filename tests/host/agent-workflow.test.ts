@@ -95,6 +95,9 @@ function makeBridge(bindings: Map<string, { generation: number; workflowId: stri
       const binding = bindings.get(payload.runId as string);
       return { ok: true, data: { binding: binding ?? null } };
     }
+    if (operation === 'binding.revoke-intents') {
+      return { ok: true, data: { runId: payload.runId, revoked: 0 } };
+    }
     return { ok: false, error: { code: 'INTERNAL', message: '内部错误', retryable: false } };
   };
 }
@@ -138,19 +141,22 @@ describe('AgentWorkflow（接管栅栏 + 句柄/取消参数）', () => {
     if (!second.ok) expect(second.error.code).toBe('RUN_BUSY');
   });
 
-  it('resumeRun 接管：expectedGeneration CAS 成功、新 workflowId、旧记录撤销', async () => {
+  it('resumeRun 接管：expectedGeneration CAS 成功、新 workflowId、sessionId 复用持久化', async () => {
     const bindings = new Map();
     const bridge = makeBridge(bindings as never);
     const { workflow, agents, calls } = makeWorkflow(bridge);
     await workflow.startRun({ runId, workspaceId: 'ws', topic: 't', mode: 'draft', visualMode: 'none', themeId: 't' });
 
+    const oldSessionId = workflow.bindingOf(runId)!.sessionId;
     const oldAgentId = workflow.bindingOf(runId)!.agentId;
     const result = await workflow.resumeRun({ runId, expectedGeneration: 1, workspaceId: 'ws' });
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.data.binding.generation).toBe(2);
       expect(result.data.binding.workflowId).not.toBe('id-2'); // 新 workflowId（id-3）
-      expect(result.data.binding.agentId).not.toBe(oldAgentId);
+      // 返修二轮-2：接管复用持久化 sessionId，不是随机新 id。
+      expect(result.data.binding.sessionId).toBe(oldSessionId);
+      expect(result.data.resumedExisting).toBe(true);
     }
     // 返修 3：接管走 runtime.resume 而非 create。
     expect(calls.filter((c) => c === 'resume')).toHaveLength(1);
@@ -173,6 +179,24 @@ describe('AgentWorkflow（接管栅栏 + 句柄/取消参数）', () => {
     if (!stale.ok) expect(stale.error.code).toBe('VERSION_CONFLICT');
   });
 
+  it('重启后（records 清空）恢复走持久化 sessionId', async () => {
+    const bindings = new Map();
+    const bridge = makeBridge(bindings as never);
+    const first = makeWorkflow(bridge);
+    await first.workflow.startRun({ runId, workspaceId: 'ws', topic: 't', mode: 'draft', visualMode: 'none', themeId: 't' });
+    const persistedSessionId = first.workflow.bindingOf(runId)!.sessionId;
+
+    // 模拟重启：新的 AgentWorkflow 实例（records 清空），facade 持久化 binding 仍在 bindings map。
+    const second = makeWorkflow(bridge);
+    const result = await second.workflow.resumeRun({ runId, expectedGeneration: 1, workspaceId: 'ws' });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.data.binding.generation).toBe(2);
+      expect(result.data.binding.sessionId).toBe(persistedSessionId);
+      expect(result.data.resumedExisting).toBe(true);
+    }
+  });
+
   it('cancelRun 用 {kind:user} 取消并移除绑定', async () => {
     const bindings = new Map();
     const bridge = makeBridge(bindings as never);
@@ -185,5 +209,28 @@ describe('AgentWorkflow（接管栅栏 + 句柄/取消参数）', () => {
     expect(workflow.bindingOf(runId)).toBeUndefined();
     const agent = agents.get(agentId);
     if (agent) expect(agent.cancelled[0]).toEqual({ kind: 'user' });
+  });
+
+  it('cancelRun 撤销失败不得吞掉：返回失败并保留活跃记录', async () => {
+    const bindings = new Map();
+    const failingBridge = async (operation: string, payload: Record<string, unknown>) => {
+      if (operation === 'binding.publish') {
+        const current = bindings.get(payload.runId as string);
+        if (current) return { ok: false, error: { code: 'VERSION_CONFLICT', message: '冲突', retryable: false } };
+        const binding = { runId: payload.runId, workflowId: payload.workflowId, generation: 1, agentId: payload.agentId, sessionId: payload.sessionId, workspaceId: payload.workspaceId, phase: 'starting' };
+        bindings.set(payload.runId as string, binding);
+        return { ok: true, data: binding };
+      }
+      if (operation === 'binding.get') return { ok: true, data: { binding: bindings.get(payload.runId as string) ?? null } };
+      if (operation === 'binding.revoke-intents') return { ok: false, error: { code: 'INTERNAL', message: '撤销失败', retryable: false } };
+      return { ok: false, error: { code: 'INTERNAL', message: '内部错误', retryable: false } };
+    };
+    const { workflow } = makeWorkflow(failingBridge as never);
+    await workflow.startRun({ runId, workspaceId: 'ws', topic: 't', mode: 'draft', visualMode: 'none', themeId: 't' });
+    const result = await workflow.cancelRun({ runId, generation: 1 });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.message).toContain('撤销');
+    // 保留活跃记录（不报 cancelled）。
+    expect(workflow.bindingOf(runId)).toBeDefined();
   });
 });

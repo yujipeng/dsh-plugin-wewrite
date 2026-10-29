@@ -22,6 +22,10 @@ from dsh_wewrite_facade import sanitize
     '<object data="https://evil.example.com/x"></object>',
     '<img src="data:text/html;base64,PHNjcmlwdD4=">',
     '<style>@import url(https://evil.example.com/x.css);</style><p>正文</p>',
+    # 返修二轮：实体编码输入（convert_charrefs 会解码，必须重新转义）。
+    '<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>',
+    '<a href="https://x.com/?a=1&quot; onmouseover=&quot;alert(1)">链</a>',
+    '<p>&lt;img src=x onerror=alert(1)&gt;</p>',
 ])
 def test_sanitize_strips_unsafe(payload):
     out = sanitize.sanitize_html(payload)

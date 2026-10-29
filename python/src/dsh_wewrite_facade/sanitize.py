@@ -74,6 +74,21 @@ def _allowed_attrs_for(tag: str) -> set[str]:
     return base | _ALLOWED_ATTRS.get(tag, set())
 
 
+def _escape_text(value: str) -> str:
+    """文本节点转义：&、<、>（convert_charrefs 已把实体解码，这里必须重新编码，防实体绕过）。"""
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _escape_attr(value: str) -> str:
+    """属性上下文转义：先 &，再 "、<、>。URL 与文本属性统一走这里，防引号闭合/标签逃逸。"""
+    return (
+        value.replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 class _Sanitizer(HTMLParser):
     """逐 token 重建安全 HTML。"""
 
@@ -107,11 +122,11 @@ class _Sanitizer(HTMLParser):
                 safe = _sanitize_url(value)
                 if safe is None:
                     continue
-                kept.append(f'{name_l}="{safe}"')
+                # URL 通过 scheme 白名单后仍按属性上下文转义（返修二轮：防引号闭合/标签逃逸）。
+                kept.append(f'{name_l}="{_escape_attr(safe)}"')
             else:
-                # 属性值做实体转义，防注入属性闭合。
-                escaped = value.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
-                kept.append(f'{name_l}="{escaped}"')
+                # alt/title/width/height 等属性值一律属性上下文转义。
+                kept.append(f'{name_l}="{_escape_attr(value)}"')
         self._parts.append(f"<{tag_l}{(' ' + ' '.join(kept)) if kept else ''}>")
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -139,7 +154,9 @@ class _Sanitizer(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._blocked_depth > 0:
             return
-        self._parts.append(data)
+        # 返修二轮：文本节点输出前转义（convert_charrefs 已把 &lt;script&gt; 解码为 <script>，
+        # 这里必须重新编码，否则实体编码输入会重新变成真实标签）。
+        self._parts.append(_escape_text(data))
 
     def handle_comment(self, data: str) -> None:
         # 注释一律剥离。
@@ -195,12 +212,71 @@ def _wrap_with_csp(body: str) -> str:
     )
 
 
+class _NodeInspector(HTMLParser):
+    """把清洗输出再解析一次，收集真实节点/属性集合（返修二轮：不用字符串包含判断）。"""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.tags: list[str] = []
+        self.attrs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.tags.append(tag.lower())
+        for name, _value in attrs:
+            self.attrs.append(name.lower())
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.tags.append(tag.lower())
+        for name, _value in attrs:
+            self.attrs.append(name.lower())
+
+
 def has_unsafe_content(html: str) -> dict[str, bool]:
-    """负向断言辅助：检测清洗结果是否仍含脚本节点/事件属性/远程 URL/javascript 链接。"""
+    """负向断言：把清洗结果**再解析**，看真实节点/属性集合。
+
+    返回：
+    - script: 是否出现 script/iframe/frame/object/embed 节点。
+    - event_attr: 是否出现 on* 事件属性。
+    - javascript_url: href/src 属性是否以 javascript: 开头（解析后）。
+    - remote_url: img 的 src 是否 http(s)。
+    """
+    inspector = _NodeInspector()
+    inspector.feed(html)
+    inspector.close()
+
+    blocked_tags = {"script", "iframe", "frame", "object", "embed"}
+    has_script_node = any(t in blocked_tags for t in inspector.tags)
+    has_event_attr = any(a.startswith("on") for a in inspector.attrs)
+    has_javascript_url = any(a in ("href", "src") and False for a in inspector.attrs)  # 由下面具体检查
+    has_remote_img = False
+
+    # 二次解析 URL 属性值（保留原始值以便判断 scheme）。
+    class _UrlInspector(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.urls: list[str] = []
+            self.event_attrs: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            for name, value in attrs:
+                if name.lower().startswith("on"):
+                    self.event_attrs.append(name.lower())
+                if name.lower() in ("href", "src") and value:
+                    self.urls.append((name.lower(), value))
+
+        def handle_startendtag(self, tag, attrs):
+            self.handle_starttag(tag, attrs)
+
+    ui = _UrlInspector()
+    ui.feed(html)
+    ui.close()
+    has_javascript_url = any(n in ("href", "src") and v.strip().lower().startswith("javascript:") for n, v in ui.urls)
+    has_remote_img = any(n == "src" and v.strip().lower().startswith(("http://", "https://")) for n, v in ui.urls)
+
     return {
-        "script": bool(re.search(r"<\s*script\b", html, re.IGNORECASE)),
-        "iframe": bool(re.search(r"<\s*(?:iframe|frame|object|embed)\b", html, re.IGNORECASE)),
-        "event_attr": bool(re.search(r"\bon[a-z]+\s*=", html, re.IGNORECASE)),
-        "javascript_url": bool(re.search(r'(?:href|src)\s*=\s*["\']\s*javascript:', html, re.IGNORECASE)),
-        "remote_url": bool(re.search(r'<\s*img\b[^>]*\bsrc\s*=\s*["\']https?://', html, re.IGNORECASE)),
+        "script": has_script_node,
+        "iframe": has_script_node,
+        "event_attr": has_event_attr or bool(ui.event_attrs),
+        "javascript_url": has_javascript_url,
+        "remote_url": has_remote_img,
     }
