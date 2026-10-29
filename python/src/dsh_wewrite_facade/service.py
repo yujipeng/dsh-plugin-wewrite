@@ -444,9 +444,22 @@ def op_draft_prepare(payload: dict) -> dict[str, Any]:
 
 
 def op_draft_send(payload: dict) -> dict[str, Any]:
-    """draft.send 只接假 transport：真实微信调用计数恒为零。"""
+    """draft.send 只接假 transport：真实微信调用计数恒为零。
+
+    四轮：读正文之前必须先在 run 锁内调用 active_intent_for 复验（binding 撤销集合唯一权威）；
+    未通过即拒（CANCELLED），假 transport 调用计数保持零。
+    """
     run_id = payload["runId"]
-    content, version = projection.read_artifact_content(run_id, "article")
+    intent_id = payload["intentId"]
+    with storage.run_lock(run_id, create=False):
+        # 读正文前先复验 intent（占用前 fence）。
+        current_binding = binding.read_binding(run_id)
+        workflow_id = current_binding.get("workflowId", "") if isinstance(current_binding, dict) else ""
+        generation = current_binding.get("generation", 1) if isinstance(current_binding, dict) else 1
+        if intents.active_intent_for(run_id, intent_id, workflow_id=workflow_id, generation=generation) is None:
+            from .errors import cancelled
+            raise cancelled("推送意图已失效，需重新预检", run_id=run_id)
+        content, version = projection.read_artifact_content(run_id, "article")
     if payload["expectedVersion"] is not None and payload["expectedVersion"] != version:
         from .errors import version_conflict
         raise version_conflict("正文版本已变化，请刷新后重试")

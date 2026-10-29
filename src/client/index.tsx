@@ -37,7 +37,7 @@ function recordPending(slot: string): void {
 
 type ViewKey = 'runs' | 'topics' | 'editor' | 'review' | 'settings';
 
-/** 「写这个」完整两跳流程（返修 2 可判定单元）：runCreate 成功后必须 runStart，成功才交付 runId。 */
+/** 「写这个」完整两跳流程（返修 2 + 四轮-3）：先定工作区/会话，再 runCreate，成功才 runStart。 */
 export async function startWriting(
   topic: string,
   themeId: string,
@@ -45,6 +45,10 @@ export async function startWriting(
   client: WeWriteClient,
   randomId: () => string,
 ): Promise<{ ok: true; runId: string } | { ok: false; message: string }> {
+  // 四轮-3：runCreate 挪到工作区确定之后；无 workspaceId 时零调用、直接拒绝。
+  if (!workspaceId) {
+    return { ok: false, message: '当前没有可用工作区，无法启动写作会话' };
+  }
   const created = await client.runCreate({
     requestId: randomId(),
     topic,
@@ -57,9 +61,6 @@ export async function startWriting(
   }
   const { runId } = created.data as { runId: string };
 
-  if (!workspaceId) {
-    return { ok: false, message: '当前没有可用工作区，无法启动写作会话' };
-  }
   const started = await client.runStart({
     requestId: randomId(),
     runId,
@@ -122,6 +123,9 @@ function WorkbenchPanel({ runtime }: { runtime: ClientRuntime }): JSX.Element {
         {view === 'topics' && (
           <TopicsPanel
             client={client}
+            // 四轮-3：无工作区时「写这个」禁用并给原因，不发起 runCreate。
+            canWrite={runtime.workspaceId !== null}
+            writeDisabledReason={runtime.workspaceId === null ? '无当前工作区，请先新建或选择写作会话' : null}
             onWrite={async (topic, themeId) => {
               setActionError(null);
               const result = await startWriting(topic, themeId, runtime.workspaceId, client, () => crypto.randomUUID());

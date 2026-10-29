@@ -122,7 +122,7 @@ def revoke_all_intents(run_id: str) -> int:
 def revoked_intent_ids_except(run_id: str, *, keep_workflow_id: str, keep_generation: int) -> list[str]:
     """返回不属于 (workflowId, generation) 的未撤销 intentId 集合（只读，不写盘）。
 
-    供 binding.publish 把它与新绑定合成**单一提交记录**（返修二轮-3：跨文件原子性）。
+    供 binding.publish 把它与新绑定合成**单一提交记录**（四轮：binding 撤销集合唯一权威）。
     """
     ids: list[str] = []
     for item in read_intents(run_id):
@@ -135,6 +135,17 @@ def revoked_intent_ids_except(run_id: str, *, keep_workflow_id: str, keep_genera
         iid = item.get("intentId")
         if isinstance(iid, str) and iid:
             ids.append(iid)
+    return ids
+
+
+def all_intent_ids(run_id: str) -> list[str]:
+    """返回全部 intentId（cancel 路径用于写进 binding 撤销集合）。只读。"""
+    ids: list[str] = []
+    for item in read_intents(run_id):
+        if isinstance(item, dict):
+            iid = item.get("intentId")
+            if isinstance(iid, str) and iid:
+                ids.append(iid)
     return ids
 
 
@@ -155,15 +166,31 @@ def apply_revocations(run_id: str, revoked_ids: list[str]) -> int:
 
 
 def active_intent_for(run_id: str, intent_id: str, *, workflow_id: str, generation: int) -> dict[str, Any] | None:
-    """复验：仅返回未撤销且绑定一致的 intent；否则 None。draft.send 占用前必须调用。"""
+    """复验（唯一权威，四轮）：在 run 锁内同时读 binding + intents。
+
+    - intentId 命中 binding.revokedIntentIds → 直接判死（不依赖 intents.json 的 revoked 被重放过）。
+    - workflowId/generation 与 binding 不一致 → 判死。
+    - intents.json 的 revoked 标记是可选缓存，不是权威。
+    调用方须已持 run 锁。
+    """
+    from . import binding
+
+    # 1) binding 撤销集合是唯一权威。
+    current_binding = binding.read_binding(run_id)
+    if isinstance(current_binding, dict):
+        revoked = current_binding.get("revokedIntentIds")
+        if isinstance(revoked, list) and intent_id in revoked:
+            return None
+        if current_binding.get("workflowId") != workflow_id or current_binding.get("generation") != generation:
+            return None
+
+    # 2) intents.json 只作为可选的 intent 元数据来源（工作流/代次已由 binding 权威判定）。
     for item in read_intents(run_id):
         if not isinstance(item, dict):
             continue
         if item.get("intentId") != intent_id:
             continue
         if item.get("revoked") is True:
-            return None
-        if item.get("workflowId") != workflow_id or item.get("generation") != generation:
             return None
         return item
     return None

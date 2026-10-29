@@ -21,9 +21,10 @@ _BINDING_REL = ".dsh-workbench/binding.json"
 
 
 def _commit_binding_and_revocations(run_id: str, binding: dict[str, Any], revoked_ids: list[str]) -> dict[str, Any]:
-    """单一原子提交记录（返修二轮-3）：binding + 撤销集合合成一次写盘。
+    """单一原子提交记录：binding + 撤销集合合成一次写盘（唯一权威）。
 
-    读取时按该记录幂等重放撤销；进程在写前退出则 binding 仍为旧代次（零半提交）。
+    四轮：撤销集合内嵌 binding.json，是唯一权威；不再立即重放 intents.json（重放是可选优化，
+    正确性不依赖它——active_intent_for 在占用/发送前同锁读 binding 复验）。
     """
     record = {**binding, "revokedIntentIds": revoked_ids}
     storage.write_run_file_rel(
@@ -31,10 +32,6 @@ def _commit_binding_and_revocations(run_id: str, binding: dict[str, Any], revoke
         _BINDING_REL,
         json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8"),
     )
-    # 写成功后幂等重放撤销（失败不影响 binding 已生效——撤销集合已在同一记录里，
-    # 下次 read_binding 仍会重放；这里立即重放让 draft.send 复验立即生效）。
-    if revoked_ids:
-        intents.apply_revocations(run_id, revoked_ids)
     return binding
 
 
@@ -51,10 +48,10 @@ def _valid_workflow_id(value: Any) -> str:
 
 
 def read_binding(run_id: str) -> dict[str, Any] | None:
-    """只读读取绑定；不存在返回 None。绝不创建目录/文件。
+    """只读读取绑定；不存在返回 None。绝不创建目录/文件、绝不写盘（设计 §6 读面无写盘）。
 
-    返修二轮-3：若 commit 记录含 revokedIntentIds，幂等重放撤销（防进程在写 commit 后、
-    重放撤销前退出时旧 intent 残留为未撤销）。
+    四轮：读到 revokedIntentIds 只做内存保留，不落盘重放；撤销集合的唯一权威就是
+    binding.json 本身，active_intent_for 在占用/发送前同锁读它复验。
     """
     paths.validate_run_id(run_id)
     try:
@@ -68,9 +65,6 @@ def read_binding(run_id: str) -> dict[str, Any] | None:
         return None
     if not isinstance(data, dict):
         return None
-    revoked = data.get("revokedIntentIds")
-    if isinstance(revoked, list) and revoked:
-        intents.apply_revocations(run_id, revoked)
     return data
 
 
@@ -167,11 +161,24 @@ def publish_binding(
 
 
 def revoke_intents_for_cancel(run_id: str) -> int:
-    """cancel 路径：在 run 锁内撤销该 run 的全部未消费 intent（返修 6）。
+    """cancel 路径：在 run 锁内撤销该 run 的全部未消费 intent，并把撤销集合写进 binding（唯一权威）。
 
-    - 与 Agent 取消在 host 侧配合；facade 侧只负责把未消费 intent 标记 revoked。
-    - 返回撤销数（撤销后旧 intent 的外部调用计数为零）。
+    - binding.revokedIntentIds 是唯一权威；intents.json 的 revoked 标记是可选缓存。
+    - 返回撤销数（撤销后旧 intent 的外部调用计数为零，draft.send 复验判死）。
     """
     paths.validate_run_id(run_id)
     with storage.run_lock(run_id, create=False):
-        return intents.revoke_all_intents(run_id)
+        all_ids = intents.all_intent_ids(run_id)
+        # 把全部 intentId 记为撤销集合，写进 binding（单一原子提交）。
+        current = read_binding(run_id)
+        binding = dict(current) if isinstance(current, dict) else {
+            "runId": run_id, "workflowId": "", "generation": 0,
+            "agentId": "", "sessionId": "", "workspaceId": "", "phase": "cancelled",
+        }
+        binding["revokedIntentIds"] = all_ids
+        storage.write_run_file_rel(
+            run_id,
+            _BINDING_REL,
+            json.dumps(binding, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+        return len(all_ids)

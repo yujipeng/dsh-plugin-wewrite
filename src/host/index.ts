@@ -18,6 +18,7 @@ import { runFacade } from './wewrite-bridge';
 import { buildAgentTools, setToolService, controlledToolGuard, INHERITED_TOOL_ALLOWLIST } from './tools';
 import { buildProvider, defaultManifestPath, PROVIDER_NAME } from './skills-provider';
 import { randomUUID } from 'node:crypto';
+import { installModelSelection } from '@deepseek-ai/dsh-agent';
 
 export const name = 'dsh-plugin-wewrite';
 
@@ -48,17 +49,39 @@ interface AgentCtxLike {
   tools?: { register: (definition: unknown) => () => void; restrict?: (filter: unknown) => () => void; guard?: (guard: unknown) => () => void };
 }
 
-/** 把真实 DSH AgentRuntime 适配为最小消费面。 */
+/** 把真实 DSH AgentRuntime 适配为最小消费面（含生产 model selection 装配）。 */
 function agentRuntimeFrom(ctx: HostContext): DshAgentRuntime | undefined {
   const agents = ctx.get?.('agents') as { create?: unknown; resume?: unknown; get?: unknown } | undefined;
   if (!agents || typeof agents.create !== 'function') return undefined;
+  const agentDefaultModel = ctx.get?.('agentDefaultModel') as { currentSelection?: () => { provider: string; model: string } | undefined } | undefined;
+  const defaultSelection = agentDefaultModel?.currentSelection?.() ?? { provider: 'tcreditai', model: 'deepseek-flash' };
+  const wrapSetup = (setup: ((agentCtx: unknown, agent: unknown) => void | Promise<void>) | undefined) =>
+    (agentCtx: unknown, agent: unknown) => {
+      // 生产 model selection：与 headless-runner 一致，避免 prompt 变量缺失。
+      try {
+        installModelSelection(agentCtx as never, { current: defaultSelection, assembled: undefined });
+      } catch {
+        // 忽略：宿主无 installModelSelection 时由 preset 提供。
+      }
+      return setup?.(agentCtx, agent);
+    };
   return {
     create(options) {
-      return (agents.create as (o: unknown) => Promise<import('@deepseek-ai/dsh-agent').AgentHandle>)(options) as Promise<import('@deepseek-ai/dsh-agent').AgentHandle>;
+      const opts = {
+        ...options,
+        agentOptions: { provider: defaultSelection.provider, model: defaultSelection.model },
+        setup: wrapSetup(options.setup as ((agentCtx: unknown, agent: unknown) => void | Promise<void>) | undefined),
+      };
+      return (agents.create as (o: unknown) => Promise<import('@deepseek-ai/dsh-agent').AgentHandle>)(opts) as Promise<import('@deepseek-ai/dsh-agent').AgentHandle>;
     },
     async resume(options) {
       if (typeof agents.resume !== 'function') throw new Error('resume 不可用');
-      return (agents.resume as (o: unknown) => Promise<import('@deepseek-ai/dsh-agent').AgentHandle>)(options) as Promise<import('@deepseek-ai/dsh-agent').AgentHandle>;
+      const opts = {
+        ...options,
+        agentOptions: { provider: defaultSelection.provider, model: defaultSelection.model },
+        setup: wrapSetup(options.setup as ((agentCtx: unknown, agent: unknown) => void | Promise<void>) | undefined),
+      };
+      return (agents.resume as (o: unknown) => Promise<import('@deepseek-ai/dsh-agent').AgentHandle>)(opts) as Promise<import('@deepseek-ai/dsh-agent').AgentHandle>;
     },
     get(id: string) {
       return (agents.get as (id: string) => import('@deepseek-ai/dsh-agent').Agent | undefined)(id);
@@ -66,7 +89,7 @@ function agentRuntimeFrom(ctx: HostContext): DshAgentRuntime | undefined {
   };
 }
 
-/** 组装 WorkbenchService + AgentWorkflow，并返回工具注册闭包（在专属 Agent scope 的 setup 里调用）。 */
+/** 组装 WorkbenchService + AgentWorkflow（每个 apply 只组装一次，多处 fiber 共享同一实例）。 */
 function assembleWorkbench(
   ctx: HostContext,
   config: PluginConfig,
@@ -166,6 +189,22 @@ function assembleWorkbench(
   return { service, workflow, bridge, interpreter, home, runtime };
 }
 
+/** 生产装配结果注册表（供真实 profile 装载后的取证/宿主探针读取，不进入 client 面）。 */
+export interface AssembledWorkbench {
+  readonly service: WorkbenchService;
+  readonly workflow: AgentWorkflow;
+  readonly bridge: WorkbenchBridge;
+  readonly interpreter: string;
+  readonly home: string;
+}
+
+const assembledByProfile = new Map<string, AssembledWorkbench>();
+
+/** 由 apply 写入的生产装配结果（真实 profile 装载时记录）。 */
+export function getAssembled(profile: string): AssembledWorkbench | undefined {
+  return assembledByProfile.get(profile);
+}
+
 export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void> {
   const config = Config.parse(rawConfig ?? {});
   const logger = resolveLogger(ctx, 'dsh-plugin-wewrite');
@@ -176,22 +215,46 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
     snapshot = detectCapabilities(ctx, config);
   };
 
+  // ── 生产装配（只组装一次，多个 fiber 共享同一 service/workflow 实例）──────────────
+  // assembleWorkbench 需要 agents 服务；在 ['agents','skills'] 子 fiber 组装一次并缓存。
+  // RPC 路由和 Agent 工具都用这一个实例，避免「两套 serviceRef」导致绑定/工具错位。
+  let assembledCache: ReturnType<typeof assembleWorkbench> | undefined;
+
+  const getAssembledOnce = (fiberCtx: HostContext, get: (name: string) => unknown) => {
+    if (!assembledCache) {
+      assembledCache = assembleWorkbench(fiberCtx, config, logger, get);
+      const record: AssembledWorkbench = {
+        service: assembledCache.service,
+        workflow: assembledCache.workflow,
+        bridge: assembledCache.bridge,
+        interpreter: assembledCache.interpreter,
+        home: assembledCache.home,
+      };
+      const profileCtx = get('profileContext') as { name?: string } | undefined;
+      const profileName = profileCtx?.name ?? 'default';
+      assembledByProfile.set('default', record);
+      assembledByProfile.set(profileName, record);
+      (globalThis as unknown as { __wewriteAssembled?: AssembledWorkbench }).__wewriteAssembled = record;
+    }
+    return assembledCache;
+  };
+
   // ── skills provider：子 fiber 内装配（rc.4 官方模式）──────────────
   if (typeof ctx.inject === 'function') {
     try {
       ctx.inject(['skills'], (skillsCtx) => {
         const get = skillsCtx.get?.bind(skillsCtx) ?? (() => undefined);
         const skills = get('skills') as { registerProvider?: (create: (control: unknown) => unknown) => () => void } | undefined;
-        if (typeof skills?.registerProvider !== 'function') {
+        if (typeof skills?.registerProvider === 'function') {
+          try {
+            const stopProvider = skills.registerProvider(() => buildProvider({ manifestPath: defaultManifestPath() }));
+            if (typeof stopProvider === 'function') disposers.push(stopProvider);
+            logger.info(`dsh-plugin-wewrite: skills provider 已注册（${PROVIDER_NAME}）`);
+          } catch (error) {
+            logger.warn(`dsh-plugin-wewrite: skills provider 注册失败：${redactError(error)}`);
+          }
+        } else {
           logger.warn('dsh-plugin-wewrite: skills 服务未就绪，随包 provider 不可注册');
-          return;
-        }
-        try {
-          const stopProvider = skills.registerProvider(() => buildProvider({ manifestPath: defaultManifestPath() }));
-          if (typeof stopProvider === 'function') disposers.push(stopProvider);
-          logger.info(`dsh-plugin-wewrite: skills provider 已注册（${PROVIDER_NAME}）`);
-        } catch (error) {
-          logger.warn(`dsh-plugin-wewrite: skills provider 注册失败：${redactError(error)}`);
         }
         refresh();
       });
@@ -200,17 +263,12 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
     }
   }
 
-  // ── Agent 工具 + skills：独立于 Web RPC 层装配（返修 7：真实 Agent 闭环在 headless
-  //    profile 也需要受控工具；连接/Web 只影响 client 面板 RPC 路由，不影响 Agent 工具面）。──────────────
-  // assembleWorkbench 需要 agents 服务；这里在 ['agents'] 子 fiber 里组装，工具随 startRun 的
-  // Agent setup 注册（scope 层）。RPC 路由单独在 connection/webServer 子 fiber 里挂。
+  // ── Agent 工具 + 生产装配：在 ['agents'] 子 fiber 组装一次（工具随 Agent setup 注册）。──────────────
   if (typeof ctx.inject === 'function') {
     try {
       ctx.inject(['agents'], (agentsCtx) => {
         const get = agentsCtx.get?.bind(agentsCtx) ?? (() => undefined);
-        const { workflow } = assembleWorkbench(agentsCtx, config, logger, get);
-        // 持有 workflow 引用，防止 GC；实际工具注册发生在 Agent setup 内。
-        void workflow;
+        getAssembledOnce(agentsCtx, get);
         refresh();
       });
     } catch (error) {
@@ -230,14 +288,14 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
           return;
         }
 
-        const { service } = assembleWorkbench(rpcCtx, config, logger, get);
+        const assembled = getAssembledOnce(rpcCtx, get);
 
         try {
           const stopRpc = registerWebRpcRoute(
             webServer as never,
             connection as never,
             RPC_CHANNEL,
-            createHandler(service),
+            createHandler(assembled.service),
           );
           logger.info('dsh-plugin-wewrite: RPC 通道已注册 /wewrite-python');
           if (typeof stopRpc === 'function') disposers.push(() => Promise.resolve(stopRpc()).catch(() => undefined));

@@ -68,13 +68,14 @@ def test_takeover_revokes_old_intent(tmp_path):
     article_before = (home / "runs" / run_id / "article.md").read_bytes()
     state_before = (home / "runs" / run_id / "state.yaml").read_bytes()
 
-    # 接管：generation=1 → 2，应撤销旧 intent。
+    # 接管：generation=1 → 2，binding 撤销集合应包含旧 intent（唯一权威）。
     assert _publish(home, run_id, 2, workflow="wf-new", expected=1)["ok"] is True
 
-    items = _read_intents(home, run_id)
-    assert len(items) == 1
-    assert items[0]["revoked"] is True
-    # 旧 intent 复验返回 None（外部调用计数为零）。
+    # 四轮：binding.revokedIntentIds 是唯一权威；intents.json 的 revoked 标记不再被重放（读面无写盘）。
+    binding_data = _read_binding(home, run_id)
+    assert "intent-old" in binding_data.get("revokedIntentIds", [])
+    # 旧 intent 复验返回 None（active_intent_for 读 binding 撤销集合）。
+    assert intents.active_intent_for(run_id, "intent-old", workflow_id="wf-new", generation=2) is None
     assert intents.active_intent_for(run_id, "intent-old", workflow_id="wf-old", generation=1) is None
     # 正文/状态字节不变。
     assert (home / "runs" / run_id / "article.md").read_bytes() == article_before
@@ -92,6 +93,15 @@ def test_cancel_revokes_all_intents(tmp_path):
     assert resp["ok"] is True, resp
     assert resp["data"]["revoked"] == 1
 
-    items = _read_intents(home, run_id)
-    assert items[0]["revoked"] is True
+    # 四轮：binding.revokedIntentIds 是唯一权威。
+    binding_data = _read_binding(home, run_id)
+    assert "intent-1" in binding_data.get("revokedIntentIds", [])
     assert intents.active_intent_for(run_id, "intent-1", workflow_id="wf-a", generation=1) is None
+
+
+def _read_binding(home, run_id):
+    import json
+    p = home / "runs" / run_id / ".dsh-workbench" / "binding.json"
+    if not p.exists():
+        return {}
+    return json.loads(p.read_text(encoding="utf-8"))

@@ -16,9 +16,12 @@ interface Hotspot {
 interface TopicsPanelProps {
   readonly client: WeWriteClient;
   readonly onWrite?: (topic: string, themeId: string) => void;
+  /** 四轮-3：无工作区时「写这个」禁用并给原因，不发起 runCreate。 */
+  readonly canWrite?: boolean;
+  readonly writeDisabledReason?: string | null;
 }
 
-export function TopicsPanel({ client, onWrite }: TopicsPanelProps): JSX.Element {
+export function TopicsPanel({ client, onWrite, canWrite = true, writeDisabledReason = null }: TopicsPanelProps): JSX.Element {
   const [items, setItems] = useState<Hotspot[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -48,7 +51,12 @@ export function TopicsPanel({ client, onWrite }: TopicsPanelProps): JSX.Element 
             <li key={`${item.source}-${i}`} className="ww-topics__item">
               <span className="ww-topics__title">{item.title}</span>
               <span className="ww-topics__source">{item.source} · {item.hotNormalized}</span>
-              <button onClick={() => onWrite?.(item.title, 'professional-clean')} data-testid={`ww-write-${i}`}>写这个</button>
+              <button
+                onClick={() => canWrite && onWrite?.(item.title, 'professional-clean')}
+                disabled={!canWrite}
+                title={writeDisabledReason ?? undefined}
+                data-testid={`ww-write-${i}`}
+              >写这个</button>
             </li>
           ))}
         </ul>

@@ -97,7 +97,7 @@ def test_commit_write_failure_leaves_old_generation_and_intents(monkeypatch, see
 
 
 def test_commit_replays_revocations_on_read(seeded_home):
-    """进程在写 commit 后、重放撤销前退出：下次 read_binding 幂等重放撤销。"""
+    """四轮：read_binding 只读，不再重放撤销（读面无写盘）。"""
     home, run_id, version = seeded_home
     assert _publish(run_id, 1, workflow="wf-old") is not None
     _record_intent(home, run_id, "intent-old", "wf-old", 1, version)
@@ -110,8 +110,11 @@ def test_commit_replays_revocations_on_read(seeded_home):
             item["revoked"] = False
     p = home / "runs" / run_id / ".dsh-workbench" / "intents.json"
     p.write_text(json.dumps({"intents": intents}, ensure_ascii=False), encoding="utf-8")
+    intents_bytes_before = p.read_bytes()
 
-    # 再次 read_binding 触发幂等重放。
-    binding_mod.read_binding(run_id)
-    intents2 = intents_mod.read_intents(run_id)
-    assert any(i["intentId"] == "intent-old" and i["revoked"] is True for i in intents2)
+    # read_binding 只读：不触发重放，intents.json 字节不变。
+    b = binding_mod.read_binding(run_id)
+    assert "intent-old" in b.get("revokedIntentIds", [])
+    assert p.read_bytes() == intents_bytes_before  # 读面无写盘
+    # active_intent_for 读 binding 撤销集合判死（不依赖 intents.json 的 revoked）。
+    assert intents_mod.active_intent_for(run_id, "intent-old", workflow_id="wf-new", generation=2) is None
