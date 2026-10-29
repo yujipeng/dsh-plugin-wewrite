@@ -1,25 +1,15 @@
 /**
  * wewrite-bridge 测试（设计 §6 范围第 7 条）：固定解释器 JSON 协议、超时回收、child close 回调。
  * 使用真实 facade 子进程（python/src 已就绪），验证单请求单响应 + 超时档选择。
+ * 证据环境不可用时显式失败（不静默 skip）。
  */
 
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync, existsSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
 import { timeoutFor, runFacade, shouldRecoverAfterClose, TIMEOUT_HOTSPOTS, TIMEOUT_NORMAL, TIMEOUT_PUSH } from '@/host/wewrite-bridge';
-
-const REPO = resolve(__dirname, '..', '..');
-const FACADE_PYTHON = process.env.FACADE_PYTHON ?? resolve(REPO, '.venv', 'bin', 'python');
-
-function facadeAvailable(): boolean {
-  if (!existsSync(FACADE_PYTHON)) return false;
-  const probe = spawnSync(FACADE_PYTHON, ['-c', 'import dsh_wewrite_facade'], { encoding: 'utf8' });
-  return probe.status === 0;
-}
-
-const SKIP = !facadeAvailable();
+import { requireFacade } from './facade-env';
 
 describe('timeoutFor（超时档选择）', () => {
   it('普通/热榜/推送档位', () => {
@@ -46,14 +36,15 @@ describe('runFacade onChildClose（JEE-1956 缺口 3）', () => {
     expect(shouldRecoverAfterClose({ operation: 'draft.send', ok: false, timedOut: false })).toBe(false);
   });
 
-  it.skipIf(SKIP)('child close 前 0 次、close 后恰 1 次回调', async () => {
+  it('child close 前 0 次、close 后恰 1 次回调', async () => {
+    const interpreter = await requireFacade();
     const home = mkdtempSync(join(tmpdir(), 'wewrite-close-'));
     let calls = 0;
 
     const result = await runFacade(
       { operation: 'run.detail', requestId: 'r-close', payload: { runId: '20261029-120000-abcdef' } },
       {
-        interpreter: FACADE_PYTHON,
+        interpreter,
         home,
         onChildClose: ({ ok }) => {
           calls += 1;
@@ -68,7 +59,8 @@ describe('runFacade onChildClose（JEE-1956 缺口 3）', () => {
     expect(calls).toBe(1);
   });
 
-  it.skipIf(SKIP)('成功路径 child close 后恰 1 次回调且 ok=true', async () => {
+  it('成功路径 child close 后恰 1 次回调且 ok=true', async () => {
+    const interpreter = await requireFacade();
     const home = mkdtempSync(join(tmpdir(), 'wewrite-close-ok-'));
     let calls = 0;
     const created = await runFacade(
@@ -78,7 +70,7 @@ describe('runFacade onChildClose（JEE-1956 缺口 3）', () => {
         payload: { requestId: 'r-create', topic: 't', mode: 'draft', visualMode: 'none', themeId: 'professional-clean' },
       },
       {
-        interpreter: FACADE_PYTHON,
+        interpreter,
         home,
         onChildClose: ({ ok }) => {
           calls += 1;

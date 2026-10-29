@@ -34,7 +34,8 @@ def _now() -> int:
     return int(time.time())
 
 
-# 摘要字段簇已收敛到 intents.SUMMARY_FIELDS（JEE-1956 整理项）。
+# 摘要字段簇唯一权威在 intents.SUMMARY_FIELDS（JEE-1956 整理项）：
+# 生产方 _summary_baseline 与复验方 _verify_summary 都按该清单构造/遍历，不再逐字段散落。
 
 
 def _summary_baseline(
@@ -47,17 +48,17 @@ def _summary_baseline(
     """从磁盘真实状态固定推送摘要基线（缺口 1）。
 
     封面哈希从资产登记表回读（而非空串）；账号 ref/version 在 S3 无微信凭据，固定为空。
+    返回 dict 的键集与顺序严格等于 intents.SUMMARY_FIELDS。
     """
     report_version = None
-    publishable = None
     try:
         _, rv = projection.read_artifact_content(run_id, "review_report")
         report_version = rv
     except FacadeError:
         report_version = None
-    if isinstance(gate, dict):
-        publishable = bool(gate.get("publishable"))
-    return {
+    publishable = bool(gate.get("publishable")) if isinstance(gate, dict) else None
+
+    values = {
         "reportVersion": report_version,
         "publishable": publishable,
         "coverHash": assets.asset_hash(run_id, cover_asset_id),
@@ -66,40 +67,25 @@ def _summary_baseline(
         "accountRef": "",
         "accountVersion": None,
     }
+    return {field: values[field] for field in intents.SUMMARY_FIELDS}
 
 
 def _verify_summary(run_id: str, item: dict[str, Any], current_gate: dict[str, Any] | None) -> bool:
     """二次复验摘要基线逐项比对（缺口 1，fail-closed）。
 
-    当前盘上 reportVersion/publishable/coverHash/themeId 与 intent 固定值任一不符即拒。
-    accountRef/accountVersion 在 S3 固定为空，仅按 intent 固定值原样比对。
+    按 intents.SUMMARY_FIELDS 逐字段比对：当前盘上重新派生的基线任一字段与
+    intent 固定值不符即拒。accountRef/accountVersion 因 S3 固定为空，天然随该
+    比对一起校验（非默认值即拒）。
     """
-    report_version = None
-    try:
-        _, rv = projection.read_artifact_content(run_id, "review_report")
-        report_version = rv
-    except FacadeError:
-        report_version = None
-    current_publishable = bool(current_gate.get("publishable")) if isinstance(current_gate, dict) else None
-
-    cover_asset_id = item.get("coverAssetId", "")
-    current_cover = assets.asset_hash(run_id, cover_asset_id) if isinstance(cover_asset_id, str) and cover_asset_id else ""
-    # 主题比对同 baseline 口径：权威持久化主题存在时以其为准，否则回退 intent 固定值（二者一致）。
-    current_theme = _current_theme_id(run_id) or item.get("themeId")
-
-    if item.get("reportVersion") != report_version:
-        return False
-    if item.get("publishable") != current_publishable:
-        return False
-    if item.get("coverHash") != current_cover:
-        return False
-    if item.get("themeId") != current_theme:
-        return False
-    # accountRef/accountVersion：S3 固定为空；与 intent 固定值不一致即拒。
-    if item.get("accountRef") != "":
-        return False
-    if item.get("accountVersion") is not None:
-        return False
+    current = _summary_baseline(
+        run_id=run_id,
+        theme_id=item.get("themeId") or "",
+        cover_asset_id=item.get("coverAssetId") or "",
+        gate=current_gate,
+    )
+    for field in intents.SUMMARY_FIELDS:
+        if item.get(field) != current[field]:
+            return False
     return True
 
 
@@ -442,6 +428,11 @@ def _verify_context(run_id: str, item: dict[str, Any], context: dict[str, Any]) 
     if isinstance(revoked, list) and item.get("intentId") in revoked:
         return False
     # TTL（九轮-1 + JEE-1956 缺口 2）：异常即拒——缺失/空串/数值类型一律 fail-closed。
+    return _verify_ttl(item)
+
+
+def _verify_ttl(item: dict[str, Any]) -> bool:
+    """TTL 校验（独立 seam，供返修真红自证用 monkeypatch 回退）。"""
     expires = item.get("expiresAt")
     if not isinstance(expires, str) or not expires:
         return False

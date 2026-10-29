@@ -4,31 +4,21 @@
  * 不走「保存的 handler 引用」直调——而是用生产 createHandler(WorkbenchService) 经
  * registerWebRpcRoute 注册为真实 prefix 路由，再以 owner 身份的 HTTP 请求穿过路由
  * handler 完成分派，验证 run/create 业务响应端到端可达（facade 真实子进程）。
+ * 证据环境不可用时显式失败（不静默 skip）。
  */
 
 import { describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { registerWebRpcRoute, type WebServerRoute } from '@/host/web-route';
 import { createHandler } from '@/host/rpc';
 import { WorkbenchService } from '@/host/workbench-service';
 import { AgentWorkflow } from '@/host/agent-workflow';
 import { runFacade, timeoutFor, TIMEOUT_PUSH } from '@/host/wewrite-bridge';
-
-const REPO = resolve(__dirname, '..', '..');
-const FACADE_PYTHON = process.env.FACADE_PYTHON ?? resolve(REPO, '.venv', 'bin', 'python');
-
-function facadeAvailable(): boolean {
-  if (!existsSync(FACADE_PYTHON)) return false;
-  const probe = spawnSync(FACADE_PYTHON, ['-c', 'import dsh_wewrite_facade'], { encoding: 'utf8' });
-  return probe.status === 0;
-}
-
-const SKIP = !facadeAvailable();
+import { requireFacade } from './facade-env';
 
 function fakeReq(method: string, url: string, body: string): IncomingMessage & { destroy: () => void } {
   const req = new EventEmitter() as IncomingMessage & { method: string; url: string; headers: Record<string, string>; destroy: () => void };
@@ -53,12 +43,13 @@ function fakeRes(): ServerResponse & { writeHead: ReturnType<typeof vi.fn>; end:
 }
 
 describe('生产路由分派入口（JEE-1956 缺口 5）', () => {
-  it.skipIf(SKIP)('run/create 经 registerWebRpcRoute 注册的真实路由分派到 facade', async () => {
+  it('run/create 经 registerWebRpcRoute 注册的真实路由分派到 facade', async () => {
+    const interpreter = await requireFacade();
     const home = mkdtempSync(join(tmpdir(), 'wewrite-route-'));
     const bridge = async (operation: string, payload: Record<string, unknown>) => {
       const result = await runFacade(
         { operation, payload, requestId: (payload.requestId as string | undefined) ?? 'r' },
-        { interpreter: FACADE_PYTHON, home },
+        { interpreter, home },
       );
       if (result.issue) return { ok: false, error: { code: result.issue.code, message: result.issue.message, retryable: false } };
       if (result.timedOut) return { ok: false, error: { code: 'TIMEOUT', message: '操作超时', retryable: true } };

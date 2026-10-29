@@ -181,4 +181,3 @@ def test_adapter_called_exactly_once_and_repeat_send_rejected(tmp_path, monkeypa
         code = exc.code
     assert code == "INVALID_TRANSITION", code
     assert len(calls) == 1, calls
-

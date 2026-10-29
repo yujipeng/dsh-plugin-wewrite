@@ -113,6 +113,19 @@ def _setup(home, run_id):
     return version, cover["data"]
 
 
+def _send_inproc(dispatch, run_id, intent_id, version):
+    """进程内驱动 draft_dispatch.send，拒绝时把 FacadeError 归一为业务联合（对齐子进程协议）。"""
+    from dsh_wewrite_facade.errors import FacadeError
+
+    try:
+        return dispatch.send(
+            {"requestId": "s", "runId": run_id, "intentId": intent_id, "expectedVersion": version},
+            {"runId": run_id, "workflowId": "wf-a", "generation": 1},
+        )
+    except FacadeError as exc:
+        return {"ok": False, "error": {"code": exc.code, "message": str(exc)}}
+
+
 # ── 缺口 1：摘要复验基线 ─────────────────────────────────────────────────
 
 def test_prepare_pins_summary_baseline(tmp_path):
@@ -243,3 +256,75 @@ def test_recover_migrates_all_legacy_entries(tmp_path):
     # 整体迁移：两条都必须是 v2 合法状态，而非只有定向的那条。
     for i in data["intents"]:
         assert i.get("state") == "unknown", i
+
+
+# ── 返修真红自证（进程内 monkeypatch，复验者可自助复现红转绿）────────────────
+
+def test_red_probe_summary_reverify_is_load_bearing(tmp_path, monkeypatch):
+    """缺口 1 自证：同一场景内「修复在位→拒」与「注入回退→发送成功」两相。
+
+    复验者跑本用例即可自助复核红转绿：monkeypatch 把 _verify_summary 回退为恒真后，
+    改审稿的发送恢复成功——证明该二次复验是 load-bearing，去掉即绕过。
+    """
+    from dsh_wewrite_facade import draft_dispatch
+
+    home = make_home(tmp_path)
+    run_id = create_run(home)
+    version, cover = _setup(home, run_id)
+    monkeypatch.setenv("WEWRITE_HOME", str(home))
+
+    def new_intent():
+        prep = _prepare(home, run_id, cover["assetId"])
+        assert prep["ok"] is True, prep
+        return prep["data"]["intentId"]
+
+    # 相 1：修复在位，改审稿后发送必须被拒。
+    iid_a = new_intent()
+    _write_review(home, run_id, version, False)
+    resp_a = _send_inproc(draft_dispatch, run_id, iid_a, version)
+    assert resp_a["ok"] is False, resp_a
+
+    # 相 2：注入回退（等价于修复前无此项比对），改审稿后发送恢复成功。
+    monkeypatch.setattr(draft_dispatch, "_verify_summary", lambda *a, **k: True)
+    iid_b = new_intent()
+    _write_review(home, run_id, version, False)
+    resp_b = _send_inproc(draft_dispatch, run_id, iid_b, version)
+    assert resp_b["ok"] is True, resp_b
+    assert resp_b["data"]["status"] == "succeeded"
+
+
+def test_red_probe_ttl_failclosed_is_load_bearing(tmp_path, monkeypatch):
+    """缺口 2 自证：同一场景内「修复在位→拒」与「注入回退→发送成功」两相。"""
+    from dsh_wewrite_facade import draft_dispatch
+
+    home = make_home(tmp_path)
+    run_id = create_run(home)
+    version, cover = _setup(home, run_id)
+    monkeypatch.setenv("WEWRITE_HOME", str(home))
+
+    def new_intent():
+        prep = _prepare(home, run_id, cover["assetId"])
+        assert prep["ok"] is True, prep
+        return prep["data"]["intentId"]
+
+    def strip_expires(intent_id):
+        p = home / "runs" / run_id / ".dsh-workbench" / "intents.json"
+        data = json.loads(p.read_text(encoding="utf-8"))
+        for i in data["intents"]:
+            if i["intentId"] == intent_id:
+                del i["expiresAt"]
+        p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    # 相 1：修复在位，删除期限后发送必须被拒。
+    iid_a = new_intent()
+    strip_expires(iid_a)
+    resp_a = _send_inproc(draft_dispatch, run_id, iid_a, version)
+    assert resp_a["ok"] is False, resp_a
+
+    # 相 2：注入回退（TTL 恒真，等价于修复前仅非空字符串才检查），发送恢复成功。
+    monkeypatch.setattr(draft_dispatch, "_verify_ttl", lambda item: True)
+    iid_b = new_intent()
+    strip_expires(iid_b)
+    resp_b = _send_inproc(draft_dispatch, run_id, iid_b, version)
+    assert resp_b["ok"] is True, resp_b
+    assert resp_b["data"]["status"] == "succeeded"
