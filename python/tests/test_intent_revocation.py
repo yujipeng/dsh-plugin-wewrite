@@ -89,7 +89,7 @@ def test_cancel_revokes_all_intents(tmp_path):
     assert _publish(home, run_id, 1, workflow="wf-a")["ok"] is True
     _record_intent(home, run_id, "intent-1", "wf-a", 1, version)
 
-    resp = call_facade(str(home), "binding.revoke-intents", {"runId": run_id})
+    resp = call_facade(str(home), "binding.revoke-intents", {"runId": run_id, "expectedGeneration": 1})
     assert resp["ok"] is True, resp
     assert resp["data"]["revoked"] == 1
 

@@ -18,7 +18,7 @@ import { runProfile } from '@deepseek-ai/dsh/profile-boot';
 import { loadLayeredEnv } from '@deepseek-ai/dsh-app-boot';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
-import { getAssembled, runFacade, createHandler, RPC_CHANNEL } from '../lib/index.js';
+import { getAssembled, runFacade, RPC_CHANNEL } from '../lib/index.js';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '..', '..');
 const HOME = process.env.WEWRITE_HOME ?? resolve(ROOT, '..', 'wewrite-home');
@@ -54,8 +54,9 @@ async function main() {
 
   log('info', `assembled: interpreter=${assembled.interpreter} home=${assembled.home}`);
 
-  // D 项：经插件自己注册的 RPC 端点发起 run/create → run/start（同一 createHandler apply() 注册到路由）。
-  const rpc = createHandler(assembled.service);
+  // 七轮-5：走 apply() 实际注册到路由的 handler（assembled.handler），不得重新 createHandler。
+  const rpc = assembled.handler;
+  if (!rpc) throw new Error('生产证据失败：apply() 注册的 RPC handler 缺失（路由未注册）');
   const signal = new AbortController().signal;
   const peer = { principal: { kind: 'owner' } };
 
@@ -73,7 +74,7 @@ async function main() {
   const agentDefaultModel = ctx.get('agentDefaultModel');
   const selection = agentDefaultModel?.currentSelection?.() ?? { provider: 'tcreditai', model: 'deepseek-flash' };
 
-  // D 项：run/start 也经插件注册的 RPC 端点（createHandler）。
+  // 七轮-5：run/start 也经 apply() 注册的 RPC 端点。
   const startResp = await rpc('run/start', {
     requestId: randomUUID(), runId, workspaceId: 'ws-e2e',
   }, signal, peer);

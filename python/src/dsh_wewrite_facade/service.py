@@ -428,8 +428,8 @@ def op_binding_get(payload: dict) -> dict[str, Any]:
 
 
 def op_binding_revoke_intents(payload: dict) -> dict[str, Any]:
-    """cancel 路径：撤销该 run 全部未消费 intent（返修 6）。"""
-    revoked = binding.revoke_intents_for_cancel(payload["runId"])
+    """cancel 路径：先门闩→run 锁 CAS 撤销 + phase=cancelled（七轮-1）。"""
+    revoked = binding.revoke_intents_for_cancel(payload["runId"], expected_generation=payload["expectedGeneration"])
     return business_success({"runId": payload["runId"], "revoked": revoked})
 
 

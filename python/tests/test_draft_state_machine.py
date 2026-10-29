@@ -75,14 +75,69 @@ def test_send_full_chain_claim_dispatching_sent(tmp_path):
     op_id = resp["data"]["operationId"]
     assert op_id
 
-    # 重复发送同 intent 返回同一 operationId（幂等）。
+    # 重复发送同 intent：两分支都必须断言，不许 if 跳过（六轮-6 测试质量）。
     resp2 = call_facade(str(home), "draft.send", {
         "requestId": "s2", "runId": run_id, "intentId": intent_id, "expectedVersion": version,
         "context": {"runId": run_id, "workflowId": "wf-1", "generation": 1},
     })
-    # 已 sent 的 intent 不再新建 operation（返回同一 operationId 或终态拒绝）。
     if resp2["ok"] is True:
-        assert resp2["data"]["operationId"] == op_id
+        assert resp2["data"]["operationId"] == op_id, resp2
+    else:
+        # 终态拒绝：错误码必须是终态拒绝，不得新建 operation。
+        assert resp2["error"]["code"] in ("INVALID_TRANSITION", "VERSION_CONFLICT", "NOT_FOUND"), resp2
+
+
+def test_takeover_while_send_latch_held_run_busy(tmp_path):
+    """七轮-1：发送已持门闩、正进 adapter 时接管必须 RUN_BUSY，generation/phase 不变。"""
+    import fcntl
+    import multiprocessing
+
+    home = make_home(tmp_path)
+    run_id = create_run(home)
+    version = write_article(home, run_id, "# 标题\n\n正文内容")
+    assert _publish(home, run_id, 1, workflow="wf-1")["ok"] is True
+
+    # 子进程持住 send.lock。
+    run_dir = home / "runs" / run_id
+    (run_dir / ".dsh-workbench").mkdir(parents=True, exist_ok=True)
+    lock_path = run_dir / ".dsh-workbench" / "send.lock"
+    lock_path.touch()
+    ready = multiprocessing.Event()
+    release = multiprocessing.Event()
+
+    def hold():
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        ready.set()
+        release.wait(timeout=30)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    p = multiprocessing.Process(target=hold)
+    p.start()
+    assert ready.wait(timeout=10), "持锁子进程未就绪"
+    try:
+        # 门闩被持期间接管：必须 RUN_BUSY，不得提交 generation。
+        resp = _publish(home, run_id, 2, workflow="wf-new", expected=1)
+        assert resp["ok"] is False, resp
+        assert resp["error"]["code"] == "RUN_BUSY", resp
+        # binding 仍 generation=1。
+        b = _read_binding(home, run_id)
+        assert b.get("generation") == 1, b
+    finally:
+        release.set()
+        p.join(timeout=10)
+        if p.is_alive():
+            p.terminate()
+            p.join()
+
+
+def _read_binding(home, run_id):
+    import json
+    p = home / "runs" / run_id / ".dsh-workbench" / "binding.json"
+    if not p.exists():
+        return {}
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
 def test_recover_claimed_to_revoked(tmp_path):

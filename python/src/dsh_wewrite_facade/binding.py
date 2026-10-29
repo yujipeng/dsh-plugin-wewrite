@@ -129,56 +129,61 @@ def publish_binding(
     if not isinstance(workspace_id, str) or not workspace_id.strip():
         raise invalid_input("workspaceId 不合法")
 
-    with storage.run_lock(run_id, create=True):
-        storage.ensure_writable_state(run_id)
-        current = read_binding(run_id)
-        if expected_generation is None:
-            if isinstance(current, dict) and current.get("generation"):
-                raise version_conflict("run 已被绑定，请用 run/resume 接管")
-        else:
-            expected_generation = _valid_generation(expected_generation)
-            if not isinstance(current, dict) or current.get("generation") != expected_generation:
-                raise version_conflict("接管代次冲突，请刷新后重试")
+    # 七轮-1：接管/取消必须参与 send 门闩。先取 send_lock（非阻塞，忙则 RUN_BUSY），再取 run 锁。
+    with storage.send_lock(run_id, create=True):
+        with storage.run_lock(run_id, create=True):
+            storage.ensure_writable_state(run_id)
+            current = read_binding(run_id)
+            if expected_generation is None:
+                if isinstance(current, dict) and current.get("generation"):
+                    raise version_conflict("run 已被绑定，请用 run/resume 接管")
+            else:
+                expected_generation = _valid_generation(expected_generation)
+                if not isinstance(current, dict) or current.get("generation") != expected_generation:
+                    raise version_conflict("接管代次冲突，请刷新后重试")
 
-        # 返修二轮-3：binding + 旧 generation 撤销集合合成单一原子提交记录。
-        # 撤销集合与 binding 一起一次写盘；读取时按记录幂等重放，杜绝跨文件半提交。
-        binding = {
-            "runId": run_id,
-            "workflowId": workflow_id,
-            "generation": generation,
-            "agentId": agent_id,
-            "sessionId": session_id,
-            "workspaceId": workspace_id,
-            "phase": phase,
-            "updated": int(time.time()),
-        }
-        revoked_ids = intents.revoked_intent_ids_except(
-            run_id,
-            keep_workflow_id=workflow_id,
-            keep_generation=generation,
-        )
-        return _commit_binding_and_revocations(run_id, binding, revoked_ids)
+            # 返修二轮-3：binding + 旧 generation 撤销集合合成单一原子提交记录。
+            binding = {
+                "runId": run_id,
+                "workflowId": workflow_id,
+                "generation": generation,
+                "agentId": agent_id,
+                "sessionId": session_id,
+                "workspaceId": workspace_id,
+                "phase": phase,
+                "updated": int(time.time()),
+            }
+            revoked_ids = intents.revoked_intent_ids_except(
+                run_id,
+                keep_workflow_id=workflow_id,
+                keep_generation=generation,
+            )
+            return _commit_binding_and_revocations(run_id, binding, revoked_ids)
 
 
-def revoke_intents_for_cancel(run_id: str) -> int:
-    """cancel 路径：在 run 锁内撤销该 run 的全部未消费 intent，并把撤销集合写进 binding（唯一权威）。
+def revoke_intents_for_cancel(run_id: str, *, expected_generation: int) -> int:
+    """cancel 路径：先取 send_lock（非阻塞，忙则 RUN_BUSY）再取 run 锁，CAS 持久化 phase=cancelled。
 
+    - expectedGeneration 必须等于当前 binding.generation，否则 VERSION_CONFLICT。
     - binding.revokedIntentIds 是唯一权威；intents.json 的 revoked 标记是可选缓存。
     - 返回撤销数（撤销后旧 intent 的外部调用计数为零，draft.send 复验判死）。
     """
     paths.validate_run_id(run_id)
-    with storage.run_lock(run_id, create=False):
-        all_ids = intents.all_intent_ids(run_id)
-        # 把全部 intentId 记为撤销集合，写进 binding（单一原子提交）。
-        current = read_binding(run_id)
-        binding = dict(current) if isinstance(current, dict) else {
-            "runId": run_id, "workflowId": "", "generation": 0,
-            "agentId": "", "sessionId": "", "workspaceId": "", "phase": "cancelled",
-        }
-        binding["revokedIntentIds"] = all_ids
-        storage.write_run_file_rel(
-            run_id,
-            _BINDING_REL,
-            json.dumps(binding, ensure_ascii=False, indent=2).encode("utf-8"),
-        )
-        return len(all_ids)
+    expected_generation = _valid_generation(expected_generation)
+    with storage.send_lock(run_id, create=True):
+        with storage.run_lock(run_id, create=False):
+            current = read_binding(run_id)
+            if not isinstance(current, dict) or current.get("generation") != expected_generation:
+                raise version_conflict("取消代次冲突，请刷新后重试")
+            all_ids = intents.all_intent_ids(run_id)
+            binding = dict(current)
+            binding["phase"] = "cancelled"
+            binding["revokedIntentIds"] = all_ids
+            storage.write_run_file_rel(
+                run_id,
+                _BINDING_REL,
+                json.dumps(binding, ensure_ascii=False, indent=2).encode("utf-8"),
+            )
+            # 同时把 intents 全部置 revoked（可选缓存，权威在 binding）。
+            intents.revoke_all_intents(run_id)
+            return len(all_ids)

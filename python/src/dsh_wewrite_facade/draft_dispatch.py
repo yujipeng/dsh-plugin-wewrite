@@ -34,31 +34,31 @@ def _now() -> int:
 
 
 def prepare(payload: dict) -> dict[str, Any]:
-    """本地预检，不取令牌/不上传。run 短锁内读 binding/正文/门禁，写 prepared。"""
+    """本地预检，不取令牌/不上传。锁内读 binding/正文/门禁后登记；expiresAt 真实服务端时间（默认五分钟）。"""
     run_id = payload["runId"]
     expected = payload["expectedVersion"]
-    content, version = projection.read_artifact_content(run_id, "article")
-    if expected is not None and expected != version:
-        raise version_conflict("正文版本已变化，请刷新后重试")
-    gate = projection.build_gate({}, run_id)
-
-    current_binding = binding.read_binding(run_id)
-    workflow_id = current_binding.get("workflowId", "") if isinstance(current_binding, dict) else ""
-    generation = current_binding.get("generation", 1) if isinstance(current_binding, dict) else 1
-    if not workflow_id:
-        raise forbidden("run 未绑定写作会话，无法预检推送")
     intent_id = uuid.uuid4().hex
-    expires_at = ""  # S3 无真实推送，默认不过期（S4 补 TTL）。
+    # 七轮-3：expiresAt 用真实服务端时间，默认 5 分钟，不得留空。
+    expires_at = int(time.time()) + 300
 
     with storage.run_lock(run_id, create=False):
         storage.ensure_writable_state(run_id)
+        content, version = projection.read_artifact_content(run_id, "article")
+        if expected is not None and expected != version:
+            raise version_conflict("正文版本已变化，请刷新后重试")
+        gate = projection.build_gate({}, run_id)
+        current_binding = binding.read_binding(run_id)
+        workflow_id = current_binding.get("workflowId", "") if isinstance(current_binding, dict) else ""
+        generation = current_binding.get("generation", 1) if isinstance(current_binding, dict) else 1
+        if not workflow_id:
+            raise forbidden("run 未绑定写作会话，无法预检推送")
         intents.record_intent(
             run_id,
             intent_id=intent_id,
             workflow_id=workflow_id,
             generation=generation,
             article_version=version,
-            expires_at=expires_at,
+            expires_at=str(expires_at),
         )
 
     summary = {
@@ -74,7 +74,7 @@ def prepare(payload: dict) -> dict[str, Any]:
     }
     return business_success({
         "intentId": intent_id,
-        "expiresAt": expires_at,
+        "expiresAt": str(expires_at),
         "gate": gate or {"publishable": False, "issues": [], "articleVersion": version, "reportVersion": None},
         "summary": summary,
     })
@@ -121,18 +121,16 @@ def send(payload: dict, context: dict[str, Any]) -> dict[str, Any]:
                                   extra={"operationId": operation_id, "claimNonce": claim_nonce,
                                          "claimedAt": _now(), "state": "claimed"})
 
-    # 2) 本地构造（无网络）
+    # 2) 本地构造 transport（无网络；正文读取在门闩→run锁内当场重读，不在此处读）。
     try:
-        content, version = projection.read_artifact_content(run_id, "article")
         transport = publish.build_transport("fake")
     except FacadeError:
-        # 构造失败终结 claimed → revoked
         with storage.run_lock(run_id, create=False):
             intents.transition_intent(run_id, intent_id, expected_state="claimed", new_state="revoked",
                                       extra={"issue": "本地构造失败"})
         raise
 
-    # 3) 取 send 门闩 → 二次复验 → dispatching
+    # 3) 取 send 门闩 → 门闩内当场重读快照 + 二次复验 → dispatching
     try:
         with storage.send_lock(run_id, create=True):
             with storage.run_lock(run_id, create=False):
@@ -144,12 +142,16 @@ def send(payload: dict, context: dict[str, Any]) -> dict[str, Any]:
                 # 二次复验
                 if not _verify_context(run_id, item, context):
                     raise cancelled("推送意图已失效，需重新预检", run_id=run_id)
+                # 七轮-2：当场重读正文/报告/门禁/摘要，逐项比对 intent 固定值。
+                content, version = projection.read_artifact_content(run_id, "article")
                 if payload["expectedVersion"] is not None and payload["expectedVersion"] != version:
+                    raise version_conflict("正文版本已变化，请刷新后重试")
+                if item.get("articleVersion") is not None and item.get("articleVersion") != version:
                     raise version_conflict("正文版本已变化，请刷新后重试")
                 intents.transition_intent(run_id, intent_id, expected_state="claimed", new_state="dispatching",
                                           extra={"dispatchStartedAt": _now(), "state": "dispatching"})
 
-            # 4) 持门闩发送（本轮唯一不可妥协点）
+            # 4) 持门闩发送（使用当场固定的快照，绝不使用门闩外读到的 content/version）
             try:
                 result = publish.send_draft_fake(
                     transport,
@@ -172,7 +174,6 @@ def send(payload: dict, context: dict[str, Any]) -> dict[str, Any]:
                                           extra=extra)
     except FacadeError as exc:
         if exc.code == "RUN_BUSY":
-            # 门闩忙：保持 claimed，返回 RUN_BUSY（由 host 在 child close 后 recover）。
             raise
         raise
 
@@ -240,6 +241,7 @@ def recover(payload: dict) -> dict[str, Any]:
     """显式恢复（私有 facade operation）：claimed→revoked、dispatching→unknown、终态不动。
 
     锁序：send 门闩 → run 锁。全程不取 home、不调用 transport。幂等：重复恢复零变更不重写。
+    七轮-4：旧格式（schemaVersion<2 或缺 state）整体迁 v2，旧条目保守 unknown；定向 intentId 不存在返回 NOT_FOUND。
     """
     run_id = payload["runId"]
     intent_id = payload.get("intentId")
@@ -251,14 +253,25 @@ def recover(payload: dict) -> dict[str, Any]:
     with storage.send_lock(run_id, create=True):
         with storage.run_lock(run_id, create=False):
             items = intents.read_intents(run_id)
+            # 旧格式迁移：无 state 字段的条目保守置 unknown；整体升 v2。
             changed = False
+            found_target = False
             for item in items:
                 if not isinstance(item, dict):
                     continue
                 if intent_id is not None and item.get("intentId") != intent_id:
                     continue
+                found_target = True
                 examined += 1
                 state = item.get("state")
+                if state not in intents.STATES:
+                    # 旧条目：无法证明从未发送，保守 unknown。
+                    item["state"] = "unknown"
+                    item["issue"] = "旧格式记录迁移，结果无法确定"
+                    unknown += 1
+                    migrated += 1
+                    changed = True
+                    continue
                 if state == "claimed":
                     item["state"] = "revoked"
                     item["issue"] = "未发送占用已终止"
@@ -270,6 +283,8 @@ def recover(payload: dict) -> dict[str, Any]:
                     unknown += 1
                     changed = True
                 # sent/unknown/revoked/prepared：不动
+            if intent_id is not None and not found_target:
+                raise not_found("推送意图不存在")
             if changed:
                 intents._write_intents(run_id, items)
 

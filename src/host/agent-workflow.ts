@@ -258,16 +258,33 @@ export class AgentWorkflow {
     if (record.binding.generation !== input.generation) {
       return businessFailure('VERSION_CONFLICT', '接管代次冲突，请刷新后重试');
     }
+
+    // 七轮-1：先持久撤租约（binding.revoke-intents，含 expectedGeneration CAS + phase=cancelled），
+    // 撤销失败/门闩忙(RUN_BUSY)不杀 Agent、不报成功。
+    const revokeResp = await this.options.bridge('binding.revoke-intents', {
+      runId: input.runId,
+      expectedGeneration: input.generation,
+    });
+    if (revokeResp.ok === false) {
+      const err = revokeResp.error as { code?: string };
+      if (err?.code === 'RUN_BUSY') {
+        return businessFailure('RUN_BUSY', '草稿正在发送，无法取消', { runId: input.runId });
+      }
+      if (err?.code === 'VERSION_CONFLICT') {
+        return businessFailure('VERSION_CONFLICT', '取消代次冲突，请刷新后重试');
+      }
+      if (err?.code === 'CANCELLED') {
+        return businessFailure('CANCELLED', '写租约已失效，需重新接管', { runId: input.runId });
+      }
+      return businessFailure('INTERNAL', '撤销未消费推送意图失败，任务仍处于取消中');
+    }
+
+    // 撤租约成功后才停 Agent + 回收（等子进程退出的退出证明由 bridge close 保证）。
     try {
       record.handle.agent.cancel({ kind: 'user' });
       await record.handle.dispose().catch(() => undefined);
     } catch (error) {
       this.options.onError?.(redactError(error));
-    }
-    // 返修二轮-3：取消路径撤销失败不得吞掉——撤销失败返回失败并保留活跃记录，不能报 cancelled。
-    const revokeResp = await this.options.bridge('binding.revoke-intents', { runId: input.runId });
-    if (revokeResp.ok === false) {
-      return businessFailure('INTERNAL', '撤销未消费推送意图失败，任务仍处于取消中');
     }
     this.records.delete(input.runId);
     return businessSuccess({ runId: input.runId, phase: 'cancelled', generation: input.generation });

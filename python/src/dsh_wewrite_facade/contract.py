@@ -336,7 +336,11 @@ def _v_binding_get(p: dict) -> dict:
 
 
 def _v_binding_revoke_intents(p: dict) -> dict:
-    return {"runId": _require_run_id(p.get("runId"))}
+    run_id = _require_run_id(p.get("runId"))
+    expected_generation = p.get("expectedGeneration")
+    if isinstance(expected_generation, bool) or not isinstance(expected_generation, int) or expected_generation < 1:
+        raise invalid_input("expectedGeneration 不合法")
+    return {"runId": run_id, "expectedGeneration": expected_generation}
 
 
 def _v_draft_prepare(p: dict) -> dict:

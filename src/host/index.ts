@@ -198,6 +198,8 @@ export interface AssembledWorkbench {
   readonly bridge: WorkbenchBridge;
   readonly interpreter: string;
   readonly home: string;
+  /** 实际注册到 RPC 路由的 handler（七轮-5 取证用）。 */
+  readonly handler?: ReturnType<typeof createHandler>;
 }
 
 const assembledByProfile = new Map<string, AssembledWorkbench>();
@@ -293,11 +295,19 @@ export async function apply(ctx: HostContext, rawConfig: unknown): Promise<void>
         const assembled = getAssembledOnce(rpcCtx, get);
 
         try {
+          // 七轮-5：记录实际注册到路由的 handler（e2e 走这一个，不再重新 createHandler）。
+          const registeredHandler = createHandler(assembled.service);
+          const record = assembledByProfile.get('default');
+          if (record) {
+            assembledByProfile.set('default', { ...record, handler: registeredHandler });
+            (globalThis as unknown as { __wewriteAssembled?: AssembledWorkbench }).__wewriteAssembled =
+              { ...record, handler: registeredHandler };
+          }
           const stopRpc = registerWebRpcRoute(
             webServer as never,
             connection as never,
             RPC_CHANNEL,
-            createHandler(assembled.service),
+            registeredHandler,
           );
           logger.info('dsh-plugin-wewrite: RPC 通道已注册 /wewrite-python');
           if (typeof stopRpc === 'function') disposers.push(() => Promise.resolve(stopRpc()).catch(() => undefined));
