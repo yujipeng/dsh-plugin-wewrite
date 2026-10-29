@@ -10,12 +10,13 @@ RPC 和工具共享本 Module；`draft.recover` 只在 host 私有 facade bridge
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import time
 import uuid
 from typing import Any
 
-from . import binding, counters, intents, paths, projection, publish, storage
+from . import assets, binding, counters, intents, paths, projection, publish, storage
 from .errors import (
     FacadeError,
     business_success,
@@ -31,6 +32,81 @@ from .errors import (
 
 def _now() -> int:
     return int(time.time())
+
+
+# 摘要字段簇唯一权威在 intents.SUMMARY_FIELDS（JEE-1956 整理项）：
+# 生产方 _summary_baseline 与复验方 _verify_summary 都按该清单构造/遍历，不再逐字段散落。
+
+
+def _summary_baseline(
+    *,
+    run_id: str,
+    theme_id: str,
+    cover_asset_id: str,
+    gate: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """从磁盘真实状态固定推送摘要基线（缺口 1）。
+
+    封面哈希从资产登记表回读（而非空串）；账号 ref/version 在 S3 无微信凭据，固定为空。
+    返回 dict 的键集与顺序严格等于 intents.SUMMARY_FIELDS。
+    """
+    report_version = None
+    try:
+        _, rv = projection.read_artifact_content(run_id, "review_report")
+        report_version = rv
+    except FacadeError:
+        report_version = None
+    publishable = bool(gate.get("publishable")) if isinstance(gate, dict) else None
+
+    values = {
+        "reportVersion": report_version,
+        "publishable": publishable,
+        "coverHash": assets.asset_hash(run_id, cover_asset_id),
+        # 权威主题取已持久化的 editorial.theme；未保存过时回退 prepare 入参 themeId。
+        "themeId": _current_theme_id(run_id) or theme_id,
+        "accountRef": "",
+        "accountVersion": None,
+    }
+    return {field: values[field] for field in intents.SUMMARY_FIELDS}
+
+
+def _verify_summary(run_id: str, item: dict[str, Any], current_gate: dict[str, Any] | None) -> bool:
+    """二次复验摘要基线逐项比对（缺口 1，fail-closed）。
+
+    按 intents.SUMMARY_FIELDS 逐字段比对：当前盘上重新派生的基线任一字段与
+    intent 固定值不符即拒。accountRef/accountVersion 因 S3 固定为空，天然随该
+    比对一起校验（非默认值即拒）。
+    """
+    current = _summary_baseline(
+        run_id=run_id,
+        theme_id=item.get("themeId") or "",
+        cover_asset_id=item.get("coverAssetId") or "",
+        gate=current_gate,
+    )
+    for field in intents.SUMMARY_FIELDS:
+        if item.get(field) != current[field]:
+            return False
+    return True
+
+
+def _current_theme_id(run_id: str) -> str:
+    """读 state.yaml editorial.theme（与 article.save 落盘口径一致）；读不到返回空串。"""
+    import yaml
+
+    try:
+        fd, _st = paths.open_state(run_id)
+    except FacadeError:
+        return ""
+    try:
+        with os.fdopen(fd, "rb") as f:
+            state = yaml.safe_load(f.read())
+    except Exception:
+        return ""
+    if not isinstance(state, dict):
+        return ""
+    editorial = state.get("editorial")
+    theme = editorial.get("theme") if isinstance(editorial, dict) else None
+    return theme if isinstance(theme, str) else ""
 
 
 def prepare(payload: dict) -> dict[str, Any]:
@@ -51,22 +127,19 @@ def prepare(payload: dict) -> dict[str, Any]:
         if not isinstance(current_binding, dict):
             raise forbidden("run 未绑定写作会话，无法预检推送")
         # 九轮-2/9：prepare 拒绝 cancelling/cancelled 的 binding。
-        if current_binding.get("phase") in ("cancelling", "cancelled"):
+        if binding.is_cancelled_phase(current_binding):
             raise forbidden("run 已取消，无法预检推送")
         workflow_id = current_binding.get("workflowId", "")
         generation = current_binding.get("generation", 1)
         if not workflow_id:
             raise forbidden("run 未绑定写作会话，无法预检推送")
-        # 九轮-9：摘要字段一并写入 intent（reportVersion/publishable/coverHash/themeId/account）。
-        report_version = None
-        publishable = None
-        try:
-            _, rv = projection.read_artifact_content(run_id, "review_report")
-            report_version = rv
-        except FacadeError:
-            report_version = None
-        if isinstance(gate, dict):
-            publishable = bool(gate.get("publishable"))
+        # 九轮-9 / JEE-1956 缺口 1：摘要字段基线从磁盘真实状态固定。
+        summary = _summary_baseline(
+            run_id=run_id,
+            theme_id=payload["themeId"],
+            cover_asset_id=payload["coverAssetId"],
+            gate=gate,
+        )
         intents.record_intent(
             run_id,
             intent_id=intent_id,
@@ -74,11 +147,13 @@ def prepare(payload: dict) -> dict[str, Any]:
             generation=generation,
             article_version=version,
             expires_at=str(expires_at),
-            report_version=report_version,
-            publishable=publishable,
-            cover_hash="",
-            theme_id=payload["themeId"],
-            account_ref="",
+            report_version=summary["reportVersion"],
+            publishable=summary["publishable"],
+            cover_hash=summary["coverHash"],
+            theme_id=summary["themeId"],
+            account_ref=summary["accountRef"],
+            account_version=summary["accountVersion"],
+            cover_asset_id=payload["coverAssetId"],
         )
 
     summary = {
@@ -87,7 +162,7 @@ def prepare(payload: dict) -> dict[str, Any]:
         "digest": "",
         "articleVersion": version,
         "themeId": payload["themeId"],
-        "coverHash": "",
+        "coverHash": summary["coverHash"],
         "contentHash": version,
         "accountLabel": "",
         "dryRun": True,
@@ -168,6 +243,10 @@ def send(payload: dict, context: dict[str, Any]) -> dict[str, Any]:
                     raise version_conflict("正文版本已变化，请刷新后重试")
                 if item.get("articleVersion") is not None and item.get("articleVersion") != version:
                     raise version_conflict("正文版本已变化，请刷新后重试")
+                # JEE-1956 缺口 1：二次复验重读门禁与摘要基线逐项比对（fail-closed）。
+                current_gate = projection.build_gate({}, run_id)
+                if not _verify_summary(run_id, item, current_gate):
+                    raise cancelled("推送摘要已变化，需重新预检", run_id=run_id)
                 intents.transition_intent(run_id, intent_id, expected_state="claimed", new_state="dispatching",
                                           extra={"dispatchStartedAt": _now(), "state": "dispatching"})
 
@@ -273,9 +352,22 @@ def recover(payload: dict) -> dict[str, Any]:
     with storage.send_lock(run_id, create=True):
         with storage.run_lock(run_id, create=False):
             items = intents.read_intents(run_id)
-            # 旧格式迁移：无 state 字段的条目保守置 unknown；整体升 v2。
             changed = False
             found_target = False
+
+            # JEE-1956 缺口 4：先整体迁移旧格式（schemaVersion<2 或缺 state），再处理定向条目。
+            # 迁移不受 intentId 过滤影响——定向恢复前所有旧条目都必须迁到 v2，保守 unknown。
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("state") not in intents.STATES:
+                    item["state"] = "unknown"
+                    item["issue"] = "旧格式记录迁移，结果无法确定"
+                    migrated += 1
+                    unknown += 1
+                    changed = True
+
+            # 定向状态转移（只作用于目标条目）。
             for item in items:
                 if not isinstance(item, dict):
                     continue
@@ -284,14 +376,6 @@ def recover(payload: dict) -> dict[str, Any]:
                 found_target = True
                 examined += 1
                 state = item.get("state")
-                if state not in intents.STATES:
-                    # 旧条目：无法证明从未发送，保守 unknown。
-                    item["state"] = "unknown"
-                    item["issue"] = "旧格式记录迁移，结果无法确定"
-                    unknown += 1
-                    migrated += 1
-                    changed = True
-                    continue
                 if state == "claimed":
                     item["state"] = "revoked"
                     item["issue"] = "未发送占用已终止"
@@ -303,6 +387,7 @@ def recover(payload: dict) -> dict[str, Any]:
                     unknown += 1
                     changed = True
                 # sent/unknown/revoked/prepared：不动
+
             if intent_id is not None and not found_target:
                 raise not_found("推送意图不存在")
             if changed:
@@ -337,19 +422,25 @@ def _verify_context(run_id: str, item: dict[str, Any], context: dict[str, Any]) 
     if current_binding.get("generation") != context.get("generation"):
         return False
     # phase fence（九轮-2）：cancelling/cancelled 一律拒。
-    if current_binding.get("phase") in ("cancelling", "cancelled"):
+    if binding.is_cancelled_phase(current_binding):
         return False
     revoked = current_binding.get("revokedIntentIds")
     if isinstance(revoked, list) and item.get("intentId") in revoked:
         return False
-    # TTL（九轮-1）：过期即拒。
+    # TTL（九轮-1 + JEE-1956 缺口 2）：异常即拒——缺失/空串/数值类型一律 fail-closed。
+    return _verify_ttl(item)
+
+
+def _verify_ttl(item: dict[str, Any]) -> bool:
+    """TTL 校验（独立 seam，供返修真红自证用 monkeypatch 回退）。"""
     expires = item.get("expiresAt")
-    if isinstance(expires, str) and expires:
-        try:
-            if int(expires) <= int(time.time()):
-                return False
-        except ValueError:
+    if not isinstance(expires, str) or not expires:
+        return False
+    try:
+        if int(expires) <= int(time.time()):
             return False
+    except ValueError:
+        return False
     return True
 
 

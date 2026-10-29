@@ -22,6 +22,16 @@ STATES = ("prepared", "claimed", "dispatching", "sent", "unknown", "revoked")
 # 终态：不回 prepared，墓碑不释放。
 TERMINAL_STATES = ("sent", "unknown", "revoked")
 
+# 推送摘要字段簇（JEE-1956 整理项）：prepare 固定、send 二次复验逐项比对的基线字段。
+SUMMARY_FIELDS = (
+    "reportVersion",
+    "publishable",
+    "coverHash",
+    "themeId",
+    "accountRef",
+    "accountVersion",
+)
+
 
 def os_fd_read(fd: int) -> bytes:
     import os
@@ -89,10 +99,14 @@ def record_intent(
     cover_hash: str = "",
     theme_id: str = "",
     account_ref: str = "",
+    account_version: str | None = None,
+    cover_asset_id: str = "",
 ) -> dict[str, Any]:
     """在 run 锁内登记一个新 intent（op_draft_prepare 调用），state=prepared。
 
-    九轮-9：摘要字段（reportVersion/publishable/coverHash/themeId/account）一并写入。
+    九轮-9 / JEE-1956 缺口 1：摘要字段（reportVersion/publishable/coverHash/themeId/
+    accountRef/accountVersion）一并写入并作为发送二次复验的固定基线；coverAssetId
+    用于发送时回读封面当前哈希比对。
     """
     paths.validate_run_id(run_id)
     intents = read_intents(run_id)
@@ -118,6 +132,8 @@ def record_intent(
         "coverHash": cover_hash,
         "themeId": theme_id,
         "accountRef": account_ref,
+        "accountVersion": account_version,
+        "coverAssetId": cover_asset_id,
     }
     intents.append(entry)
     _write_intents(run_id, intents)

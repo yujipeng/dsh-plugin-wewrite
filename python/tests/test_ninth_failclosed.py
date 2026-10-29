@@ -137,27 +137,47 @@ def test_summary_fields_written_and_verified(tmp_path):
     assert "themeId" in target, target
 
 
-def test_adapter_total_calls_exactly_one(tmp_path):
-    """九轮-8：一次 send 恰好调用一次 adapter，重复 send 不增调用。"""
+def test_adapter_called_exactly_once_and_repeat_send_rejected(tmp_path, monkeypatch):
+    """JEE-1956 缺口 6：真实 adapter 计数（替换原「声称计数却无计数断言」的用例）。
+
+    进程内直接驱动 draft_dispatch.send，monkeypatch 假 adapter 计数：
+    一次 send 恰好一次 adapter；重复 send 终态拒绝（INVALID_TRANSITION）且不再调用。
+    """
+    from dsh_wewrite_facade import draft_dispatch
+    from dsh_wewrite_facade.errors import FacadeError
+
     home = make_home(tmp_path)
     run_id = create_run(home)
     version = write_article(home, run_id, "# 标题\n\n正文内容")
     assert _publish(home, run_id, 1, workflow="wf-1")["ok"] is True
     intent_id = _prepare(home, run_id)["data"]["intentId"]
+    monkeypatch.setenv("WEWRITE_HOME", str(home))
 
-    resp = call_facade(str(home), "draft.send", {
-        "requestId": "s1", "runId": run_id, "intentId": intent_id, "expectedVersion": version,
-        "context": {"runId": run_id, "workflowId": "wf-1", "generation": 1},
-    })
+    calls: list[int] = []
+    real_send = draft_dispatch.publish.send_draft_fake
+
+    def counting_send(*args, **kwargs):
+        calls.append(1)
+        return real_send(*args, **kwargs)
+
+    monkeypatch.setattr(draft_dispatch.publish, "send_draft_fake", counting_send)
+
+    resp = draft_dispatch.send(
+        {"requestId": "s1", "runId": run_id, "intentId": intent_id, "expectedVersion": version},
+        {"runId": run_id, "workflowId": "wf-1", "generation": 1},
+    )
     assert resp["ok"] is True, resp
-    # 假 transport 调用 1 次（dry-run 成功路径）。
-    # 重复发送：终态拒绝，不再调用 adapter。
-    resp2 = call_facade(str(home), "draft.send", {
-        "requestId": "s2", "runId": run_id, "intentId": intent_id, "expectedVersion": version,
-        "context": {"runId": run_id, "workflowId": "wf-1", "generation": 1},
-    })
-    # 终态：ok=false 则断言错误码；ok=true 则 operationId 同。两分支都断言。
-    if resp2["ok"] is True:
-        assert resp2["data"]["operationId"] == resp["data"]["operationId"]
-    else:
-        assert resp2["error"]["code"] in ("INVALID_TRANSITION", "VERSION_CONFLICT", "NOT_FOUND"), resp2
+    assert resp["data"]["status"] == "succeeded"
+    assert len(calls) == 1, calls
+
+    # 重复发送：终态拒绝（精确 INVALID_TRANSITION，不再允许 NOT_FOUND），adapter 不再调用。
+    try:
+        draft_dispatch.send(
+            {"requestId": "s2", "runId": run_id, "intentId": intent_id, "expectedVersion": version},
+            {"runId": run_id, "workflowId": "wf-1", "generation": 1},
+        )
+        code = None
+    except FacadeError as exc:
+        code = exc.code
+    assert code == "INVALID_TRANSITION", code
+    assert len(calls) == 1, calls

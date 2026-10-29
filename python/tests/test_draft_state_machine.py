@@ -87,49 +87,80 @@ def test_send_full_chain_claim_dispatching_sent(tmp_path):
         assert resp2["error"]["code"] in ("INVALID_TRANSITION", "VERSION_CONFLICT", "NOT_FOUND"), resp2
 
 
-def test_takeover_while_send_latch_held_run_busy(tmp_path):
-    """七轮-1：发送已持门闩、正进 adapter 时接管必须 RUN_BUSY，generation/phase 不变。"""
-    import fcntl
-    import multiprocessing
+def test_takeover_run_busy_while_send_in_adapter_window(tmp_path, monkeypatch):
+    """JEE-1956 缺口 6：真实交错窗口——二次复验已过、adapter 执行中（持 send 门闩）时接管 RUN_BUSY。
+
+    替换原「子进程手工持锁」用例：这里起真实 draft_dispatch.send，在 adapter 暂停点
+    （二次复验之后、adapter 之前）从主线程发起 binding.publish，必须 RUN_BUSY 且 generation 不变。
+    """
+    import threading
+
+    from dsh_wewrite_facade import binding as binding_mod
+    from dsh_wewrite_facade import draft_dispatch
 
     home = make_home(tmp_path)
     run_id = create_run(home)
     version = write_article(home, run_id, "# 标题\n\n正文内容")
     assert _publish(home, run_id, 1, workflow="wf-1")["ok"] is True
+    intent_id = _prepare(home, run_id)["data"]["intentId"]
+    monkeypatch.setenv("WEWRITE_HOME", str(home))
 
-    # 子进程持住 send.lock。
-    run_dir = home / "runs" / run_id
-    (run_dir / ".dsh-workbench").mkdir(parents=True, exist_ok=True)
-    lock_path = run_dir / ".dsh-workbench" / "send.lock"
-    lock_path.touch()
-    ready = multiprocessing.Event()
-    release = multiprocessing.Event()
+    entered = threading.Event()
+    release = threading.Event()
+    real_send = draft_dispatch.publish.send_draft_fake
 
-    def hold():
-        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        ready.set()
-        release.wait(timeout=30)
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+    def blocking_send(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=30), "adapter 暂停点未收到释放信号"
+        return real_send(*args, **kwargs)
 
-    p = multiprocessing.Process(target=hold)
-    p.start()
-    assert ready.wait(timeout=10), "持锁子进程未就绪"
+    monkeypatch.setattr(draft_dispatch.publish, "send_draft_fake", blocking_send)
+
+    result: dict = {}
+    error: Exception | None = None
+
+    def run_send():
+        nonlocal result, error
+        try:
+            result = draft_dispatch.send(
+                {"requestId": "s1", "runId": run_id, "intentId": intent_id, "expectedVersion": version},
+                {"runId": run_id, "workflowId": "wf-1", "generation": 1},
+            )
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+
+    t = threading.Thread(target=run_send)
+    t.start()
+    assert entered.wait(timeout=10), "send 未进入 adapter 暂停点"
     try:
-        # 门闩被持期间接管：必须 RUN_BUSY，不得提交 generation。
-        resp = _publish(home, run_id, 2, workflow="wf-new", expected=1)
-        assert resp["ok"] is False, resp
-        assert resp["error"]["code"] == "RUN_BUSY", resp
-        # binding 仍 generation=1。
+        # adapter 执行中、send 门闩已持：接管必须 RUN_BUSY，不得提交 generation=2。
+        try:
+            binding_mod.publish_binding(
+                run_id,
+                workflow_id="wf-new",
+                generation=2,
+                agent_id="agent-2",
+                session_id="session-2",
+                workspace_id="ws-1",
+                phase="writing",
+                expected_generation=1,
+            )
+            code = None
+        except Exception as exc:  # noqa: BLE001
+            from dsh_wewrite_facade.errors import FacadeError
+            code = exc.code if isinstance(exc, FacadeError) else None
+        assert code == "RUN_BUSY", code
+        # binding 仍 generation=1（未提交接管）。
         b = _read_binding(home, run_id)
         assert b.get("generation") == 1, b
     finally:
         release.set()
-        p.join(timeout=10)
-        if p.is_alive():
-            p.terminate()
-            p.join()
+        t.join(timeout=10)
+        if t.is_alive():
+            raise AssertionError("send 线程未在 adapter 释放后收敛")
+
+    assert error is None, error
+    assert result.get("ok") is True, result
 
 
 def _read_binding(home, run_id):

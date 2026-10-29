@@ -14,8 +14,8 @@ import { registerWebRpcRoute } from './web-route';
 import { resolveLogger, type Disposer, type HostContext } from './types';
 import { WorkbenchService, type WorkbenchBridge } from './workbench-service';
 import { AgentWorkflow, type DshAgentRuntime } from './agent-workflow';
-import { runFacade } from './wewrite-bridge';
-import { buildAgentTools, setToolService, controlledToolGuard, INHERITED_TOOL_ALLOWLIST } from './tools';
+import { runFacade, shouldRecoverAfterClose } from './wewrite-bridge';
+import { buildAgentTools, setToolService, controlledToolGuard, setupAgentScope, INHERITED_TOOL_ALLOWLIST } from './tools';
 import { buildProvider, defaultManifestPath, PROVIDER_NAME } from './skills-provider';
 import { randomUUID } from 'node:crypto';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
@@ -28,7 +28,7 @@ export type { DshAgentRuntime } from './agent-workflow';
 export { WorkbenchService } from './workbench-service';
 export type { WorkbenchBridge } from './workbench-service';
 export { runFacade } from './wewrite-bridge';
-export { buildAgentTools, setToolService, controlledToolGuard, INHERITED_TOOL_ALLOWLIST } from './tools';
+export { buildAgentTools, setToolService, controlledToolGuard, setupAgentScope, INHERITED_TOOL_ALLOWLIST } from './tools';
 export { createHandler } from './rpc';
 export { RPC_CHANNEL } from '../shared/contract';
 
@@ -109,7 +109,25 @@ function assembleWorkbench(
         payload,
         requestId: (payload.requestId as string | undefined) ?? randomUUID(),
       },
-      { interpreter, home, timeoutMs: config.bridgeTimeoutMs },
+      {
+        interpreter,
+        home,
+        timeoutMs: config.bridgeTimeoutMs,
+        // JEE-1956 缺口 3：draft.send 子进程确切 close 后调用一次 draft.recover。
+        // 发送成功/sent 无待恢复；失败/中断/超时后把 claimed/dispatching 收口为 revoked/unknown。
+        onChildClose: async (info) => {
+          if (!shouldRecoverAfterClose(info)) return;
+          try {
+            await runFacade(
+              { operation: 'draft.recover', payload: { requestId: randomUUID(), runId: info.runId }, requestId: randomUUID() },
+              { interpreter, home },
+            );
+          } catch {
+            // 恢复失败不吞主链路结果；仅记录诊断。
+            logger.warn('dsh-plugin-wewrite: draft.recover 接线调用失败');
+          }
+        },
+      },
     );
     if (result.issue) {
       return { ok: false, error: { code: result.issue.code, message: result.issue.message, retryable: false } };
@@ -147,36 +165,12 @@ function assembleWorkbench(
     bridge,
     scopeSetup: (agentCtx) => {
       // 专属写作 Agent 的 scope 装配：注册 8 个受控工具 + 继承层 restrict + 单调 guard。
-      // 设计 §5 两条路径分别落实：
-      // 1) 继承层：restrict({allow: 空清单}) 只过滤继承的全局/祖先层工具（shell/通用写入/代码执行/委派），
-      //    不把 scope-local 名称、未知名称或 reserved `run_code` 传给 restrict。
-      // 2) 自身层与 reserved：guard 显式拒绝 run_code/自身层危险工具，native 插件工具仍可执行。
       if (config.agentToolsEnabled === false) return;
-      const agentTools = (agentCtx as { get?: (name: string) => unknown }).get?.('tools') as
-        | { register?: (d: unknown) => () => void; restrict?: (f: unknown) => () => void; guard?: (g: unknown) => () => void }
-        | undefined;
-      if (typeof agentTools?.register !== 'function') return;
-      for (const def of toolDefs) {
-        try {
-          agentTools.register(def);
-        } catch (error) {
-          logger.warn(`dsh-plugin-wewrite: 工具 ${def.name} scope 注册失败：${redactError(error)}`);
-        }
-      }
-      if (typeof agentTools.restrict === 'function') {
-        try {
-          agentTools.restrict({ allow: [...INHERITED_TOOL_ALLOWLIST] });
-        } catch (error) {
-          logger.warn(`dsh-plugin-wewrite: tools.restrict 继承层过滤失败：${redactError(error)}`);
-        }
-      }
-      if (typeof agentTools.guard === 'function') {
-        try {
-          agentTools.guard(controlledToolGuard);
-        } catch (error) {
-          logger.warn(`dsh-plugin-wewrite: tools.guard scope 注册失败：${redactError(error)}`);
-        }
-      }
+      setupAgentScope(
+        agentCtx as { get?: (name: string) => unknown },
+        toolDefs,
+        (message) => logger.warn(`dsh-plugin-wewrite: ${message}`),
+      );
     },
     homeLabel: home ? '数据根（已配置，不显示路径）' : '数据根未配置',
     mainSkillName: 'wewrite',

@@ -81,6 +81,14 @@ def _binding_matches(binding: dict[str, Any] | None, workflow_id: str, generatio
     return binding.get("workflowId") == workflow_id and binding.get("generation") == generation
 
 
+def is_cancelled_phase(binding: dict[str, Any] | None) -> bool:
+    """取消阶段判定（JEE-1956 整理项）：cancelling/cancelled 一律视为已取消。
+
+    收敛 binding.py 与 draft_dispatch.py 的多处重复判定为一处。
+    """
+    return isinstance(binding, dict) and binding.get("phase") in ("cancelling", "cancelled")
+
+
 def require_active_binding(run_id: str, workflow_id: Any, generation: Any) -> None:
     """写面 fencing 复核：host 上下文必须与持久化绑定一致，否则拒绝（旧租约零写）。
 
@@ -95,7 +103,7 @@ def require_active_binding(run_id: str, workflow_id: Any, generation: Any) -> No
     binding = read_binding(run_id)
     if not isinstance(binding, dict):
         raise forbidden("run 未绑定写作会话")
-    if binding.get("phase") in ("cancelling", "cancelled"):
+    if is_cancelled_phase(binding):
         raise forbidden("run 已取消，禁止写入")
     if binding.get("workflowId") != workflow_id:
         raise forbidden("工作流与当前 run 绑定不符")
