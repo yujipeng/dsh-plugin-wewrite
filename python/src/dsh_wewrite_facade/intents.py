@@ -1,40 +1,26 @@
-"""intent 注册表（设计 §5 接管栅栏 + §6 存储布局 + 返修 6）。
+"""intent 注册表（设计修订版二 §3）：schemaVersion=2 状态机持久层。
 
-推送 intent 持久化在 ``runs/<runId>/.dsh-workbench/intents.json``，每个 intent 绑定发起时的
-``workflowId``/``generation``/``runId``/``articleVersion``。接管/取消时在 run 锁内把旧 generation
-的全部未消费 intent 标记 ``revoked``，与 binding 发布写进同一可恢复事务；撤销后旧 intent 的
-外部调用计数为零（draft.send 复验时拒绝 revoked intent）。
-
-注意：S3 无真实推送，intent 只用于预检；但撤销栅栏必须完整落地，S4 真实推送直接复用。
+每项含 state / operationId / claimNonce / claimedAt / dispatchStartedAt / result / issue。
+状态机：prepared → claimed → dispatching → sent|unknown；prepared/claimed 可转 revoked。
+sent/unknown/revoked 不回 prepared，unknown 墓碑不释放。
+binding.json 仍是代次与撤销唯一权威；本文件是消费/结果与 intentId 唯一性的唯一权威。
 """
 
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from . import paths, storage
-from .errors import FacadeError, forbidden
+from .errors import FacadeError, forbidden, not_found, state_corrupted
 
 _INTENTS_REL = ".dsh-workbench/intents.json"
+SCHEMA_VERSION = 2
 
-
-def read_intents(run_id: str) -> list[dict[str, Any]]:
-    """只读读取 intent 注册表；不存在返回空。绝不创建目录/文件。"""
-    paths.validate_run_id(run_id)
-    try:
-        fd, _st = paths.open_run_file_rel(run_id, _INTENTS_REL)
-    except FacadeError:
-        return []
-    raw = os_fd_read(fd)
-    try:
-        data = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return []
-    if not isinstance(data, dict):
-        return []
-    items = data.get("intents", [])
-    return items if isinstance(items, list) else []
+STATES = ("prepared", "claimed", "dispatching", "sent", "unknown", "revoked")
+# 终态：不回 prepared，墓碑不释放。
+TERMINAL_STATES = ("sent", "unknown", "revoked")
 
 
 def os_fd_read(fd: int) -> bytes:
@@ -44,13 +30,43 @@ def os_fd_read(fd: int) -> bytes:
         return f.read()
 
 
+def read_intents(run_id: str) -> list[dict[str, Any]]:
+    """只读读取 intent 注册表；不存在返回空。损坏返回 None 语义（调用方决定）。"""
+    paths.validate_run_id(run_id)
+    try:
+        fd, _st = paths.open_run_file_rel(run_id, _INTENTS_REL)
+    except FacadeError:
+        return []
+    raw = os_fd_read(fd)
+    return _parse_intents(raw)
+
+
+def _parse_intents(raw: bytes) -> list[dict[str, Any]]:
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        # 损坏：调用方按 STATE_CORRUPTED 处理，不能覆盖。
+        raise state_corrupted("推送记录损坏")
+    if not isinstance(data, dict):
+        raise state_corrupted("推送记录损坏")
+    items = data.get("intents", [])
+    return items if isinstance(items, list) else []
+
+
 def _write_intents(run_id: str, intents: list[dict[str, Any]]) -> None:
-    """写回 intent 注册表（调用方须已持 run 锁）。"""
+    """写回 intent 注册表（调用方须已持 run 锁），schemaVersion=2 原子替换。"""
     storage.write_run_file_rel(
         run_id,
         _INTENTS_REL,
-        json.dumps({"intents": intents}, ensure_ascii=False, indent=2).encode("utf-8"),
+        json.dumps({"schemaVersion": SCHEMA_VERSION, "intents": intents}, ensure_ascii=False, indent=2).encode("utf-8"),
     )
+
+
+def get_intent(run_id: str, intent_id: str) -> dict[str, Any] | None:
+    for item in read_intents(run_id):
+        if isinstance(item, dict) and item.get("intentId") == intent_id:
+            return item
+    return None
 
 
 def record_intent(
@@ -62,10 +78,12 @@ def record_intent(
     article_version: str | None,
     expires_at: str,
 ) -> dict[str, Any]:
-    """在 run 锁内登记一个新 intent（op_draft_prepare 调用）。"""
+    """在 run 锁内登记一个新 intent（op_draft_prepare 调用），state=prepared。"""
     paths.validate_run_id(run_id)
     intents = read_intents(run_id)
     intents = [i for i in intents if isinstance(i, dict)]
+    if any(i.get("intentId") == intent_id for i in intents):
+        raise forbidden("intentId 已存在")
     entry = {
         "intentId": intent_id,
         "runId": run_id,
@@ -73,11 +91,52 @@ def record_intent(
         "generation": generation,
         "articleVersion": article_version,
         "expiresAt": expires_at,
-        "revoked": False,
+        "state": "prepared",
+        "operationId": None,
+        "claimNonce": None,
+        "claimedAt": None,
+        "dispatchStartedAt": None,
+        "result": None,
+        "issue": None,
     }
     intents.append(entry)
     _write_intents(run_id, intents)
     return entry
+
+
+def transition_intent(
+    run_id: str,
+    intent_id: str,
+    *,
+    expected_state: str | None,
+    new_state: str,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """CAS 状态转移（调用方须已持 run 锁）。expected_state=None 表示不校验当前状态。
+
+    返回新 entry；不匹配抛 FacadeError（VERSION_CONFLICT / INVALID_TRANSITION）。
+    """
+    from .errors import invalid_transition, version_conflict
+
+    intents = read_intents(run_id)
+    intents = [i for i in intents if isinstance(i, dict)]
+    for idx, item in enumerate(intents):
+        if item.get("intentId") != intent_id:
+            continue
+        cur = item.get("state", "prepared")
+        if expected_state is not None and cur != expected_state:
+            if cur in TERMINAL_STATES:
+                raise invalid_transition(f"推送记录已是终态 {cur}")
+            raise version_conflict("推送记录状态冲突，请刷新后重试")
+        if cur in TERMINAL_STATES and new_state != cur:
+            raise invalid_transition(f"终态 {cur} 不可转移为 {new_state}")
+        item["state"] = new_state
+        if extra:
+            item.update(extra)
+        intents[idx] = item
+        _write_intents(run_id, intents)
+        return item
+    raise not_found("推送意图不存在")
 
 
 def revoke_intents_except(
@@ -86,20 +145,18 @@ def revoke_intents_except(
     keep_workflow_id: str,
     keep_generation: int,
 ) -> int:
-    """撤销不属于指定 (workflowId, generation) 的全部未撤销 intent，返回撤销数。
-
-    调用方须已持 run 锁（与 binding 发布同一事务）。
-    """
+    """撤销不属于 (workflowId, generation) 的未撤销 intent，返回撤销数。调用方须已持 run 锁。"""
     intents = read_intents(run_id)
     changed = 0
     for item in intents:
         if not isinstance(item, dict):
             continue
-        if item.get("revoked") is True:
+        if item.get("state") in TERMINAL_STATES:
             continue
         if item.get("workflowId") == keep_workflow_id and item.get("generation") == keep_generation:
             continue
-        item["revoked"] = True
+        item["state"] = "revoked"
+        item["issue"] = "已被接管撤销"
         changed += 1
     if changed:
         _write_intents(run_id, intents)
@@ -111,8 +168,9 @@ def revoke_all_intents(run_id: str) -> int:
     intents = read_intents(run_id)
     changed = 0
     for item in intents:
-        if isinstance(item, dict) and item.get("revoked") is not True:
-            item["revoked"] = True
+        if isinstance(item, dict) and item.get("state") not in TERMINAL_STATES:
+            item["state"] = "revoked"
+            item["issue"] = "已被取消撤销"
             changed += 1
     if changed:
         _write_intents(run_id, intents)
@@ -120,15 +178,12 @@ def revoke_all_intents(run_id: str) -> int:
 
 
 def revoked_intent_ids_except(run_id: str, *, keep_workflow_id: str, keep_generation: int) -> list[str]:
-    """返回不属于 (workflowId, generation) 的未撤销 intentId 集合（只读，不写盘）。
-
-    供 binding.publish 把它与新绑定合成**单一提交记录**（四轮：binding 撤销集合唯一权威）。
-    """
+    """返回不属于 (workflowId, generation) 的未撤销 intentId 集合（只读，不写盘）。"""
     ids: list[str] = []
     for item in read_intents(run_id):
         if not isinstance(item, dict):
             continue
-        if item.get("revoked") is True:
+        if item.get("state") in TERMINAL_STATES:
             continue
         if item.get("workflowId") == keep_workflow_id and item.get("generation") == keep_generation:
             continue
@@ -149,33 +204,16 @@ def all_intent_ids(run_id: str) -> list[str]:
     return ids
 
 
-def apply_revocations(run_id: str, revoked_ids: list[str]) -> int:
-    """幂等重放撤销：把指定 intentId 集合标记 revoked（commit 记录重放用）。调用方须已持 run 锁。"""
-    if not revoked_ids:
-        return 0
-    ids = set(revoked_ids)
-    intents = read_intents(run_id)
-    changed = 0
-    for item in intents:
-        if isinstance(item, dict) and item.get("revoked") is not True and item.get("intentId") in ids:
-            item["revoked"] = True
-            changed += 1
-    if changed:
-        _write_intents(run_id, intents)
-    return changed
-
-
 def active_intent_for(run_id: str, intent_id: str, *, workflow_id: str, generation: int) -> dict[str, Any] | None:
-    """复验（唯一权威，四轮）：在 run 锁内同时读 binding + intents。
+    """复验（唯一权威）：在 run 锁内同时读 binding + intents。
 
-    - intentId 命中 binding.revokedIntentIds → 直接判死（不依赖 intents.json 的 revoked 被重放过）。
+    - intentId 命中 binding.revokedIntentIds → 判死。
     - workflowId/generation 与 binding 不一致 → 判死。
-    - intents.json 的 revoked 标记是可选缓存，不是权威。
+    - state 为终态/revoked → 判死。
     调用方须已持 run 锁。
     """
     from . import binding
 
-    # 1) binding 撤销集合是唯一权威。
     current_binding = binding.read_binding(run_id)
     if isinstance(current_binding, dict):
         revoked = current_binding.get("revokedIntentIds")
@@ -184,13 +222,9 @@ def active_intent_for(run_id: str, intent_id: str, *, workflow_id: str, generati
         if current_binding.get("workflowId") != workflow_id or current_binding.get("generation") != generation:
             return None
 
-    # 2) intents.json 只作为可选的 intent 元数据来源（工作流/代次已由 binding 权威判定）。
-    for item in read_intents(run_id):
-        if not isinstance(item, dict):
-            continue
-        if item.get("intentId") != intent_id:
-            continue
-        if item.get("revoked") is True:
-            return None
-        return item
-    return None
+    item = get_intent(run_id, intent_id)
+    if not isinstance(item, dict):
+        return None
+    if item.get("state") in TERMINAL_STATES:
+        return None
+    return item

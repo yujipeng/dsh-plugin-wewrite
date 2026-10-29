@@ -99,15 +99,15 @@ def test_draft_prepare_rejected(tmp_path):
     home = make_home(tmp_path)
     run_id, ver, run_dir = _seed(home)
     article_before = (run_dir / "article.md").read_bytes()
+    # 设计修订版二：prepare 需已绑定；未绑定先 FORBIDDEN，不写 intent。
     resp = call_facade(str(home), "draft.prepare", {
         "requestId": "w", "runId": run_id, "expectedVersion": None,
         "coverAssetId": "c", "themeId": "professional-clean",
     })
-    # draft.prepare 在写 intent 前先读正文（只读可过），随后写面守卫拦截。
     assert resp["ok"] is False, resp
-    assert resp["error"]["code"] == "STATE_CORRUPTED", resp
+    assert resp["error"]["code"] in ("STATE_CORRUPTED", "FORBIDDEN"), resp
     assert _state_bytes(run_dir) == CORRUPT
-    assert not (run_dir / ".dsh-workbench").exists()
+    assert not (run_dir / ".dsh-workbench" / "intents.json").exists()
 
 
 def test_review_build_rejected(tmp_path):

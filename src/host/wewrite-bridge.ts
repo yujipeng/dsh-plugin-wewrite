@@ -127,6 +127,7 @@ function collect(
     let settled = false;
     let timedOut = false;
     let timedOutAfterSend = false;
+    let outputTooLarge = false;
     let returncode: number | null = null;
 
     const deadline = setTimeout(() => {
@@ -139,18 +140,9 @@ function collect(
     child.stdout!.on('data', (chunk: Buffer) => {
       stdoutBytes += chunk.length;
       if (stdoutBytes > MAX_OUTPUT_BYTES) {
-        if (!settled) {
-          settled = true;
-          clearTimeout(deadline);
-          terminate(child.pid ?? undefined);
-          resolve({
-            response: null,
-            timedOut: false,
-            timedOutAfterSend: false,
-            returncode: null,
-            issue: { code: 'OUTPUT_TOO_LARGE', message: '子进程输出超限', blocking: true },
-          });
-        }
+        // 五轮 C：输出超限标记后不提前 resolve，等 child close（确切退出证明）。
+        outputTooLarge = true;
+        terminate(child.pid ?? undefined);
         return;
       }
       stdoutChunks.push(chunk);
@@ -179,6 +171,18 @@ function collect(
       if (settled) return;
       settled = true;
       clearTimeout(deadline);
+
+      // 五轮 C：输出超限时也必须等 child close 才 resolve（确切退出证明）。
+      if (outputTooLarge) {
+        resolve({
+          response: null,
+          timedOut: false,
+          timedOutAfterSend: false,
+          returncode,
+          issue: { code: 'OUTPUT_TOO_LARGE', message: '子进程输出超限', blocking: true },
+        });
+        return;
+      }
 
       if (timedOut) {
         resolve({

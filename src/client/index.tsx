@@ -222,7 +222,7 @@ export function apply(ctx: ClientContext): void {
         const wait = slots.inject(slot, () => {
           const component = slotComponent(slot) as (props: { runtime: ClientRuntime } & Record<string, unknown>) => JSX.Element;
           const dispose = slots.register(
-            { ...slotOptions(slot), inject: (...args: unknown[]) => makeRuntime(args[0]) },
+            { ...slotOptions(slot), inject: (...args: unknown[]) => ({ runtime: makeRuntime(args[0]) }) },
             component,
           );
           registerDisposers.push(dispose);
@@ -234,7 +234,7 @@ export function apply(ctx: ClientContext): void {
         try {
           const component = slotComponent(slot) as (props: { runtime: ClientRuntime } & Record<string, unknown>) => JSX.Element;
           const dispose = slots.register(
-            { ...slotOptions(slot), inject: (...args: unknown[]) => makeRuntime(args[0]) },
+            { ...slotOptions(slot), inject: (...args: unknown[]) => ({ runtime: makeRuntime(args[0]) }) },
             component,
           );
           registerDisposers.push(dispose);
@@ -246,7 +246,7 @@ export function apply(ctx: ClientContext): void {
     } else {
       try {
         const component = slotComponent(slot) as (props: { runtime: ClientRuntime } & Record<string, unknown>) => JSX.Element;
-        const dispose = slots.register({ ...slotOptions(slot), inject: (...args: unknown[]) => makeRuntime(args[0]) }, component);
+        const dispose = slots.register({ ...slotOptions(slot), inject: (...args: unknown[]) => ({ runtime: makeRuntime(args[0]) }) }, component);
         registerDisposers.push(dispose);
         registered.add(slot);
       } catch (error) {

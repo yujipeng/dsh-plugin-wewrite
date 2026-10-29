@@ -211,7 +211,7 @@ host 在每次工具入场从真实 Agent 绑定提取不可变的 `{runId,workf
 
 响应 `{protocol:1,requestId,ok:true,data}` 或 `{protocol:1,requestId,ok:false,error}`。stdout 只允许 JSON，stderr 是脱敏诊断；解释器固定，operation 白名单，不接受 Python 模块名、任意 argv、文件路径或 shell。普通调用 30 秒，热榜 60 秒，推送 120 秒；超时 TERM 后短时 KILL 并回收确切子进程，发送后超时标 unknown。字节流超限立刻停止，单请求/单响应不常驻。
 
-内部 operation 仅限 `diagnose`、`snapshot`、`hotspots.fetch`、`run.create/detail/step/finish/fork`、`artifact.get/write`、`article.save`、`review.build`、`preview.render`、`asset.put/get`、`draft.prepare/send/status`；UI Agent 操作留在 host。没有 update 任意 patch、任意 state 字段修改或 current run 操作。
+内部 operation 仅限 `diagnose`、`snapshot`、`hotspots.fetch`、`run.create/detail/step/finish/fork`、`artifact.get/write`、`article.save`、`review.build`、`preview.render`、`asset.put/get`、`draft.prepare/send/status/recover`；UI Agent 操作留在 host。没有 update 任意 patch、任意 state 字段修改或 current run 操作。
 
 读/写面副作用清单（不以 Python 函数名像“读取”还是“创建”代替实际副作用判断）：
 
@@ -232,6 +232,26 @@ host 在每次工具入场从真实 Agent 绑定提取不可变的 `{runId,workf
 - 热榜 facade 调 `fetch_weibo/fetch_toutiao/fetch_baidu/deduplicate`，集中复刻已读 main 的排序聚合并做兼容测试；不修改上游，也不直接调用解析 sys.argv 的 main。来源失败部分返回，不伪造新鲜数据。
 - `build_report()` 复用上游，另外保存 article/draft 哈希与 assessment 来源；用户编辑后旧 pass 无效，不能用旧 assessment 给新正文自动重新判 pass。`WeChatConverter.convert()`/`preview_html()` 复用排版，不做任何网络上传。
 - `publisher.create_draft()`、令牌与图片上传函数只在 `draft.send` 中经过 host 授权后调用；内部注入假 transport 用于测试，禁止 CLI publish 的旁路调用。
+
+### 6.1 推送 intent 状态机与 send 门闩（JEE-1942 第五轮返修后落地）
+
+**状态机**：`prepared → claimed → dispatching → sent|unknown`；`prepared/claimed` 可转 `revoked`；`sent/unknown/revoked` 为终态不回 `prepared`，`unknown` 是幂等墓碑不释放。持久化在 `runs/<runId>/.dsh-workbench/intents.json`（`schemaVersion:2`），每项含 `state/operationId/claimNonce/claimedAt/dispatchStartedAt/result/issue`。`binding.json` 的 `revokedIntentIds` 仍是代次与撤销唯一权威。
+
+**send 全链**（`draft_dispatch.send`）：
+1. run 短锁 CAS `prepared→claimed`，写 `operationId/claimNonce`。
+2. 出锁本地构造 transport（无网络）。
+3. 取独立 `send.lock`（`LOCK_EX|LOCK_NB`，竞争即 `RUN_BUSY`）→ run 短锁二次复验（context/binding/intent/正文版本/门禁全一致）→ CAS `claimed→dispatching` + fsync。
+4. **持 send 门闩**发送。
+5. 持门闩重取 run 锁提交 `sent/unknown`。
+
+**门闩参与者**（判据：是否改写审批摘要字段 title/digest/articleVersion/reportVersion/coverHash/themeId/accountLabel）：
+- 取门闩：`article.save`、`artifact.write(kind=article|draft|review_report)`、`review.build`、`asset.put(role=cover)`、`draft.send`、`draft.recover`、`binding.publish`、`binding.revoke-intents`。
+- 不取门闩（只 run 短锁）：`artifact.write(其余 kind)`、`asset.put(role=inline)`、`draft.prepare`（纯本地预检）。
+- 锁序一律 `send 门闩 → run 锁`；持门闩/run 路径禁止取 home，杜绝 `send → home → run`。
+
+**恢复 `draft.recover`**（私有 facade operation，不进浏览器 RPC/模型工具）：入参 `{requestId,runId,intentId?}` 严格拒未知字段；`claimed→revoked`、`dispatching→unknown`、终态不动；幂等依据记录状态，重复恢复零变更不重写文件。锁序 `send 门闩 → run 锁`，全程不取 home、不调用 transport。
+
+**`draft.send` 不可变 context**：`{runId,workflowId,generation}` 仅存在于内部 `draft.send` 协议，host 从可信 Agent 绑定注入；公开 `wechat/pushDraft` 不加 context，浏览器/模型自报 context 一律拒绝。
 
 存储布局保留上游 `WEWRITE_HOME/runs/<runId>/{state.yaml,brief.yaml,claims.yaml,draft.md,article.md,review-report.json,sources.yaml,...}`；插件增量放 `.dsh-workbench/`，含绑定、generation、版本/审稿关联、元数据、推送日志、幂等记录和 locks。共享历史仍由上游写，不引入第二套文章真源。
 

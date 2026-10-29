@@ -36,6 +36,7 @@ OPERATIONS = (
     "draft.prepare",
     "draft.send",
     "draft.status",
+    "draft.recover",
 )
 
 KINDS = ("brief", "claims", "draft", "article", "review_report", "sources",
@@ -377,6 +378,20 @@ def _v_draft_status(p: dict) -> dict:
     return {"runId": run_id, "operationId": operation_id}
 
 
+def _v_draft_recover(p: dict) -> dict:
+    request_id = _require_request_id(p.get("requestId"))
+    run_id = _require_run_id(p.get("runId"))
+    intent_id = p.get("intentId")
+    if intent_id is not None:
+        intent_id = _require_str(intent_id, "intentId")
+    # 严格拒绝未知字段（设计 §5：不接受 claimNonce/保留列表/caller 自报存活）。
+    allowed = {"requestId", "runId", "intentId"}
+    unknown = set(p.keys()) - allowed
+    if unknown:
+        raise invalid_input(f"未知字段: {', '.join(sorted(unknown))}")
+    return {"requestId": request_id, "runId": run_id, "intentId": intent_id}
+
+
 _VALIDATORS = {
     "diagnose": _v_diagnose,
     "snapshot": _v_snapshot,
@@ -400,4 +415,5 @@ _VALIDATORS = {
     "draft.prepare": _v_draft_prepare,
     "draft.send": _v_draft_send,
     "draft.status": _v_draft_status,
+    "draft.recover": _v_draft_recover,
 }

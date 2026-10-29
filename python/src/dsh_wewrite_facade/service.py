@@ -13,7 +13,7 @@ import os
 import uuid
 from typing import Any
 
-from . import assets, binding, contract, counters, hotspots as hotspots_mod, intents, paths, projection, publish, review as review_mod, storage
+from . import assets, binding, contract, counters, draft_dispatch, hotspots as hotspots_mod, intents, paths, projection, publish, review as review_mod, storage
 from .errors import (
     FacadeError,
     business_failure,
@@ -434,91 +434,23 @@ def op_binding_revoke_intents(payload: dict) -> dict[str, Any]:
 
 
 def op_draft_prepare(payload: dict) -> dict[str, Any]:
-    """本地预检，不取令牌/不上传。"""
-    run_id = payload["runId"]
-    expected = payload["expectedVersion"]
-    content, version = projection.read_artifact_content(run_id, "article")
-    if expected is not None and expected != version:
-        from .errors import version_conflict
-        raise version_conflict("正文版本已变化，请刷新后重试")
-    gate = projection.build_gate({}, run_id)
-    # 生成 intent（绑定当前 binding 的 workflowId/generation，用于接管/取消撤销）。
-    current_binding = binding.read_binding(run_id)
-    workflow_id = current_binding.get("workflowId", "") if isinstance(current_binding, dict) else ""
-    generation = current_binding.get("generation", 1) if isinstance(current_binding, dict) else 1
-    intent_id = uuid.uuid4().hex
-    with storage.run_lock(run_id, create=False):
-        storage.ensure_writable_state(run_id)
-        intents.record_intent(
-            run_id,
-            intent_id=intent_id,
-            workflow_id=workflow_id,
-            generation=generation,
-            article_version=version,
-            expires_at="",
-        )
-    summary = {
-        "runId": run_id,
-        "title": "",
-        "digest": "",
-        "articleVersion": version,
-        "themeId": payload["themeId"],
-        "coverHash": "",
-        "contentHash": version,
-        "accountLabel": "",
-        "dryRun": True,
-    }
-    return business_success({
-        "intentId": intent_id,
-        "expiresAt": "",
-        "gate": gate or {"publishable": False, "issues": [], "articleVersion": version, "reportVersion": None},
-        "summary": summary,
-    })
+    """薄 Adapter：调用 draft_dispatch.prepare。"""
+    return draft_dispatch.prepare(payload)
 
 
 def op_draft_send(payload: dict) -> dict[str, Any]:
-    """draft.send 只接假 transport：真实微信调用计数恒为零。
-
-    四轮 + 裁定 B：context 来自 host 可信绑定（不反填），读正文前在 run 锁内复验 intent。
-    """
-    run_id = payload["runId"]
-    intent_id = payload["intentId"]
-    ctx = payload["context"]
-    with storage.run_lock(run_id, create=False):
-        # 读正文前先复验 intent（用 host 传入的可信 context 的 workflowId/generation）。
-        if intents.active_intent_for(run_id, intent_id, workflow_id=ctx["workflowId"], generation=ctx["generation"]) is None:
-            from .errors import cancelled
-            raise cancelled("推送意图已失效，需重新预检", run_id=run_id)
-        content, version = projection.read_artifact_content(run_id, "article")
-    if payload["expectedVersion"] is not None and payload["expectedVersion"] != version:
-        from .errors import version_conflict
-        raise version_conflict("正文版本已变化，请刷新后重试")
-    transport = publish.build_transport("fake")
-    result = publish.send_draft_fake(
-        transport,
-        title="",
-        html=content,
-        digest="",
-        thumb_media_id=None,
-        author=None,
-    )
-    return business_success({
-        "operationId": uuid.uuid4().hex,
-        "status": "succeeded",
-        "mediaId": result["mediaId"],
-        "dryRun": True,
-        "counters": counters.get_counters().snapshot(),
-    })
+    """薄 Adapter：调用 draft_dispatch.send（context 由 host 可信绑定注入）。"""
+    return draft_dispatch.send(payload, payload["context"])
 
 
 def op_draft_status(payload: dict) -> dict[str, Any]:
-    return business_success({
-        "operationId": payload["operationId"],
-        "status": "succeeded",
-        "mediaId": "fake-media-1",
-        "issue": None,
-        "dryRun": True,
-    })
+    """薄 Adapter：调用 draft_dispatch.status（真实只读投影，不固定返回成功）。"""
+    return draft_dispatch.status(payload["runId"], payload["operationId"])
+
+
+def op_draft_recover(payload: dict) -> dict[str, Any]:
+    """私有恢复：调用 draft_dispatch.recover。"""
+    return draft_dispatch.recover(payload)
 
 
 _DISPATCH = {
@@ -544,6 +476,7 @@ _DISPATCH = {
     "draft.prepare": op_draft_prepare,
     "draft.send": op_draft_send,
     "draft.status": op_draft_status,
+    "draft.recover": op_draft_recover,
 }
 
 

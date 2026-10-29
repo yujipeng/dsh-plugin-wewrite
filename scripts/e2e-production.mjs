@@ -18,7 +18,7 @@ import { runProfile } from '@deepseek-ai/dsh/profile-boot';
 import { loadLayeredEnv } from '@deepseek-ai/dsh-app-boot';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
-import { getAssembled, runFacade } from '../lib/index.js';
+import { getAssembled, runFacade, createHandler, RPC_CHANNEL } from '../lib/index.js';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '..', '..');
 const HOME = process.env.WEWRITE_HOME ?? resolve(ROOT, '..', 'wewrite-home');
@@ -54,12 +54,17 @@ async function main() {
 
   log('info', `assembled: interpreter=${assembled.interpreter} home=${assembled.home}`);
 
-  // 用生产装配的 WorkbenchService 发起 run/create → run/start（同一服务 apply() 注册到 RPC 路由）。
-  const service = assembled.service;
-  const created = await service.runCreate({
+  // D 项：经插件自己注册的 RPC 端点发起 run/create → run/start（同一 createHandler apply() 注册到路由）。
+  const rpc = createHandler(assembled.service);
+  const signal = new AbortController().signal;
+  const peer = { principal: { kind: 'owner' } };
+
+  const createResp = await rpc('run/create', {
     requestId: randomUUID(), topic: '人工智能对教育的影响', mode: 'draft', visualMode: 'none', themeId: 'professional-clean',
-  });
-  if (!created.ok) throw new Error(`run/create 失败：${JSON.stringify(created.error)}`);
+  }, signal, peer);
+  if (createResp.ok !== true) throw new Error(`run/create 失败：${JSON.stringify(createResp.error)}`);
+  const created = createResp.value;
+  if (created.ok !== true) throw new Error(`run/create 业务失败：${JSON.stringify(created.error)}`);
   const runId = created.data.runId;
   log('info', `runId=${runId}`);
 
@@ -68,27 +73,38 @@ async function main() {
   const agentDefaultModel = ctx.get('agentDefaultModel');
   const selection = agentDefaultModel?.currentSelection?.() ?? { provider: 'tcreditai', model: 'deepseek-flash' };
 
-  // 生产 workflow 内部 runtime 由 apply() 组装；startRun 需要 workspaceId。
-  const workflow = assembled.workflow;
-  const started = await workflow.startRun({
-    runId, workspaceId: 'ws-e2e', topic: '人工智能对教育的影响', mode: 'draft', visualMode: 'none', themeId: 'professional-clean',
-  });
-  if (!started.ok) throw new Error(`run/start 失败：${JSON.stringify(started.error)}`);
+  // D 项：run/start 也经插件注册的 RPC 端点（createHandler）。
+  const startResp = await rpc('run/start', {
+    requestId: randomUUID(), runId, workspaceId: 'ws-e2e',
+  }, signal, peer);
+  if (startResp.ok !== true) throw new Error(`run/start 失败：${JSON.stringify(startResp.error)}`);
+  const started = startResp.value;
+  if (started.ok !== true) throw new Error(`run/start 业务失败：${JSON.stringify(started.error)}`);
   const binding = started.data.binding;
+  const workflow = assembled.workflow;
   const handle = workflow.agentHandleOf(runId);
   const agent = handle?.agent;
   if (!agent) throw new Error('run/start 后无活跃 Agent');
   log('info', `sessionId=${binding.sessionId} agentId=${binding.agentId} workflowId=${binding.workflowId} generation=${binding.generation}`);
 
-  // 真实宿主 scope 探针：继承工具不可见 + reserved run_code 被 guard 拒 + native 工具可执行。
-  // 由于 followup 走真实 turn 执行，工具实际执行记录由 session 日志给出；这里额外检查 guard 注册面。
+  // D 项：真实宿主 scope 双路径硬断言（缺工具列表必须失败，不得跳过）。
   const scopedTools = agent.ctx?.get?.('tools');
-  if (scopedTools) {
-    const schemas = typeof scopedTools.schemas === 'function' ? scopedTools.schemas(agent) : undefined;
-    const names = Array.isArray(schemas) ? schemas.map((s) => s.name) : [];
-    log('info', `scope visible tools=${JSON.stringify(names)}`);
-    log('info', `scope has bash=${names.includes('bash')} run_code=${names.includes('run_code')} wewrite=${names.some((n) => n.startsWith('wewrite_'))}`);
+  if (!scopedTools || typeof scopedTools.schemas !== 'function') {
+    throw new Error('scope 探针失败：拿不到 tools.schemas（必须失败，不得跳过）');
   }
+  const schemas = scopedTools.schemas(agent);
+  const names = Array.isArray(schemas) ? schemas.map((s) => s.name) : [];
+  if (names.length === 0) throw new Error('scope 探针失败：可见工具列表为空');
+  log('info', `scope visible tools=${JSON.stringify(names)}`);
+  // 硬断言：继承危险工具不可见、reserved run_code 不可见、8 个 native 工具可见。
+  for (const dangerous of ['bash', 'write', 'edit', 'str_replace_editor', 'subagent', 'delegate', 'run_code']) {
+    if (names.includes(dangerous)) throw new Error(`scope 探针失败：危险工具 ${dangerous} 可见`);
+  }
+  const nativeTools = ['wewrite_run_start','wewrite_run_detail','wewrite_artifact_get','wewrite_run_step','wewrite_artifact_write','wewrite_review','wewrite_run_finish','wewrite_preview'];
+  for (const t of nativeTools) {
+    if (!names.includes(t)) throw new Error(`scope 探针失败：native 工具 ${t} 不可见`);
+  }
+  log('info', 'scope 硬断言通过：危险工具不可见、run_code 不可见、8 个 native 工具可见');
 
   // followup 主 skill 指令，等待真实 Agent 完成。
   const message = createUserMessage({

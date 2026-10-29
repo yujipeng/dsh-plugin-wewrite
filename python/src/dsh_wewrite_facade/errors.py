@@ -106,6 +106,10 @@ def version_conflict(message: str | None = None) -> FacadeError:
     return FacadeError("VERSION_CONFLICT", message)
 
 
+def invalid_transition(message: str | None = None) -> FacadeError:
+    return FacadeError("INVALID_TRANSITION", message)
+
+
 def internal(message: str | None = None) -> FacadeError:
     return FacadeError("INTERNAL", message)
 

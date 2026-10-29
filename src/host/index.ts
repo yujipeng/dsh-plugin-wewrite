@@ -29,6 +29,8 @@ export { WorkbenchService } from './workbench-service';
 export type { WorkbenchBridge } from './workbench-service';
 export { runFacade } from './wewrite-bridge';
 export { buildAgentTools, setToolService, controlledToolGuard, INHERITED_TOOL_ALLOWLIST } from './tools';
+export { createHandler } from './rpc';
+export { RPC_CHANNEL } from '../shared/contract';
 
 /** 顶层不阻塞等待任何可选服务；具体能力在子 fiber 内装配。 */
 export const inject: readonly string[] = [];

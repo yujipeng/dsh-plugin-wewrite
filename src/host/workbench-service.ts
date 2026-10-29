@@ -181,6 +181,11 @@ export class WorkbenchService {
     return bridgeResult(await this.safeBridge('draft.status', payload));
   }
 
+  /** 私有恢复（设计修订版二 §5）：host 生命周期调用，不进浏览器 RPC / 模型工具。 */
+  async recoverDraft(payload: { requestId: string; runId: string; intentId?: string }): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('draft.recover', payload));
+  }
+
   // ── Agent 工具 Adapter（设计 §5 表格）───────────────────────────────────
 
   async toolRunStart(args: { runId: string; workflowId: string; generation: number }, ctx: ToolBindingContext): Promise<BusinessResult<unknown>> {
