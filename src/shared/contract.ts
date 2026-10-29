@@ -288,10 +288,10 @@ export const rpcContract = {
       cursor: IdSchema.optional(),
       limit: LimitField.optional(),
     }),
-    response: z.strictObject({
+    response: businessResult(z.strictObject({
       items: z.array(RunSummarySchema),
       nextCursor: IdSchema.nullable(),
-    }),
+    })),
   },
   'hotspots/fetch': {
     request: z.strictObject({
@@ -301,7 +301,7 @@ export const rpcContract = {
         .min(HOTSPOT_LIMIT_MIN, `热榜 limit 须在 ${HOTSPOT_LIMIT_MIN}–${HOTSPOT_LIMIT_MAX}`)
         .max(HOTSPOT_LIMIT_MAX, `热榜 limit 须在 ${HOTSPOT_LIMIT_MIN}–${HOTSPOT_LIMIT_MAX}`),
     }),
-    response: z.strictObject({
+    response: businessResult(z.strictObject({
       timestamp: TimeSchema,
       items: z.array(
         z.strictObject({
@@ -312,7 +312,7 @@ export const rpcContract = {
         }),
       ),
       sourcesFailed: z.array(z.string()),
-    }),
+    })),
   },
   'run/create': {
     request: withRequestId({
@@ -321,28 +321,28 @@ export const rpcContract = {
       visualMode: z.enum(VISUAL_MODES),
       themeId: IdSchema,
     }),
-    response: z.strictObject({
+    response: businessResult(z.strictObject({
       runId: RunIdSchema,
       phase: z.literal('created'),
-    }),
+    })),
   },
   'run/start': {
     request: withRequestId({
       runId: RunIdSchema,
       workspaceId: IdSchema,
     }),
-    response: z.strictObject({ binding: BindingSchema }),
+    response: businessResult(z.strictObject({ binding: BindingSchema })),
   },
   'run/resume': {
     request: withRequestId({
       runId: RunIdSchema,
       expectedGeneration: z.number().int().min(1),
     }),
-    response: z.strictObject({ binding: BindingSchema }),
+    response: businessResult(z.strictObject({ binding: BindingSchema })),
   },
   'run/detail': {
     request: z.strictObject({ runId: RunIdSchema }),
-    response: z.strictObject({
+    response: businessResult(z.strictObject({
       run: RunSummarySchema,
       binding: BindingSchema.nullable(),
       steps: z.array(StepStateSchema),
@@ -350,28 +350,28 @@ export const rpcContract = {
       gate: GateSchema.nullable(),
       lastError: IssueSchema.nullable(),
       push: PushSummarySchema.nullable(),
-    }),
+    })),
   },
   'run/cancel': {
     request: withRequestId({
       runId: RunIdSchema,
       generation: z.number().int().min(1),
     }),
-    response: z.strictObject({
+    response: businessResult(z.strictObject({
       runId: RunIdSchema,
       phase: z.enum(['cancelling', 'cancelled']),
       generation: z.number().int().min(1),
-    }),
+    })),
   },
   'article/get': {
     request: z.strictObject({ runId: RunIdSchema, kind: KindSchema }),
-    response: z.strictObject({
+    response: businessResult(z.strictObject({
       runId: RunIdSchema,
       kind: KindSchema,
       content: z.string(),
       version: VersionSchema,
       editable: z.boolean(),
-    }),
+    })),
   },
   'article/save': {
     request: withRequestId({
@@ -384,23 +384,23 @@ export const rpcContract = {
         themeId: z.string(),
       }),
     }),
-    response: z.strictObject({
+    response: businessResult(z.strictObject({
       runId: RunIdSchema,
       version: HashSchema,
       reviewRequired: z.literal(true),
       previewReady: z.boolean(),
-    }),
+    })),
   },
   'article/fork': {
     request: withRequestId({
       runId: RunIdSchema,
       expectedVersion: VersionSchema,
     }),
-    response: z.strictObject({
+    response: businessResult(z.strictObject({
       runId: RunIdSchema,
       parentRunId: RunIdSchema,
       version: HashSchema,
-    }),
+    })),
   },
   'article/review': {
     request: withRequestId({
@@ -408,7 +408,7 @@ export const rpcContract = {
       expectedVersion: VersionSchema,
       workspaceId: IdSchema,
     }),
-    response: z.strictObject({ binding: BindingSchema }),
+    response: businessResult(z.strictObject({ binding: BindingSchema })),
   },
   'article/preview': {
     request: withRequestId({
@@ -417,13 +417,13 @@ export const rpcContract = {
       expectedVersion: VersionSchema,
       themeId: IdSchema,
     }),
-    response: z.strictObject({
+    response: businessResult(z.strictObject({
       runId: RunIdSchema,
       version: HashSchema,
       html: z.string(),
       issues: z.array(IssueSchema),
       remoteImagesUploaded: z.literal(false),
-    }),
+    })),
   },
   'asset/put': {
     request: withRequestId({
@@ -438,19 +438,19 @@ export const rpcContract = {
         }),
       expectedArticleVersion: VersionSchema,
     }),
-    response: z.strictObject({
+    response: businessResult(z.strictObject({
       assetId: IdSchema,
       contentHash: HashSchema,
       bytes: z.number().int().min(0),
-    }),
+    })),
   },
   'asset/get': {
     request: z.strictObject({ runId: RunIdSchema, assetId: IdSchema }),
-    response: z.strictObject({
+    response: businessResult(z.strictObject({
       mediaType: z.string(),
       base64: z.string(),
       contentHash: HashSchema,
-    }),
+    })),
   },
   'wechat/prepareDraft': {
     request: withRequestId({
@@ -459,12 +459,12 @@ export const rpcContract = {
       coverAssetId: IdSchema,
       themeId: IdSchema,
     }),
-    response: z.strictObject({
+    response: businessResult(z.strictObject({
       intentId: IdSchema,
       expiresAt: TimeSchema,
       gate: GateSchema,
       summary: PushSummarySchema,
-    }),
+    })),
   },
   'wechat/pushDraft': {
     request: withRequestId({
@@ -472,20 +472,20 @@ export const rpcContract = {
       intentId: IdSchema,
       expectedVersion: VersionSchema,
     }),
-    response: z.strictObject({
+    response: businessResult(z.strictObject({
       operationId: IdSchema,
       status: z.literal('pending_approval'),
-    }),
+    })),
   },
   'wechat/pushStatus': {
     request: z.strictObject({ runId: RunIdSchema, operationId: IdSchema }),
-    response: z.strictObject({
+    response: businessResult(z.strictObject({
       operationId: IdSchema,
       status: OperationStatusSchema,
       mediaId: z.string().nullable(),
       issue: IssueSchema.nullable(),
       dryRun: z.boolean(),
-    }),
+    })),
   },
 } as const;
 
@@ -493,3 +493,109 @@ export type RpcContract = typeof rpcContract;
 export type RpcEndpoint = keyof RpcContract;
 
 export const RPC_ENDPOINTS = Object.keys(rpcContract) as RpcEndpoint[];
+
+// ── Agent 工具契约（设计 §5 表格）──────────────────────────────────────────
+// 工具与 RPC 是同一 WorkbenchService 的两个 Adapter；写入均另带 requestId，参数显式含 runId。
+
+export const TOOL_NAMES = [
+  'wewrite_run_start',
+  'wewrite_run_detail',
+  'wewrite_artifact_get',
+  'wewrite_run_step',
+  'wewrite_artifact_write',
+  'wewrite_review',
+  'wewrite_run_finish',
+  'wewrite_preview',
+] as const;
+export type ToolName = (typeof TOOL_NAMES)[number];
+
+/** 工具结果与 RPC 一致：业务联合 {ok:true,data}|{ok:false,error}。 */
+export function toolResult<T extends z.ZodTypeAny>(dataSchema: T) {
+  return businessResult(dataSchema);
+}
+
+/** 绑定上下文的 schema（host 在工具入场时从服务端绑定取，模型自报不可信）。 */
+export const ToolBindingContextSchema = z.strictObject({
+  runId: RunIdSchema,
+  workflowId: IdSchema,
+  generation: z.number().int().min(1),
+});
+export type ToolBindingContext = z.infer<typeof ToolBindingContextSchema>;
+
+const ToolRunId = RunIdSchema;
+
+export const toolContract = {
+  wewrite_run_start: {
+    request: z.strictObject({
+      runId: ToolRunId,
+      workflowId: IdSchema,
+      generation: z.number().int().min(1),
+    }),
+    response: toolResult(z.strictObject({ binding: BindingSchema })),
+  },
+  wewrite_run_detail: {
+    request: z.strictObject({ runId: ToolRunId }),
+    response: rpcContract['run/detail'].response,
+  },
+  wewrite_artifact_get: {
+    request: z.strictObject({ runId: ToolRunId, kind: KindSchema }),
+    response: rpcContract['article/get'].response,
+  },
+  wewrite_run_step: {
+    request: withRequestId({
+      runId: ToolRunId,
+      step: StepSchema,
+      status: StepStatusSchema,
+      error: z.string().optional(),
+    }),
+    response: toolResult(z.strictObject({ runId: RunIdSchema, step: StepSchema, status: StepStatusSchema })),
+  },
+  wewrite_artifact_write: {
+    request: withRequestId({
+      runId: ToolRunId,
+      kind: KindSchema,
+      content: MarkdownField,
+      expectedVersion: VersionSchema,
+    }),
+    response: toolResult(
+      z.strictObject({ runId: RunIdSchema, kind: KindSchema, version: HashSchema }),
+    ),
+  },
+  wewrite_review: {
+    request: withRequestId({
+      runId: ToolRunId,
+      articleVersion: VersionSchema,
+      draftVersion: VersionSchema,
+      assessment: AssessmentSchema,
+    }),
+    response: toolResult(
+      z.strictObject({
+        runId: RunIdSchema,
+        report: ReportSchema,
+        reportVersion: HashSchema,
+        gate: GateSchema,
+      }),
+    ),
+  },
+  wewrite_run_finish: {
+    request: withRequestId({
+      runId: ToolRunId,
+      expectedVersion: VersionSchema,
+      reportVersion: VersionSchema,
+    }),
+    response: toolResult(
+      z.strictObject({ runId: RunIdSchema, pythonStatus: z.literal('completed') }),
+    ),
+  },
+  wewrite_preview: {
+    request: withRequestId({
+      runId: ToolRunId,
+      kind: z.enum(['article', 'illustrated_article']),
+      expectedVersion: VersionSchema,
+      themeId: IdSchema,
+    }),
+    response: rpcContract['article/preview'].response,
+  },
+} as const;
+
+export type ToolContract = typeof toolContract;

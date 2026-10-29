@@ -305,7 +305,7 @@ describe('合法请求与响应形状（表驱动抽查）', () => {
   });
 
   it('run/detail 全量响应（run/binding/steps/artifacts/gate/lastError/push）', () => {
-    const response = {
+    const data = {
       run: {
         runId,
         title: '标题',
@@ -322,18 +322,20 @@ describe('合法请求与响应形状（表驱动抽查）', () => {
       lastError: null,
       push: null,
     };
-    expect(rpcContract['run/detail'].response.safeParse(response).success).toBe(true);
+    expect(rpcContract['run/detail'].response.safeParse({ ok: true, data }).success).toBe(true);
+    // 裸 data 不再合法（必须包业务联合）
+    expect(rpcContract['run/detail'].response.safeParse(data).success).toBe(false);
   });
 
   it('wechat/pushStatus 响应 mediaId 与 issue 均可为 null', () => {
-    const response = {
+    const data = {
       operationId: 'op1',
       status: 'succeeded',
       mediaId: 'M1',
       issue: null,
       dryRun: true,
     };
-    expect(rpcContract['wechat/pushStatus'].response.safeParse(response).success).toBe(true);
+    expect(rpcContract['wechat/pushStatus'].response.safeParse({ ok: true, data }).success).toBe(true);
   });
 
   it('Assessment.dimensions 评分必须 1–5，非法拒', () => {

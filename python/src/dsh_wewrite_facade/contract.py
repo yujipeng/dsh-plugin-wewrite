@@ -16,6 +16,7 @@ PROTOCOL = 1
 OPERATIONS = (
     "diagnose",
     "snapshot",
+    "run.list",
     "hotspots.fetch",
     "run.create",
     "run.detail",
@@ -29,6 +30,8 @@ OPERATIONS = (
     "preview.render",
     "asset.put",
     "asset.get",
+    "binding.publish",
+    "binding.get",
     "draft.prepare",
     "draft.send",
     "draft.status",
@@ -81,6 +84,26 @@ def _require_request_id(value: Any) -> str:
     return value
 
 
+def _optional_binding_context(p: dict, run_id: str) -> dict | None:
+    """可选 fencing 上下文（设计 §5）：Agent 工具写路径必须携带，RPC owner 编辑路径不带。
+
+    携带时校验 runId 一致，返回 {"runId","workflowId","generation"}；不携带返回 None。
+    """
+    ctx = p.get("context")
+    if ctx is None:
+        return None
+    if not isinstance(ctx, dict):
+        raise invalid_input("context 不合法")
+    ctx_run = _require_run_id(ctx.get("runId"))
+    if ctx_run != run_id:
+        raise invalid_input("context.runId 与 runId 不一致")
+    workflow_id = _require_str(ctx.get("workflowId"), "context.workflowId")
+    generation = ctx.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise invalid_input("context.generation 不合法")
+    return {"runId": run_id, "workflowId": workflow_id, "generation": generation}
+
+
 def _require_optional_version(value: Any) -> str | None:
     if value is None:
         return None
@@ -125,6 +148,17 @@ def _v_snapshot(p: dict) -> dict:
     return {}
 
 
+def _v_run_list(p: dict) -> dict:
+    cursor = p.get("cursor")
+    limit = p.get("limit")
+    if cursor is not None and (not isinstance(cursor, str) or not cursor.strip()):
+        raise invalid_input("cursor 不合法")
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int)
+                              or not (PAGE_LIMIT_MIN <= limit <= PAGE_LIMIT_MAX)):
+        raise invalid_input(f"limit 须在 {PAGE_LIMIT_MIN}–{PAGE_LIMIT_MAX}")
+    return {"cursor": cursor, "limit": limit}
+
+
 def _v_hotspots(p: dict) -> dict:
     limit = p.get("limit")
     if not isinstance(limit, int) or isinstance(limit, bool) or not (HOTSPOT_LIMIT_MIN <= limit <= HOTSPOT_LIMIT_MAX):
@@ -164,7 +198,9 @@ def _v_run_step(p: dict) -> dict:
     error = p.get("error")
     if error is not None and not isinstance(error, str):
         raise invalid_input("error 不合法")
-    return {"requestId": request_id, "runId": run_id, "step": step, "status": status, "error": error}
+    context = _optional_binding_context(p, run_id)
+    return {"requestId": request_id, "runId": run_id, "step": step, "status": status,
+            "error": error, "context": context}
 
 
 def _v_run_finish(p: dict) -> dict:
@@ -172,8 +208,9 @@ def _v_run_finish(p: dict) -> dict:
     run_id = _require_run_id(p.get("runId"))
     expected_version = _require_optional_version(p.get("expectedVersion"))
     report_version = _require_optional_version(p.get("reportVersion"))
+    context = _optional_binding_context(p, run_id)
     return {"requestId": request_id, "runId": run_id, "expectedVersion": expected_version,
-            "reportVersion": report_version}
+            "reportVersion": report_version, "context": context}
 
 
 def _v_run_fork(p: dict) -> dict:
@@ -196,8 +233,9 @@ def _v_artifact_write(p: dict) -> dict:
         raise invalid_input("content 不合法")
     content = _require_bytes_limit(content, "content", TEXT_MAX_BYTES)
     expected_version = _require_optional_version(p.get("expectedVersion"))
+    context = _optional_binding_context(p, run_id)
     return {"requestId": request_id, "runId": run_id, "kind": kind,
-            "content": content, "expectedVersion": expected_version}
+            "content": content, "expectedVersion": expected_version, "context": context}
 
 
 def _v_article_save(p: dict) -> dict:
@@ -227,8 +265,9 @@ def _v_review_build(p: dict) -> dict:
     assessment = p.get("assessment")
     if not isinstance(assessment, dict):
         raise invalid_input("assessment 不合法")
+    context = _optional_binding_context(p, run_id)
     return {"requestId": request_id, "runId": run_id, "articleVersion": article_version,
-            "draftVersion": draft_version, "assessment": assessment}
+            "draftVersion": draft_version, "assessment": assessment, "context": context}
 
 
 def _v_preview_render(p: dict) -> dict:
@@ -268,6 +307,32 @@ def _v_asset_get(p: dict) -> dict:
     return {"runId": run_id, "assetId": asset_id}
 
 
+def _v_binding_publish(p: dict) -> dict:
+    request_id = _require_request_id(p.get("requestId"))
+    run_id = _require_run_id(p.get("runId"))
+    workflow_id = _require_str(p.get("workflowId"), "workflowId")
+    generation = p.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise invalid_input("generation 不合法")
+    agent_id = _require_str(p.get("agentId"), "agentId")
+    session_id = _require_str(p.get("sessionId"), "sessionId")
+    workspace_id = _require_str(p.get("workspaceId"), "workspaceId")
+    phase = p.get("phase")
+    if phase not in ("created", "starting", "writing", "reviewing", "ready",
+                     "failed", "cancelling", "cancelled", "interrupted"):
+        raise invalid_input("phase 不合法")
+    expected = p.get("expectedGeneration")
+    if expected is not None and (isinstance(expected, bool) or not isinstance(expected, int) or expected < 1):
+        raise invalid_input("expectedGeneration 不合法")
+    return {"requestId": request_id, "runId": run_id, "workflowId": workflow_id,
+            "generation": generation, "agentId": agent_id, "sessionId": session_id,
+            "workspaceId": workspace_id, "phase": phase, "expectedGeneration": expected}
+
+
+def _v_binding_get(p: dict) -> dict:
+    return {"runId": _require_run_id(p.get("runId"))}
+
+
 def _v_draft_prepare(p: dict) -> dict:
     request_id = _require_request_id(p.get("requestId"))
     run_id = _require_run_id(p.get("runId"))
@@ -296,6 +361,7 @@ def _v_draft_status(p: dict) -> dict:
 _VALIDATORS = {
     "diagnose": _v_diagnose,
     "snapshot": _v_snapshot,
+    "run.list": _v_run_list,
     "hotspots.fetch": _v_hotspots,
     "run.create": _v_run_create,
     "run.detail": _v_run_detail,
@@ -309,6 +375,8 @@ _VALIDATORS = {
     "preview.render": _v_preview_render,
     "asset.put": _v_asset_put,
     "asset.get": _v_asset_get,
+    "binding.publish": _v_binding_publish,
+    "binding.get": _v_binding_get,
     "draft.prepare": _v_draft_prepare,
     "draft.send": _v_draft_send,
     "draft.status": _v_draft_status,

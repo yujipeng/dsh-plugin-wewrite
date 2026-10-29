@@ -114,6 +114,14 @@ def state_corrupted(message: str | None = None) -> FacadeError:
     return FacadeError("STATE_CORRUPTED", message)
 
 
+def run_busy(message: str | None = None) -> FacadeError:
+    return FacadeError("RUN_BUSY", message)
+
+
+def cancelled(message: str | None = None, run_id: str | None = None) -> FacadeError:
+    return FacadeError("CANCELLED", message, run_id=run_id)
+
+
 def business_failure(code: str, message: str | None = None, **extra: Any) -> dict[str, Any]:
     """构造业务失败联合 {ok:false,error:{code,message,retryable,runId?}}。"""
     err = FacadeError(code, message, **extra)

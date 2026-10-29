@@ -23,3 +23,15 @@ export interface ClientContext {
   readonly slots?: ClientSlots;
   readonly effect?: (factory: () => void | (() => void), label?: string) => void;
 }
+
+/**
+ * 宿主注入的 RPC 请求通道（dsh-client-connection 的 Web client 面）。
+ * 由 slot inject 在 conversation.view 注入时挂到 globalThis，供面板发起 RPC。
+ * 仅浏览器端存在；SSR/测试无此全局时面板显示「RPC 通道不可用」。
+ */
+declare global {
+  // eslint-disable-next-line no-var
+  var __wewriteRpc:
+    | ((channel: string, endpoint: string, payload: unknown) => Promise<unknown>)
+    | undefined;
+}

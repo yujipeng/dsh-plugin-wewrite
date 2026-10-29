@@ -11,11 +11,11 @@ import json
 from typing import Any
 
 from .errors import FacadeError, invalid_input, not_found
-from . import projection, storage
+from . import binding, projection, storage
 
 
 def build_review(*, run_id: str, article_version: str | None, draft_version: str | None,
-                 assessment: dict[str, Any]) -> dict[str, Any]:
+                 assessment: dict[str, Any], context: dict[str, Any] | None = None) -> dict[str, Any]:
     """复用上游 build_report。返回 report + gate。不写盘（写盘由 artifact.write 显式触发）。"""
     # 读正文与初稿（只读，不写盘）。
     try:
@@ -49,6 +49,8 @@ def build_review(*, run_id: str, article_version: str | None, draft_version: str
     # 落盘审稿报告（写面，显式写操作）：review-report.json 绑定 article_hash。
     with storage.run_lock(run_id, create=False):
         storage.ensure_writable_state(run_id)
+        if context:
+            binding.require_active_binding(run_id, context["workflowId"], context["generation"])
         report["article_hash"] = article_actual
         storage.write_run_file(run_id, "review-report.json",
                                json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"))

@@ -13,7 +13,7 @@ import os
 import uuid
 from typing import Any
 
-from . import assets, contract, counters, hotspots as hotspots_mod, paths, projection, publish, review as review_mod, storage
+from . import assets, binding, contract, counters, hotspots as hotspots_mod, paths, projection, publish, review as review_mod, storage
 from .errors import (
     FacadeError,
     business_failure,
@@ -64,10 +64,24 @@ def op_diagnose(payload: dict) -> dict[str, Any]:
 
 def op_snapshot(payload: dict) -> dict[str, Any]:
     """snapshot：只读投影全部 run 摘要 + 主题 + capabilities + diagnostics。"""
+    return business_success(_snapshot_data())
+
+
+def op_run_list(payload: dict) -> dict[str, Any]:
+    """run/list：只读分页（简化：全量返回，nextCursor=None，符合首版范围）。"""
+    snap = _snapshot_data()
+    items = snap["runs"]
+    limit = payload.get("limit")
+    if limit is not None:
+        items = items[:limit]
+    return business_success({"items": items, "nextCursor": None})
+
+
+def _snapshot_data() -> dict[str, Any]:
     diagnostics: list[dict[str, Any]] = []
     if not _home_ready():
         diagnostics.append({"code": "HOME_UNINITIALIZED", "message": "数据根未初始化，需先创建 run", "blocking": True})
-        return business_success({
+        return {
             "runs": [],
             "nextCursor": None,
             "themes": projection.list_theme_ids(),
@@ -86,7 +100,7 @@ def op_snapshot(payload: dict) -> dict[str, Any]:
                 "publishTransport": "fake",
                 "credentialConfigured": False,
             },
-        })
+        }
 
     runs = []
     for run_id in paths.list_run_ids():
@@ -101,7 +115,7 @@ def op_snapshot(payload: dict) -> dict[str, Any]:
 
     runs.sort(key=lambda r: r.get("updated", ""), reverse=True)
 
-    return business_success({
+    return {
         "runs": runs,
         "nextCursor": None,
         "themes": projection.list_theme_ids(),
@@ -120,7 +134,7 @@ def op_snapshot(payload: dict) -> dict[str, Any]:
             "publishTransport": "fake",
             "credentialConfigured": False,
         },
-    })
+    }
 
 
 def op_hotspots(payload: dict) -> dict[str, Any]:
@@ -184,6 +198,9 @@ def op_run_step(payload: dict) -> dict[str, Any]:
     run_id = payload["runId"]
     with storage.run_lock(run_id, create=False):
         storage.ensure_writable_state(run_id)
+        if payload.get("context"):
+            binding.require_active_binding(run_id, payload["context"]["workflowId"],
+                                           payload["context"]["generation"])
         _mark_step(run_id, payload["step"], payload["status"], payload.get("error"))
     return business_success({
         "runId": run_id,
@@ -205,6 +222,9 @@ def op_run_finish(payload: dict) -> dict[str, Any]:
     run_id = payload["runId"]
     with storage.run_lock(run_id, create=False):
         storage.ensure_writable_state(run_id)
+        if payload.get("context"):
+            binding.require_active_binding(run_id, payload["context"]["workflowId"],
+                                           payload["context"]["generation"])
         from wewrite.runs import finish_run as _upstream
         try:
             state = _upstream(run_id=run_id)
@@ -246,6 +266,9 @@ def op_artifact_write(payload: dict) -> dict[str, Any]:
     expected = payload["expectedVersion"]
     with storage.run_lock(run_id, create=False):
         storage.ensure_writable_state(run_id)
+        if payload.get("context"):
+            binding.require_active_binding(run_id, payload["context"]["workflowId"],
+                                           payload["context"]["generation"])
         current = _current_version(run_id, kind)
         if current != expected:
             from .errors import version_conflict
@@ -285,6 +308,7 @@ def op_review_build(payload: dict) -> dict[str, Any]:
         article_version=payload["articleVersion"],
         draft_version=payload["draftVersion"],
         assessment=payload["assessment"],
+        context=payload.get("context"),
     )
     return business_success(result)
 
@@ -313,6 +337,39 @@ def op_asset_put(payload: dict) -> dict[str, Any]:
 def op_asset_get(payload: dict) -> dict[str, Any]:
     result = assets.get_asset(payload["runId"], payload["assetId"])
     return business_success(result)
+
+
+def op_binding_publish(payload: dict) -> dict[str, Any]:
+    result = binding.publish_binding(
+        payload["runId"],
+        workflow_id=payload["workflowId"],
+        generation=payload["generation"],
+        agent_id=payload["agentId"],
+        session_id=payload["sessionId"],
+        workspace_id=payload["workspaceId"],
+        phase=payload["phase"],
+        expected_generation=payload.get("expectedGeneration"),
+    )
+    return business_success(result)
+
+
+def op_binding_get(payload: dict) -> dict[str, Any]:
+    data = binding.read_binding(payload["runId"])
+    if data is None:
+        return business_success({"runId": payload["runId"], "binding": None})
+    # 只返回契约 Binding 字段，不含内部 updated 等。
+    return business_success({
+        "runId": payload["runId"],
+        "binding": {
+            "runId": data.get("runId"),
+            "agentId": data.get("agentId"),
+            "sessionId": data.get("sessionId"),
+            "workspaceId": data.get("workspaceId"),
+            "workflowId": data.get("workflowId"),
+            "generation": data.get("generation"),
+            "phase": data.get("phase"),
+        },
+    })
 
 
 def op_draft_prepare(payload: dict) -> dict[str, Any]:
@@ -388,6 +445,7 @@ def op_draft_status(payload: dict) -> dict[str, Any]:
 _DISPATCH = {
     "diagnose": op_diagnose,
     "snapshot": op_snapshot,
+    "run.list": op_run_list,
     "hotspots.fetch": op_hotspots,
     "run.create": op_run_create,
     "run.detail": op_run_detail,
@@ -401,6 +459,8 @@ _DISPATCH = {
     "preview.render": op_preview_render,
     "asset.put": op_asset_put,
     "asset.get": op_asset_get,
+    "binding.publish": op_binding_publish,
+    "binding.get": op_binding_get,
     "draft.prepare": op_draft_prepare,
     "draft.send": op_draft_send,
     "draft.status": op_draft_status,

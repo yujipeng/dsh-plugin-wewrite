@@ -8,8 +8,14 @@
  * 页面看起来正常但入口位静默消失——这是质检与页面取证共同暴露的缺陷。
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { ClientContext, ClientSlotOptions } from './context';
+import { WeWriteClient } from './rpc';
+import { RunsPanel } from './panels/Runs';
+import { TopicsPanel } from './panels/Topics';
+import { EditorPanel } from './panels/Editor';
+import { ReviewPanel } from './panels/Review';
+import { SettingsPanel } from './panels/Settings';
 
 export const name = 'dsh-plugin-wewrite-client';
 export const inject = ['slots'];
@@ -29,36 +35,78 @@ function recordPending(slot: string): void {
   bootDiagnostics.push({ slot, message: '入口位尚未被宿主声明，等待声明后再注册' });
 }
 
-/** 占位面板：证明入口位渲染成功，后续 stage 替换为真实面板。 */
-function PlaceholderPanel({ wide }: { wide?: boolean }): JSX.Element {
-  const [ready, setReady] = useState(false);
-  useEffect(() => {
-    setReady(true);
-  }, []);
+type ViewKey = 'runs' | 'topics' | 'editor' | 'review' | 'settings';
+
+/** 真实工作台面板：任务列表/选题/编辑器/审稿/设置。 */
+function WorkbenchPanel(): JSX.Element {
+  const [view, setView] = useState<ViewKey>('runs');
+  const [runId, setRunId] = useState<string | null>(null);
+  const client = useMemo(
+    () =>
+      new WeWriteClient({
+        connection: {
+          // 宿主注入的 connection 客户端由 slot inject 提供，这里从全局 module 读取。
+          request: (channel, endpoint, payload) => globalThis.__wewriteRpc?.(channel, endpoint, payload) as Promise<unknown>,
+        },
+      }),
+    [],
+  );
+
   return (
-    <div
-      className="ww-placeholder"
-      data-testid="wewrite-placeholder"
-      aria-label={PANEL_TITLE}
-    >
-      <span className="ww-placeholder__title">{PANEL_TITLE}</span>
-      <span className="ww-placeholder__hint">工程骨架已装载（S1 占位，真实面板属后续 stage）</span>
-      <span className="ww-placeholder__ready">{ready ? 'loaded' : 'mounting'}</span>
-      {wide !== undefined ? <span className="ww-placeholder__wide">{wide ? 'wide' : 'rail'}</span> : null}
+    <div className="ww-workbench" data-testid="wewrite-workbench">
+      <nav className="ww-workbench__nav">
+        {([['runs', '任务'], ['topics', '选题'], ['editor', '编辑器'], ['review', '审稿'], ['settings', '设置']] as [ViewKey, string][]).map(([key, label]) => (
+          <button
+            key={key}
+            className={view === key ? 'is-active' : ''}
+            onClick={() => setView(key)}
+            disabled={key === 'editor' || key === 'review' ? !runId : false}
+            data-testid={`ww-nav-${key}`}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
+      <div className="ww-workbench__body">
+        {view === 'runs' && <RunsPanel client={client} onSelect={setRunId} />}
+        {view === 'topics' && (
+          <TopicsPanel
+            client={client}
+            onWrite={async (topic, themeId) => {
+              const result = await client.runCreate({
+                requestId: crypto.randomUUID(),
+                topic,
+                mode: 'draft',
+                visualMode: 'none',
+                themeId,
+              });
+              if (result.ok) {
+                const created = result.data as { runId: string };
+                setRunId(created.runId);
+                setView('runs');
+              }
+            }}
+          />
+        )}
+        {view === 'editor' && runId && <EditorPanel client={client} runId={runId} />}
+        {view === 'review' && runId && <ReviewPanel client={client} runId={runId} />}
+        {view === 'settings' && <SettingsPanel client={client} />}
+      </div>
     </div>
   );
 }
 
 function ConversationView(): JSX.Element {
-  return <PlaceholderPanel />;
+  return <WorkbenchPanel />;
 }
 
 function SidebarFooterAction({ wide }: { wide: boolean }): JSX.Element {
-  return <PlaceholderPanel wide={wide} />;
+  void wide;
+  return <WorkbenchPanel />;
 }
 
 function ShellOverlay(): JSX.Element {
-  return <PlaceholderPanel />;
+  return <WorkbenchPanel />;
 }
 
 /** 三个入口位的注册选项。conversation.view 的 inject 返回视图 props（session 相关，占位为最小面）。 */
