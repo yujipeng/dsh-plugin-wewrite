@@ -115,7 +115,10 @@ class RealPublisher:
         #    首版只处理已登记本地资源；无本地图片引用时跳过（不产生外连）。
         html = self._upload_inline_images(token, html)
 
-        # 3) 建草稿（白名单 + 计数由 send_draft_real 统一施加，任何 adapter/替身都绕不过）。
+        # 3) 建草稿（白名单 + 计数）。
+        assert_whitelisted("cgi-bin/draft/add")
+        get_counters().inc_wechat()
+        self.calls += 1
         try:
             result = _upstream_create_draft(
                 access_token=token,
@@ -152,13 +155,19 @@ class PublishTransport:
 
 
 # 可注入的 adapter 工厂 seam（测试替身用，生产默认不变）。
-# 形状：(kind, credentials) -> PublisherAdapter。替换后 draft.send 的
-# assert_whitelisted / wechatApiCalls 仍生效（它们在 send 路径上，不在工厂内）。
+# 形状：(kind, credentials) -> PublisherAdapter。
+# seam 仅替换假 transport（kind == 'fake'）的 adapter；真实 transport 的白名单与
+# 计数在 RealPublisher.create_draft 内，不可被 seam 绕过。
 _adapter_factory: "Any" = None
 
 
 def set_adapter_factory(factory: Any) -> None:
-    """测试注入 adapter 工厂：`(kind, credentials) -> PublisherAdapter`。传 None 恢复默认。"""
+    """测试注入 adapter 工厂：`(kind, credentials) -> PublisherAdapter`。
+
+    工厂只对 ``kind == 'fake'`` 生效；``kind == 'wechat'`` 时无视 seam，
+    始终构造 RealPublisher（真实白名单/计数不可被测试替身替换）。
+    传 None 恢复默认。
+    """
     global _adapter_factory
     _adapter_factory = factory
 
@@ -174,12 +183,12 @@ def _default_adapter(kind: str, credentials: dict[str, Any] | None) -> Publisher
 def build_transport(kind: str, credentials: dict[str, Any] | None = None) -> PublishTransport:
     """构造 transport。``fake``/``wechat`` 之外一律拒绝；真实 transport 必须有凭据。
 
-    若注册了测试 adapter 工厂，则经工厂构造 adapter（测试替身）；白名单/计数
-    逻辑在 send 路径上，不因替换 adapter 而绕过。
+    - ``kind == 'fake'``：若注册了测试 adapter 工厂，则经工厂构造 adapter（测试替身）。
+    - ``kind == 'wechat'``：无视 seam，始终构造 RealPublisher（白名单/计数在内部）。
     """
-    if _adapter_factory is not None:
+    if kind == "fake" and _adapter_factory is not None:
         adapter = _adapter_factory(kind, credentials)
-        return PublishTransport(adapter=adapter, is_fake=(kind != "wechat"))
+        return PublishTransport(adapter=adapter, is_fake=True)
     return PublishTransport(adapter=_default_adapter(kind, credentials), is_fake=(kind != "wechat"))
 
 
@@ -196,15 +205,7 @@ def send_draft_fake(transport: PublishTransport, *, title: str, html: str, diges
 
 def send_draft_real(transport: PublishTransport, *, title: str, html: str, digest: str,
                     thumb_media_id: str | None, author: str | None) -> dict:
-    """走真实 transport 发送草稿。
-
-    白名单校验与微信调用计数在 adapter 之上统一施加，任何注入替身都绕不过：
-    - 先 `assert_whitelisted('cgi-bin/draft/add')` 放行真实草稿端点；
-    - 再 `get_counters().inc_wechat()` 计入真实微信调用；
-    - 最后才调用 adapter 的 `create_draft`（HTTP/调用出口）。
-    """
-    assert_whitelisted("cgi-bin/draft/add")
-    get_counters().inc_wechat()
+    """走真实 transport 发送草稿（白名单与计数在 RealPublisher.create_draft 内）。"""
     return transport.adapter.create_draft(
         title=title, html=html, digest=digest,
         thumb_media_id=thumb_media_id, author=author,
