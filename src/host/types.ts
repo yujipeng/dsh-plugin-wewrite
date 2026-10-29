@@ -65,6 +65,38 @@ export interface HostContext {
   readonly logger?: HostLogger | ((name: string) => HostLogger);
 }
 
+/** 宿主工具注册面的最小声明（对标本机 DSH 0.2.1-rc.4 dsh-tools）。 */
+export interface ToolDefinitionLike {
+  readonly name: string;
+}
+
+export interface ToolRuntimeLike {
+  register(definition: unknown): () => void;
+  restrict?(filter: { allow?: readonly string[]; deny?: readonly string[] }): () => void;
+  guard?(guard: (execution: Readonly<{ name?: string; agent?: { id?: string } }>) => string | undefined): () => void;
+}
+
+export interface SkillProviderLike {
+  readonly name: string;
+  list(options: unknown): Promise<unknown>;
+  get(candidate: unknown, options: unknown): Promise<unknown>;
+}
+
+export interface SkillsServiceLike {
+  registerProvider(create: (control: unknown) => SkillProviderLike): () => void;
+}
+
+export interface AgentHandleLike {
+  readonly agent: { readonly id: string; cancel(cause: unknown, options?: unknown): void; followup(message: unknown): void };
+  dispose(): Promise<void>;
+}
+
+export interface AgentsServiceLike {
+  create(options: unknown): Promise<AgentHandleLike>;
+  resume(options: unknown): Promise<AgentHandleLike>;
+  get(id: string): { readonly id: string } | undefined;
+}
+
 export function resolveLogger(ctx: HostContext, name: string): HostLogger {
   const candidate = typeof ctx.logger === 'function' ? ctx.logger(name) : ctx.logger;
   if (candidate) return candidate;

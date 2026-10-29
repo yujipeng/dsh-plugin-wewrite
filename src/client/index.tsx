@@ -1,18 +1,24 @@
 /**
- * dsh-plugin-wewrite 客户端入口（S1：仅注册入口位并渲染占位面板，验证装载链路通）。
+ * dsh-plugin-wewrite 客户端入口（S3：真实工作台面板 + 宿主 RPC 接线）。
  * 三个入口：conversation.view（会话内 tab）/ sidebar.footer.action（侧栏 footer）/ shell.overlay（全屏浮层）。
  *
- * rc.4 实测：slots.register() 只对「已声明」的 slot 生效，未声明直接抛错；
- * 正确形态是用 ctx.slots.inject() 包裹，等 slot 声明后再注册（与 dsh-client-ui-chat/
- * dsh-client-ui-cordis 官方范本一致）。裸 register 会把「未声明」错误吞进降级路径，
- * 页面看起来正常但入口位静默消失——这是质检与页面取证共同暴露的缺陷。
+ * rc.4 实测：
+ * - slots.register() 只对「已声明」的 slot 生效，未声明直接抛错；正确形态是 ctx.slots.inject()。
+ * - RPC 走宿主真实通道 ctx.connection.rpc.call(channel, endpoint, payload, signal?)（ClientConnectionRpc
+ *   的正式方法），connection 服务由 dsh-client-connection 的 client half 提供。
  */
 
-import { useEffect, useState } from 'react';
-import type { ClientContext, ClientSlotOptions } from './context';
+import { useMemo, useState } from 'react';
+import type { ClientContext, ClientRuntime, ClientSlotOptions } from './context';
+import { WeWriteClient } from './rpc';
+import { RunsPanel } from './panels/Runs';
+import { TopicsPanel } from './panels/Topics';
+import { EditorPanel } from './panels/Editor';
+import { ReviewPanel } from './panels/Review';
+import { SettingsPanel } from './panels/Settings';
 
 export const name = 'dsh-plugin-wewrite-client';
-export const inject = ['slots'];
+export const inject = ['slots', 'connection', 'workspaces'];
 
 const PANEL_TITLE = 'WeWrite 写作台';
 
@@ -29,36 +35,128 @@ function recordPending(slot: string): void {
   bootDiagnostics.push({ slot, message: '入口位尚未被宿主声明，等待声明后再注册' });
 }
 
-/** 占位面板：证明入口位渲染成功，后续 stage 替换为真实面板。 */
-function PlaceholderPanel({ wide }: { wide?: boolean }): JSX.Element {
-  const [ready, setReady] = useState(false);
-  useEffect(() => {
-    setReady(true);
-  }, []);
+type ViewKey = 'runs' | 'topics' | 'editor' | 'review' | 'settings';
+
+/** 「写这个」完整两跳流程（返修 2 + 四轮-3）：先定工作区/会话，再 runCreate，成功才 runStart。 */
+export async function startWriting(
+  topic: string,
+  themeId: string,
+  workspaceId: string | null,
+  client: WeWriteClient,
+  randomId: () => string,
+): Promise<{ ok: true; runId: string } | { ok: false; message: string }> {
+  // 四轮-3：runCreate 挪到工作区确定之后；无 workspaceId 时零调用、直接拒绝。
+  if (!workspaceId) {
+    return { ok: false, message: '当前没有可用工作区，无法启动写作会话' };
+  }
+  const created = await client.runCreate({
+    requestId: randomId(),
+    topic,
+    mode: 'draft',
+    visualMode: 'none',
+    themeId,
+  });
+  if (!created.ok) {
+    return { ok: false, message: created.error.message };
+  }
+  const { runId } = created.data as { runId: string };
+
+  const started = await client.runStart({
+    requestId: randomId(),
+    runId,
+    workspaceId,
+  });
+  if (!started.ok) {
+    return { ok: false, message: started.error.message };
+  }
+  return { ok: true, runId };
+}
+
+/** 从当前选中 sessionId 推导工作区 id（返修二轮-4：不取 items[0]，由宿主当前会话定位）。 */
+export function resolveWorkspaceIdBySession(ctx: ClientContext, sessionId: string | null): string | null {
+  if (!sessionId) return null;
+  const workspaces = ctx.workspaces;
+  if (!workspaces) return null;
+  try {
+    const items = workspaces.list.getSnapshot().items;
+    for (const item of items) {
+      if (item.sessionIds.includes(sessionId)) return item.workspaceId;
+    }
+  } catch {
+    // 服务未就绪/快照未加载：返回 null（面板走加载态）。
+  }
+  return null;
+}
+
+/** 真实工作台面板：任务列表/选题/编辑器/审稿/设置。 */
+function WorkbenchPanel({ runtime }: { runtime: ClientRuntime }): JSX.Element {
+  const [view, setView] = useState<ViewKey>('runs');
+  const [runId, setRunId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const client = useMemo(() => new WeWriteClient(runtime.connection), [runtime.connection]);
+
+  // 返修二轮-4：connection/workspaces 未就绪是「加载」态，不是「错误」态。
+  if (!runtime.ready) {
+    return <div className="ww-state ww-state--loading" data-testid="ww-loading">加载中…</div>;
+  }
+
   return (
-    <div
-      className="ww-placeholder"
-      data-testid="wewrite-placeholder"
-      aria-label={PANEL_TITLE}
-    >
-      <span className="ww-placeholder__title">{PANEL_TITLE}</span>
-      <span className="ww-placeholder__hint">工程骨架已装载（S1 占位，真实面板属后续 stage）</span>
-      <span className="ww-placeholder__ready">{ready ? 'loaded' : 'mounting'}</span>
-      {wide !== undefined ? <span className="ww-placeholder__wide">{wide ? 'wide' : 'rail'}</span> : null}
+    <div className="ww-workbench" data-testid="wewrite-workbench">
+      <nav className="ww-workbench__nav">
+        {([['runs', '任务'], ['topics', '选题'], ['editor', '编辑器'], ['review', '审稿'], ['settings', '设置']] as [ViewKey, string][]).map(([key, label]) => (
+          <button
+            key={key}
+            className={view === key ? 'is-active' : ''}
+            onClick={() => setView(key)}
+            disabled={key === 'editor' || key === 'review' ? !runId : false}
+            data-testid={`ww-nav-${key}`}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
+      {actionError ? (
+        <div className="ww-state ww-state--error" data-testid="ww-action-error">{actionError}</div>
+      ) : null}
+      <div className="ww-workbench__body">
+        {view === 'runs' && <RunsPanel client={client} onSelect={setRunId} />}
+        {view === 'topics' && (
+          <TopicsPanel
+            client={client}
+            // 四轮-3：无工作区时「写这个」禁用并给原因，不发起 runCreate。
+            canWrite={runtime.workspaceId !== null}
+            writeDisabledReason={runtime.workspaceId === null ? '无当前工作区，请先新建或选择写作会话' : null}
+            onWrite={async (topic, themeId) => {
+              setActionError(null);
+              const result = await startWriting(topic, themeId, runtime.workspaceId, client, () => crypto.randomUUID());
+              if (!result.ok) {
+                setActionError(result.message);
+                return;
+              }
+              setRunId(result.runId);
+              setView('runs');
+            }}
+          />
+        )}
+        {view === 'editor' && runId && <EditorPanel client={client} runId={runId} />}
+        {view === 'review' && runId && <ReviewPanel client={client} runId={runId} />}
+        {view === 'settings' && <SettingsPanel client={client} />}
+      </div>
     </div>
   );
 }
 
-function ConversationView(): JSX.Element {
-  return <PlaceholderPanel />;
+function ConversationView({ runtime }: { runtime: ClientRuntime }): JSX.Element {
+  return <WorkbenchPanel runtime={runtime} />;
 }
 
-function SidebarFooterAction({ wide }: { wide: boolean }): JSX.Element {
-  return <PlaceholderPanel wide={wide} />;
+function SidebarFooterAction({ wide, runtime }: { wide: boolean; runtime: ClientRuntime }): JSX.Element {
+  void wide;
+  return <WorkbenchPanel runtime={runtime} />;
 }
 
-function ShellOverlay(): JSX.Element {
-  return <PlaceholderPanel />;
+function ShellOverlay({ runtime }: { runtime: ClientRuntime }): JSX.Element {
+  return <WorkbenchPanel runtime={runtime} />;
 }
 
 /** 三个入口位的注册选项。conversation.view 的 inject 返回视图 props（session 相关，占位为最小面）。 */
@@ -97,6 +195,22 @@ export function apply(ctx: ClientContext): void {
     return;
   }
 
+  // 返修二轮-4：connection/workspaces 未就绪时是「加载」态，不是「错误」态。
+  // sessionId 由 conversation.view slot 在会话内注入；无当前会话时 workspaceId=null。
+  const makeRuntime = (sessionId: unknown): ClientRuntime => {
+    const sid = typeof sessionId === 'string' && sessionId ? sessionId : null;
+    const hasConnection = typeof ctx.connection?.rpc?.call === 'function';
+    const hasWorkspaces = ctx.workspaces !== undefined;
+    return {
+      connection: hasConnection
+        ? (ctx.connection as ClientRuntime['connection'])
+        : { rpc: { call: async () => ({ ok: false, error: { code: 'CAPABILITY_UNAVAILABLE', message: 'RPC 通道不可用', details: {} } }) } },
+      sessionId: sid,
+      workspaceId: resolveWorkspaceIdBySession(ctx, sid),
+      ready: hasConnection && hasWorkspaces,
+    };
+  };
+
   // 收集每个 slot 的 wait disposer（ctx.slots.inject 返回）与 register disposer。
   const waitDisposers: Array<() => void> = [];
   const registerDisposers: Array<() => void> = [];
@@ -106,18 +220,23 @@ export function apply(ctx: ClientContext): void {
     if (typeof slots.inject === 'function') {
       try {
         const wait = slots.inject(slot, () => {
-          const dispose = slots.register(slotOptions(slot), slotComponent(slot));
+          const component = slotComponent(slot) as (props: { runtime: ClientRuntime } & Record<string, unknown>) => JSX.Element;
+          const dispose = slots.register(
+            { ...slotOptions(slot), inject: (...args: unknown[]) => ({ runtime: makeRuntime(args[0]) }) },
+            component,
+          );
           registerDisposers.push(dispose);
           registered.add(slot);
           return dispose;
         });
         waitDisposers.push(wait);
-        // 若 slot 此刻尚未声明，inject 会等待声明；记录 pending 供自检（不视为失败）。
-        // 注意：rc.4 SlotRegistry.inject 在 slot 已声明时同步回调并返回 wait；未声明时仅登记等待。
-        // 无法同步区分二者，故 pending 记录仅在「未注册且无错误」时于 effect 卸载前统一结算。
       } catch (error) {
         try {
-          const dispose = slots.register(slotOptions(slot), slotComponent(slot));
+          const component = slotComponent(slot) as (props: { runtime: ClientRuntime } & Record<string, unknown>) => JSX.Element;
+          const dispose = slots.register(
+            { ...slotOptions(slot), inject: (...args: unknown[]) => ({ runtime: makeRuntime(args[0]) }) },
+            component,
+          );
           registerDisposers.push(dispose);
           registered.add(slot);
         } catch (registerError) {
@@ -126,7 +245,8 @@ export function apply(ctx: ClientContext): void {
       }
     } else {
       try {
-        const dispose = slots.register(slotOptions(slot), slotComponent(slot));
+        const component = slotComponent(slot) as (props: { runtime: ClientRuntime } & Record<string, unknown>) => JSX.Element;
+        const dispose = slots.register({ ...slotOptions(slot), inject: (...args: unknown[]) => ({ runtime: makeRuntime(args[0]) }) }, component);
         registerDisposers.push(dispose);
         registered.add(slot);
       } catch (error) {

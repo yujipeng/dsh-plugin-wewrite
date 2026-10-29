@@ -106,12 +106,24 @@ def version_conflict(message: str | None = None) -> FacadeError:
     return FacadeError("VERSION_CONFLICT", message)
 
 
+def invalid_transition(message: str | None = None) -> FacadeError:
+    return FacadeError("INVALID_TRANSITION", message)
+
+
 def internal(message: str | None = None) -> FacadeError:
     return FacadeError("INTERNAL", message)
 
 
 def state_corrupted(message: str | None = None) -> FacadeError:
     return FacadeError("STATE_CORRUPTED", message)
+
+
+def run_busy(message: str | None = None) -> FacadeError:
+    return FacadeError("RUN_BUSY", message)
+
+
+def cancelled(message: str | None = None, run_id: str | None = None) -> FacadeError:
+    return FacadeError("CANCELLED", message, run_id=run_id)
 
 
 def business_failure(code: str, message: str | None = None, **extra: Any) -> dict[str, Any]:

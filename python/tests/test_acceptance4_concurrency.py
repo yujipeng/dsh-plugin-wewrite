@@ -42,10 +42,13 @@ def test_concurrent_save_same_version_one_success(tmp_path):
 
     ok = [r for r in results if r.get("ok") is True]
     conflicts = [r for r in results if r.get("ok") is False and r["error"]["code"] == "VERSION_CONFLICT"]
+    busy = [r for r in results if r.get("ok") is False and r["error"]["code"] == "RUN_BUSY"]
 
-    assert len(ok) <= 1, f"同版并发保存应最多一个成功，实际 {len(ok)} 个"
-    assert len(ok) == 1, "应恰好一个成功"
-    assert len(conflicts) == n - 1, f"其余应 VERSION_CONFLICT，实际 {len(conflicts)}"
+    # 四轮裁定 A：article.save 取 send 门闩（LOCK_NB）。同版并发最多一个成功；
+    # 其余要么 RUN_BUSY（门闩竞争，未进入 run 锁），要么 VERSION_CONFLICT（进入 run 锁但版本已被赢家改）。
+    # 核心不变量：恰好一个成功、正文最终为赢家版本、无「串写」。
+    assert len(ok) == 1, f"应恰好一个成功，实际 {len(ok)} 个"
+    assert len(conflicts) + len(busy) == n - 1, f"其余应 RUN_BUSY 或 VERSION_CONFLICT，实际 {len(conflicts)}+{len(busy)}"
 
 
 def test_concurrent_save_different_runs_no_block(tmp_path):

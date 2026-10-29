@@ -13,7 +13,7 @@ import os
 import uuid
 from typing import Any
 
-from . import assets, contract, counters, hotspots as hotspots_mod, paths, projection, publish, review as review_mod, storage
+from . import assets, binding, contract, counters, draft_dispatch, hotspots as hotspots_mod, intents, paths, projection, publish, review as review_mod, storage
 from .errors import (
     FacadeError,
     business_failure,
@@ -64,10 +64,24 @@ def op_diagnose(payload: dict) -> dict[str, Any]:
 
 def op_snapshot(payload: dict) -> dict[str, Any]:
     """snapshot：只读投影全部 run 摘要 + 主题 + capabilities + diagnostics。"""
+    return business_success(_snapshot_data())
+
+
+def op_run_list(payload: dict) -> dict[str, Any]:
+    """run/list：只读分页（简化：全量返回，nextCursor=None，符合首版范围）。"""
+    snap = _snapshot_data()
+    items = snap["runs"]
+    limit = payload.get("limit")
+    if limit is not None:
+        items = items[:limit]
+    return business_success({"items": items, "nextCursor": None})
+
+
+def _snapshot_data() -> dict[str, Any]:
     diagnostics: list[dict[str, Any]] = []
     if not _home_ready():
         diagnostics.append({"code": "HOME_UNINITIALIZED", "message": "数据根未初始化，需先创建 run", "blocking": True})
-        return business_success({
+        return {
             "runs": [],
             "nextCursor": None,
             "themes": projection.list_theme_ids(),
@@ -86,7 +100,7 @@ def op_snapshot(payload: dict) -> dict[str, Any]:
                 "publishTransport": "fake",
                 "credentialConfigured": False,
             },
-        })
+        }
 
     runs = []
     for run_id in paths.list_run_ids():
@@ -101,7 +115,7 @@ def op_snapshot(payload: dict) -> dict[str, Any]:
 
     runs.sort(key=lambda r: r.get("updated", ""), reverse=True)
 
-    return business_success({
+    return {
         "runs": runs,
         "nextCursor": None,
         "themes": projection.list_theme_ids(),
@@ -120,7 +134,7 @@ def op_snapshot(payload: dict) -> dict[str, Any]:
             "publishTransport": "fake",
             "credentialConfigured": False,
         },
-    })
+    }
 
 
 def op_hotspots(payload: dict) -> dict[str, Any]:
@@ -184,6 +198,9 @@ def op_run_step(payload: dict) -> dict[str, Any]:
     run_id = payload["runId"]
     with storage.run_lock(run_id, create=False):
         storage.ensure_writable_state(run_id)
+        if payload.get("context"):
+            binding.require_active_binding(run_id, payload["context"]["workflowId"],
+                                           payload["context"]["generation"])
         _mark_step(run_id, payload["step"], payload["status"], payload.get("error"))
     return business_success({
         "runId": run_id,
@@ -205,6 +222,9 @@ def op_run_finish(payload: dict) -> dict[str, Any]:
     run_id = payload["runId"]
     with storage.run_lock(run_id, create=False):
         storage.ensure_writable_state(run_id)
+        if payload.get("context"):
+            binding.require_active_binding(run_id, payload["context"]["workflowId"],
+                                           payload["context"]["generation"])
         from wewrite.runs import finish_run as _upstream
         try:
             state = _upstream(run_id=run_id)
@@ -239,19 +259,42 @@ def op_artifact_get(payload: dict) -> dict[str, Any]:
     })
 
 
+# 改写审批摘要的 kind：article/draft/review_report 必须取 send 门闩（设计 §4 第 96 行）。
+_SEND_LATCHED_KINDS = frozenset({"article", "draft", "review_report"})
+
+
 def op_artifact_write(payload: dict) -> dict[str, Any]:
     run_id = payload["runId"]
     kind = payload["kind"]
     content = payload["content"]
     expected = payload["expectedVersion"]
+
+    # 裁定 A：article/draft/review_report 取 send 门闩（门闩 → run 锁）；其余 kind 只取 run 短锁。
+    if kind in _SEND_LATCHED_KINDS:
+        with storage.send_lock(run_id, create=True):
+            with storage.run_lock(run_id, create=False):
+                return _artifact_write_locked(payload)
     with storage.run_lock(run_id, create=False):
-        storage.ensure_writable_state(run_id)
-        current = _current_version(run_id, kind)
-        if current != expected:
-            from .errors import version_conflict
-            raise version_conflict("内容版本冲突，请刷新后重试")
-        storage.write_run_file(run_id, paths.KIND_FILES[kind], content.encode("utf-8"))
-        new_version = storage.sha256_hex(content.encode("utf-8"))
+        return _artifact_write_locked(payload)
+
+
+def _artifact_write_locked(payload: dict) -> dict[str, Any]:
+    run_id = payload["runId"]
+    kind = payload["kind"]
+    content = payload["content"]
+    expected = payload["expectedVersion"]
+    storage.ensure_writable_state(run_id)
+    if payload.get("context"):
+        binding.require_active_binding(run_id, payload["context"]["workflowId"],
+                                       payload["context"]["generation"])
+    current = _current_version(run_id, kind)
+    if current != expected:
+        from .errors import version_conflict
+        raise version_conflict("内容版本冲突，请刷新后重试")
+    # JSON/YAML 产物必须解析为对应结构，不能任意 blob 写入（设计 §4）。
+    _validate_structured_artifact(kind, content)
+    storage.write_run_file(run_id, paths.KIND_FILES[kind], content.encode("utf-8"))
+    new_version = storage.sha256_hex(content.encode("utf-8"))
     return business_success({
         "runId": run_id,
         "kind": kind,
@@ -269,23 +312,48 @@ def _current_version(run_id: str, kind: str) -> str | None:
     return storage.sha256_hex(os.fdopen(fd, "rb").read())
 
 
+def _validate_structured_artifact(kind: str, content: str) -> None:
+    """JSON/YAML 产物写入前必须解析为对应结构（设计 §4），否则 INVALID_INPUT。"""
+    import yaml
+
+    if kind in ("review_report", "images_manifest"):
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            raise invalid_input("产物必须是合法 JSON")
+        if not isinstance(data, dict):
+            raise invalid_input("产物必须是 JSON 对象")
+    elif kind in ("brief", "claims", "sources"):
+        try:
+            data = yaml.safe_load(content)
+        except yaml.YAMLError:
+            raise invalid_input("产物必须是合法 YAML")
+        if not isinstance(data, dict):
+            raise invalid_input("产物必须是 YAML 对象")
+
+
 def op_article_save(payload: dict) -> dict[str, Any]:
-    result = storage.article_save(
-        payload["runId"],
-        payload["markdown"],
-        payload["expectedVersion"],
-        payload["metadata"],
-    )
+    # 裁定 A：正文保存参与 send 门闩（门闩 → run 锁），发送在途时 RUN_BUSY。
+    with storage.send_lock(payload["runId"], create=True):
+        result = storage.article_save(
+            payload["runId"],
+            payload["markdown"],
+            payload["expectedVersion"],
+            payload["metadata"],
+        )
     return business_success(result)
 
 
 def op_review_build(payload: dict) -> dict[str, Any]:
-    result = review_mod.build_review(
-        run_id=payload["runId"],
-        article_version=payload["articleVersion"],
-        draft_version=payload["draftVersion"],
-        assessment=payload["assessment"],
-    )
+    # 裁定 A：报告替换参与 send 门闩（门闩 → run 锁），发送在途时 RUN_BUSY。
+    with storage.send_lock(payload["runId"], create=True):
+        result = review_mod.build_review(
+            run_id=payload["runId"],
+            article_version=payload["articleVersion"],
+            draft_version=payload["draftVersion"],
+            assessment=payload["assessment"],
+            context=payload.get("context"),
+        )
     return business_success(result)
 
 
@@ -300,13 +368,24 @@ def op_preview_render(payload: dict) -> dict[str, Any]:
 
 
 def op_asset_put(payload: dict) -> dict[str, Any]:
-    result = assets.put_asset(
-        run_id=payload["runId"],
-        role=payload["role"],
-        media_type=payload["mediaType"],
-        base64_text=payload["base64"],
-        expected_article_version=payload["expectedArticleVersion"],
-    )
+    # 裁定 A：封面(role=cover)参与 send 门闩（coverHash 进审批摘要）；inline 只取 run 短锁。
+    if payload["role"] == "cover":
+        with storage.send_lock(payload["runId"], create=True):
+            result = assets.put_asset(
+                run_id=payload["runId"],
+                role=payload["role"],
+                media_type=payload["mediaType"],
+                base64_text=payload["base64"],
+                expected_article_version=payload["expectedArticleVersion"],
+            )
+    else:
+        result = assets.put_asset(
+            run_id=payload["runId"],
+            role=payload["role"],
+            media_type=payload["mediaType"],
+            base64_text=payload["base64"],
+            expected_article_version=payload["expectedArticleVersion"],
+        )
     return business_success(result)
 
 
@@ -315,79 +394,69 @@ def op_asset_get(payload: dict) -> dict[str, Any]:
     return business_success(result)
 
 
-def op_draft_prepare(payload: dict) -> dict[str, Any]:
-    """本地预检，不取令牌/不上传。"""
-    run_id = payload["runId"]
-    expected = payload["expectedVersion"]
-    content, version = projection.read_artifact_content(run_id, "article")
-    if expected is not None and expected != version:
-        from .errors import version_conflict
-        raise version_conflict("正文版本已变化，请刷新后重试")
-    gate = projection.build_gate({}, run_id)
-    # 生成 intent（内存 + 落盘到 .dsh-workbench，写面如实）。
-    intent_id = uuid.uuid4().hex
-    with storage.run_lock(run_id, create=False):
-        storage.ensure_writable_state(run_id)
-        storage.write_run_file_rel(run_id, ".dsh-workbench/intent.json",
-                                   json.dumps({"intentId": intent_id, "runId": run_id,
-                                               "articleVersion": version}, ensure_ascii=False).encode("utf-8"))
-    summary = {
-        "runId": run_id,
-        "title": "",
-        "digest": "",
-        "articleVersion": version,
-        "themeId": payload["themeId"],
-        "coverHash": "",
-        "contentHash": version,
-        "accountLabel": "",
-        "dryRun": True,
-    }
+def op_binding_publish(payload: dict) -> dict[str, Any]:
+    result = binding.publish_binding(
+        payload["runId"],
+        workflow_id=payload["workflowId"],
+        generation=payload["generation"],
+        agent_id=payload["agentId"],
+        session_id=payload["sessionId"],
+        workspace_id=payload["workspaceId"],
+        phase=payload["phase"],
+        expected_generation=payload.get("expectedGeneration"),
+    )
+    return business_success(result)
+
+
+def op_binding_get(payload: dict) -> dict[str, Any]:
+    data = binding.read_binding(payload["runId"])
+    if data is None:
+        return business_success({"runId": payload["runId"], "binding": None})
+    # 只返回契约 Binding 字段，不含内部 updated 等。
     return business_success({
-        "intentId": intent_id,
-        "expiresAt": "",
-        "gate": gate or {"publishable": False, "issues": [], "articleVersion": version, "reportVersion": None},
-        "summary": summary,
+        "runId": payload["runId"],
+        "binding": {
+            "runId": data.get("runId"),
+            "agentId": data.get("agentId"),
+            "sessionId": data.get("sessionId"),
+            "workspaceId": data.get("workspaceId"),
+            "workflowId": data.get("workflowId"),
+            "generation": data.get("generation"),
+            "phase": data.get("phase"),
+        },
     })
+
+
+def op_binding_revoke_intents(payload: dict) -> dict[str, Any]:
+    """cancel 路径：先门闩→run 锁 CAS 撤销 + phase=cancelled（七轮-1）。"""
+    revoked = binding.revoke_intents_for_cancel(payload["runId"], expected_generation=payload["expectedGeneration"])
+    return business_success({"runId": payload["runId"], "revoked": revoked})
+
+
+def op_draft_prepare(payload: dict) -> dict[str, Any]:
+    """薄 Adapter：调用 draft_dispatch.prepare。"""
+    return draft_dispatch.prepare(payload)
 
 
 def op_draft_send(payload: dict) -> dict[str, Any]:
-    """draft.send 只接假 transport：真实微信调用计数恒为零。"""
-    run_id = payload["runId"]
-    content, version = projection.read_artifact_content(run_id, "article")
-    if payload["expectedVersion"] is not None and payload["expectedVersion"] != version:
-        from .errors import version_conflict
-        raise version_conflict("正文版本已变化，请刷新后重试")
-    transport = publish.build_transport("fake")
-    result = publish.send_draft_fake(
-        transport,
-        title="",
-        html=content,
-        digest="",
-        thumb_media_id=None,
-        author=None,
-    )
-    return business_success({
-        "operationId": uuid.uuid4().hex,
-        "status": "succeeded",
-        "mediaId": result["mediaId"],
-        "dryRun": True,
-        "counters": counters.get_counters().snapshot(),
-    })
+    """薄 Adapter：调用 draft_dispatch.send（context 由 host 可信绑定注入）。"""
+    return draft_dispatch.send(payload, payload["context"])
 
 
 def op_draft_status(payload: dict) -> dict[str, Any]:
-    return business_success({
-        "operationId": payload["operationId"],
-        "status": "succeeded",
-        "mediaId": "fake-media-1",
-        "issue": None,
-        "dryRun": True,
-    })
+    """薄 Adapter：调用 draft_dispatch.status（真实只读投影，不固定返回成功）。"""
+    return draft_dispatch.status(payload["runId"], payload["operationId"])
+
+
+def op_draft_recover(payload: dict) -> dict[str, Any]:
+    """私有恢复：调用 draft_dispatch.recover。"""
+    return draft_dispatch.recover(payload)
 
 
 _DISPATCH = {
     "diagnose": op_diagnose,
     "snapshot": op_snapshot,
+    "run.list": op_run_list,
     "hotspots.fetch": op_hotspots,
     "run.create": op_run_create,
     "run.detail": op_run_detail,
@@ -401,9 +470,13 @@ _DISPATCH = {
     "preview.render": op_preview_render,
     "asset.put": op_asset_put,
     "asset.get": op_asset_get,
+    "binding.publish": op_binding_publish,
+    "binding.get": op_binding_get,
+    "binding.revoke-intents": op_binding_revoke_intents,
     "draft.prepare": op_draft_prepare,
     "draft.send": op_draft_send,
     "draft.status": op_draft_status,
+    "draft.recover": op_draft_recover,
 }
 
 

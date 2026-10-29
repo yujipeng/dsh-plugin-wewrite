@@ -32,6 +32,12 @@ def test_draft_prepare_end_to_end_success(tmp_path):
     run_id = create_run(home)
     # 先写正文，draft.prepare 才能读到 article 并生成 intent。
     write_article(home, run_id, "# 标题\n\n正文")
+    # 设计修订版二：prepare 需已绑定写作会话（不记录未绑定 run 的 intent）。
+    pub = call_facade(str(home), "binding.publish", {
+        "requestId": "b1", "runId": run_id, "workflowId": "wf-1", "generation": 1,
+        "agentId": "a", "sessionId": "s", "workspaceId": "ws-1", "phase": "writing",
+    })
+    assert pub["ok"] is True, pub
     resp = call_facade(str(home), "draft.prepare", {
         "requestId": "p1",
         "runId": run_id,
@@ -41,9 +47,11 @@ def test_draft_prepare_end_to_end_success(tmp_path):
     })
     assert resp["ok"] is True, resp
     assert resp["data"]["intentId"]
-    # intent.json 实际落盘（写面如实）。
-    intent = home / "runs" / run_id / ".dsh-workbench" / "intent.json"
+    # intent 注册表实际落盘（写面如实）：返修 6 起改为 intents.json（intentId 列表）。
+    intent = home / "runs" / run_id / ".dsh-workbench" / "intents.json"
     assert intent.is_file()
+    data = json.loads(intent.read_text(encoding="utf-8"))
+    assert any(i["intentId"] == resp["data"]["intentId"] for i in data.get("intents", []))
 
 
 def test_asset_put_end_to_end_success(tmp_path):

@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "provider": "wewrite-python-bundle",
+  "sourceRevision": "wewrite@220db1dcf141d92c03ddb704628a774ecd2b79f7",
+  "sourceHash": "220db1dcf141d92c03ddb704628a774ecd2b79f7",
+  "skills": [
+    {
+      "name": "wewrite",
+      "description": "WeWrite 一键写作主流程：接收已创建 run，按 topic/write/review 步骤产出 brief/claims/draft/article/report，审稿通过才 ready",
+      "path": "wewrite/SKILL.md",
+      "sha256": "main-skill"
+    },
+    {
+      "name": "wewrite-topic",
+      "description": "选题与主题构思（从热榜与主题目录中选题并确定写作角度）",
+      "path": "wewrite-topic/SKILL.md",
+      "sha256": "topic"
+    },
+    {
+      "name": "wewrite-write",
+      "description": "正文写作流程（brief → claims → draft → article，全部经 wewrite_artifact_write 落盘）",
+      "path": "wewrite-write/SKILL.md",
+      "sha256": "write"
+    },
+    {
+      "name": "wewrite-review",
+      "description": "审稿流程（五维评估 → wewrite_review → 通过后 wewrite_run_finish）",
+      "path": "wewrite-review/SKILL.md",
+      "sha256": "review"
+    },
+    {
+      "name": "wewrite-visual",
+      "description": "可选视觉流程（默认 visualMode=none，不启用）",
+      "path": "wewrite-visual/SKILL.md",
+      "sha256": "visual"
+    },
+    {
+      "name": "wewrite-publish",
+      "description": "预览与请求草稿推送（S3 只到预览 + 预检 + 发请求，不真实推送到微信）",
+      "path": "wewrite-publish/SKILL.md",
+      "sha256": "publish"
+    }
+  ]
+}
