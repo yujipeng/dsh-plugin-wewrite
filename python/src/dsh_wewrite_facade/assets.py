@@ -110,6 +110,22 @@ def put_asset(*, run_id: str, role: str, media_type: str, base64_text: str,
     return {"assetId": asset_id, "contentHash": content_hash, "bytes": len(data)}
 
 
+def asset_hash(run_id: str, asset_id: str) -> str:
+    """按 assetId 查登记项返回其 contentHash；不存在/未登记返回空串（供推送摘要基线）。
+
+    只读：不创建目录/文件。JEE-1956 缺口 1：prepare 固定封面哈希、send 二次复验重读比对。
+    """
+    paths.validate_run_id(run_id)
+    if not isinstance(asset_id, str) or not asset_id.strip():
+        return ""
+    registry = _read_registry(run_id)
+    for a in registry.get("assets", []):
+        if isinstance(a, dict) and a.get("assetId") == asset_id:
+            h = a.get("contentHash")
+            return h if isinstance(h, str) else ""
+    return ""
+
+
 def get_asset(run_id: str, asset_id: str) -> dict[str, Any]:
     """按 assetId 查登记项，复核真实路径与哈希后返回 base64。"""
     paths.validate_run_id(run_id)

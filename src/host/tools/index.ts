@@ -59,6 +59,46 @@ export function setToolService(service: WorkbenchService): void {
   serviceRef = service;
 }
 
+/** 宿主工具注册面的最小消费（对标本机 DSH 0.2.1-rc.4 dsh-tools）。 */
+export interface AgentToolRegistry {
+  register(definition: unknown): () => void;
+  restrict?(filter: { allow?: readonly string[]; deny?: readonly string[] }): () => void;
+  guard?(guard: (execution: Readonly<{ name?: string }>) => string | undefined): () => void;
+}
+
+/**
+ * 专属写作 Agent 的 scope 装配（设计 §5 两条路径），生产装配与证据测试共用同一实现，
+ * 避免「两套 scope 装配」漂移。
+ *
+ * 1) 继承层：restrict({allow: 空清单}) 只过滤继承的全局/祖先层工具。
+ * 2) 自身层与 reserved：guard 显式拒绝 run_code/自身层危险工具，native 插件工具仍可执行。
+ */
+export function setupAgentScope(agentCtx: { get?(name: string): unknown }, toolDefs: ToolDefinition[], onWarn?: (message: string) => void): void {
+  const agentTools = agentCtx.get?.('tools') as AgentToolRegistry | undefined;
+  if (typeof agentTools?.register !== 'function') return;
+  for (const def of toolDefs) {
+    try {
+      agentTools.register(def);
+    } catch (error) {
+      onWarn?.(`工具 ${def.name} scope 注册失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (typeof agentTools.restrict === 'function') {
+    try {
+      agentTools.restrict({ allow: [...INHERITED_TOOL_ALLOWLIST] });
+    } catch (error) {
+      onWarn?.(`tools.restrict 继承层过滤失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (typeof agentTools.guard === 'function') {
+    try {
+      agentTools.guard(controlledToolGuard);
+    } catch (error) {
+      onWarn?.(`tools.guard scope 注册失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
 /** 文本渲染：工具结果统一为中文摘要文本块，原始数据在 value 内（lossless JSON）。 */
 function textBlock(text: string): { type: 'text'; text: string } {
   return { type: 'text', text };

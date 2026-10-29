@@ -46,6 +46,8 @@ export interface BridgeConfig {
   readonly home: string;
   /** 普通调用超时（毫秒）；默认按 operation 取档。 */
   readonly timeoutMs?: number;
+  /** 每个子进程确切退出（child close）后回调一次（host 私有 recover 接线用）。 */
+  readonly onChildClose?: (info: { operation: string; runId?: string; ok: boolean; timedOut: boolean }) => void | Promise<void>;
 }
 
 export interface FacadeCall {
@@ -83,6 +85,12 @@ function terminate(pid: number | undefined): void {
 }
 
 /** 固定解释器 spawn：shell:false，参数只有 `-m dsh_wewrite_facade`。 */
+export function shouldRecoverAfterClose(info: { operation: string; runId?: string; ok: boolean; timedOut: boolean }): boolean {
+  // JEE-1956 缺口 3：只有 draft.send 子进程确切 close 后、且发送未成功或超时，才需要 recover。
+  // 成功且未超时 → sent 无待恢复；其他操作的 close 不触发。
+  return info.operation === 'draft.send' && typeof info.runId === 'string' && info.runId !== '' && !(info.ok && !info.timedOut);
+}
+
 export async function runFacade(call: FacadeCall, config: BridgeConfig): Promise<BridgeResult> {
   const timeout = config.timeoutMs ?? timeoutFor(call.operation);
   const request = JSON.stringify({
@@ -112,6 +120,15 @@ export async function runFacade(call: FacadeCall, config: BridgeConfig): Promise
   }
 
   const result = await collect(child, timeout, sent);
+  // 子进程确切退出（child close）后回调一次（host 私有 recover 接线用；S3 无真实 send 不触发）。
+  const resp = result.response;
+  const runId = (call.payload as { runId?: string } | undefined)?.runId;
+  void config.onChildClose?.({
+    operation: call.operation,
+    runId: typeof runId === 'string' ? runId : undefined,
+    ok: resp?.ok === true,
+    timedOut: result.timedOut,
+  });
   return result;
 }
 
