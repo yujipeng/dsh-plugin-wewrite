@@ -437,25 +437,48 @@ def test_real_transport_substitute_still_guarded_by_whitelist_and_counter(monkey
 
 
 def test_real_transport_substitute_bypass_non_whitelisted_rejected_and_not_counted(monkeypatch):
-    """负向：替身无法绕过白名单——send_draft_real 的白名单在 create_draft 之前强制。
+    """负向：经 send_draft_real 发送入口，白名单校验失败时拒绝且零副作用。
 
-    注入替身即使想在 create_draft 里直连群发端点，也会在 send_draft_real 入口
-    被 assert_whitelisted('cgi-bin/draft/add') 之外的白名单边界挡住；这里直接证明
-    非白名单端点被 assert_whitelisted 拒绝，且拒绝路径不触发 inc_wechat（计数不增）。
+    通过 spy 让发送入口的白名单校验（assert_whitelisted('cgi-bin/draft/add')）失败，
+    再断言：抛 FORBIDDEN、注入 adapter 的 create_draft 调用次数 == 0、wechatApiCalls 不增。
     """
     from dsh_wewrite_facade import publish as publish_mod
     from dsh_wewrite_facade import counters as counters_mod
-    from dsh_wewrite_facade.errors import FacadeError
+    from dsh_wewrite_facade.errors import FacadeError, forbidden
     import pytest as _pytest
 
     counters_mod.reset_counters()
     before = counters_mod.get_counters().wechat()
 
-    # 群发端点被白名单拒绝。
+    class SpyAdapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create_draft(self, **kwargs):
+            self.calls += 1
+            return {"mediaId": "real-media", "dryRun": False, "title": ""}
+
+    adapter = SpyAdapter()
+    transport = publish_mod.PublishTransport(adapter=adapter, is_fake=False)
+
+    # spy：让发送入口的白名单校验对 draft/add 失败（模拟非白名单/校验失败），
+    # 其余端点仍走真实 assert_whitelisted。
+    real_assert = publish_mod.assert_whitelisted
+    def failing_assert(endpoint):
+        if endpoint == "cgi-bin/draft/add":
+            raise forbidden("微信群发端点被禁止")
+        return real_assert(endpoint)
+    monkeypatch.setattr(publish_mod, "assert_whitelisted", failing_assert)
+
     with _pytest.raises(FacadeError) as exc:
-        publish_mod.assert_whitelisted("https://api.weixin.qq.com/cgi-bin/message/mass/send")
+        publish_mod.send_draft_real(
+            transport, title="t", html="<p>x</p>", digest="d", thumb_media_id="cover-media", author=None,
+        )
     assert exc.value.code == "FORBIDDEN"
-    # 拒绝路径未调用 inc_wechat（send_draft_real 只在白名单通过后才计数）。
+    assert "禁止" in str(exc.value)
+    # 白名单失败后，adapter.create_draft 从未被调用。
+    assert adapter.calls == 0
+    # 白名单失败后，inc_wechat 未执行，计数不增。
     assert counters_mod.get_counters().wechat() == before
 
 
