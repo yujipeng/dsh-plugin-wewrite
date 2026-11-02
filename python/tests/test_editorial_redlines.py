@@ -11,6 +11,11 @@ import yaml
 import pytest
 
 from conftest import call_facade, create_run, make_home, write_article
+from dsh_wewrite_facade.editorial import (
+    GUARD_NO_CONCLUSION,
+    GUARD_UNSOURCED_FACT,
+    editorial_blockers,
+)
 
 
 def _write_artifact(home, run_id, kind, content, expected=None):
@@ -42,6 +47,16 @@ def _sources_verified() -> str:
         "version": 1, "run_id": "r",
         "sources": [{"id": "s1", "title": "官方", "publisher": "p", "url": "https://example.com/a",
                      "published_at": "2026-01-01", "claim": "支持主张", "status": "verified"}],
+    }, allow_unicode=True, sort_keys=False)
+
+
+def _sources_unrelated_verified() -> str:
+    """一条 verified 来源，但主题与正文断言无关（讲天气）。"""
+    return yaml.safe_dump({
+        "version": 1, "run_id": "r",
+        "sources": [{"id": "s2", "title": "气象局", "publisher": "气象局",
+                     "url": "https://example.com/weather",
+                     "published_at": "2026-01-01", "claim": "今天局部地区有阵雨", "status": "verified"}],
     }, allow_unicode=True, sort_keys=False)
 
 
@@ -164,6 +179,71 @@ def test_sources_ledger_roundtrip(tmp_path):
     got = call_facade(str(home), "artifact.get", {"runId": run_id, "kind": "sources"})
     assert got["ok"] is True
     assert "verified" in got["data"]["content"]
+
+
+def test_unrelated_source_cannot_pass(tmp_path):
+    """返修 1：来源不支持正文断言 → 必须 revise，不能 pass。
+
+    正文「研究表明，90% 的用户支持」+ 一条讲天气的 verified 来源，
+    旧实现只看「有没有 verified」→ 误判 pass；现在按断言与来源相关性判 revise。
+    """
+    home = make_home(tmp_path)
+    run_id = create_run(home)
+    article = "研究表明，90% 的用户支持这种方式。"
+    version = write_article(home, run_id, article)
+    assert _write_artifact(home, run_id, "sources", _sources_unrelated_verified())["ok"] is True
+    assert _write_artifact(home, run_id, "claims", _claims_with_fact_unsourced())["ok"] is True
+    resp = _review(home, run_id, version)
+    assert resp["ok"] is True, resp
+    report = resp["data"]["report"]
+    assert report["decision"] == "revise"
+    assert report["publishable"] is False
+    assert report["blockers"], "必须有非空 blockers"
+    assert any("不支持" in b or "无来源" in b for b in report["blockers"])
+
+
+def test_unrelated_source_guard_off_fails(tmp_path):
+    """返修 1 反证：关掉 GUARD_UNSOURCED_FACT 后，上述场景应回到旧实现（误判为无阻断）。"""
+    home = make_home(tmp_path)
+    run_id = create_run(home)
+    article = "研究表明，90% 的用户支持这种方式。"
+    _ = home, run_id, article
+    # 直接对判定函数做反证：有无关 verified 来源时，打开守卫有阻断，关掉守卫无阻断。
+    unrelated = yaml.safe_load(_sources_unrelated_verified())
+    on = editorial_blockers(article=article, claims={"claims": []}, sources=unrelated)
+    off = editorial_blockers(
+        article=article, claims={"claims": []}, sources=unrelated,
+        disabled={GUARD_UNSOURCED_FACT},
+    )
+    assert any("不支持" in b or "无来源" in b for b in on)
+    assert off == [], "关掉守卫应退回旧行为（无阻断），反证才成立"
+
+
+def test_no_conclusion_blocked(tmp_path):
+    """返修 2：第四条红线（无结论/行动/判断方法）→ 必须 revise。"""
+    home = make_home(tmp_path)
+    run_id = create_run(home)
+    article = "关于这个问题，有很多看法。"
+    version = write_article(home, run_id, article)
+    assert _write_artifact(home, run_id, "sources", _sources_empty())["ok"] is True
+    resp = _review(home, run_id, version)
+    assert resp["ok"] is True, resp
+    report = resp["data"]["report"]
+    assert report["decision"] == "revise"
+    assert report["publishable"] is False
+    assert any("结论" in b or "行动" in b or "判断方法" in b for b in report["blockers"])
+
+
+def test_no_conclusion_guard_off_fails(tmp_path):
+    """返修 2 反证：关掉 GUARD_NO_CONCLUSION 后，无结论正文应不再命中第四条红线。"""
+    article = "关于这个问题，有很多看法。"
+    on = editorial_blockers(article=article, claims={"claims": []}, sources={"sources": []})
+    off = editorial_blockers(
+        article=article, claims={"claims": []}, sources={"sources": []},
+        disabled={GUARD_NO_CONCLUSION},
+    )
+    assert any("结论" in b or "行动" in b or "判断方法" in b for b in on)
+    assert off == [], "关掉守卫应不再命中第四条红线，反证才成立"
 
 
 def test_clean_article_with_sources_passes(tmp_path):

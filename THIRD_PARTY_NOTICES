@@ -27,8 +27,11 @@
 | `references/visual-guide.md` | `wewrite-visual` |
 | `references/wechat-constraints.md` | `wewrite-publish` |
 
-其中 `pipeline-state.md` 因 CLI 引用改写而哈希不同于上游，已在 `skills/manifest.json` 登记改写后
-sha256 并注明「已按受控工具适配，语义与上游一致」；其余 8 个文件逐字保留，sha256 与上游同文件一致。
+9 份 `references/*.md` 的逐文件 sha256 已全部登记在 `skills/manifest.json` 的 `references`
+数组中（64 位小写十六进制真实值）。其中 `pipeline-state.md` 因 CLI 引用改写而哈希不同于上游，
+manifest 中以 `"adapted": true` + `"note": "已按受控工具适配，语义与上游一致（6 处 CLI 引用改为受控工具）"`
+标注；其余 8 个文件逐字保留、`"adapted": false`，sha256 与上游同文件一致。manifest 逐文件哈希与磁盘
+`sha256sum` 的一致性由 `tests/host/manifest-integrity.test.ts` 钉定。
 
 ### Python facade 复用来源（S2 起）
 

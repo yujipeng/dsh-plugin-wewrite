@@ -40,5 +40,53 @@
       "path": "wewrite-publish/SKILL.md",
       "sha256": "282453c90f93cec56b098bc7702d2831022271a2e29b1d25afc5f7c7dd095fe7"
     }
+  ],
+  "references": [
+    {
+      "path": "wewrite/references/pipeline-state.md",
+      "sha256": "fc55c4dab631d8a072336fd0c81e10c95909d5ab02c57ac35c197c7116e80828",
+      "adapted": true,
+      "note": "已按受控工具适配，语义与上游一致（6 处 CLI 引用改为受控工具）"
+    },
+    {
+      "path": "wewrite-topic/references/topic-selection.md",
+      "sha256": "8a021f79aa4e260135d517d374abe09ab8ac11af03394daff4549fa0e8f7ef80",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-write/references/article-brief.md",
+      "sha256": "564cb1f236f7c02dcd609440dd4335e43b92324c5a9a0eef4e24a2b3a232c9db",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-write/references/content-enhance.md",
+      "sha256": "cd85cf595aeb9376ca97203e638705147d893969bd9f6eefef71812155df84b0",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-write/references/editorial-quality.md",
+      "sha256": "31832c5c4ed014bb523d3cb48d6327492e0cc6a91ab64fe511c6c000f9054e96",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-write/references/frameworks-quick.md",
+      "sha256": "e06497ee2af03d9ef27064389af0534769842fce7376eb22dde307326d1776b1",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-review/references/seo-rules.md",
+      "sha256": "d01942ba8abf63a2d1cb52921780711c260865bc1c5de4fedd2accafaee6bbb1",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-visual/references/visual-guide.md",
+      "sha256": "30f8a71927a0d555ac9900b412a84369cf35e2819bb3eab50392a0677ff53ed0",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-publish/references/wechat-constraints.md",
+      "sha256": "7736bacc8d41a525f5536995944cb9a5528bf78bc29bd6566a9e77f8da1d7028",
+      "adapted": false
+    }
   ]
 }
