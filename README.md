@@ -5,7 +5,8 @@ DSH Web 工作台 WeWrite 插件（`dsh-plugin-wewrite`）。
 - S1：工程骨架与契约层（`src/shared/contract.ts` 全 RPC schema + 双端契约测试）。
 - S2：Python facade（`python/src/dsh_wewrite_facade/`，独立包名 `dsh-wewrite-facade`）。
 - S3：业务 RPC / Agent 工具 / skills 随包装载 / 工作台 UI。
-- S4（本阶段）：微信草稿推送双闸、逐篇确认与安全边界。
+- S4：微信草稿推送双闸、逐篇确认与安全边界。
+- 方案 A（本阶段）：接回上游编辑知识层（9 个 references + 3 个 skill 内容层 + 五维判据与红线）。
 
 ## 模块
 
@@ -18,7 +19,7 @@ DSH Web 工作台 WeWrite 插件（`dsh-plugin-wewrite`）。
 | `src/host/tools/index.ts` | 8 个受控 Agent 工具（`wewrite_push_draft` 属 S4 不注册）。 |
 | `src/host/skills-provider.ts` | 随包 skills Provider（`wewrite-python-bundle`，固定 manifest 加载，禁止目录扫描）。 |
 | `src/client/panels/` | 任务/选题/编辑器/审稿/设置面板，四态不白屏。 |
-| `skills/` | 6 个适配 skill（主 skill 接收已创建 run，不执行 run start/resume）。 |
+| `skills/` | 6 个 skill（主 skill 接收已创建 run，不执行 run start/resume）；`skills/**/references/*.md` 为上游编辑知识层（9 个文件）。 |
 | `python/` | facade：读面投影 / 写锁 / 路径安全 / 版本 CAS / binding 栅栏。 |
 
 ## 契约硬约束（已定死）

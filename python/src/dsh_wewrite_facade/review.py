@@ -11,7 +11,7 @@ import json
 from typing import Any
 
 from .errors import FacadeError, invalid_input, not_found
-from . import binding, projection, sanitize, storage
+from . import binding, editorial, projection, sanitize, storage
 
 
 def build_review(*, run_id: str, article_version: str | None, draft_version: str | None,
@@ -41,6 +41,29 @@ def build_review(*, run_id: str, article_version: str | None, draft_version: str
         report = _upstream(draft or article, article, assessment)
     except ValueError as exc:
         raise invalid_input(str(exc)) from exc
+
+    # 方案 A：编辑红线守卫——审稿伪 pass 拦截（不依赖模型自报分数）。
+    # 读 claims / sources / brief 的 personal_materials，判定四条「不可交付」红线；
+    # 命中即降级为 revise，并把红线条目并入 blockers，使 build_report 的 publishable 归 false。
+    claims_data = _read_yaml_artifact(run_id, "claims")
+    sources_data = _read_yaml_artifact(run_id, "sources")
+    brief_data = _read_yaml_artifact(run_id, "brief")
+    personal_available = None
+    brief_pm = brief_data.get("personal_materials") if isinstance(brief_data, dict) else None
+    if isinstance(brief_pm, dict) and isinstance(brief_pm.get("available"), bool):
+        personal_available = brief_pm.get("available")
+
+    red_lines = editorial.editorial_blockers(
+        article=article,
+        claims=claims_data,
+        sources=sources_data,
+        personal_materials_available=personal_available,
+    )
+    if red_lines:
+        report["decision"] = "revise"
+        report["publishable"] = False
+        report["blockers"] = list(dict.fromkeys([*(report.get("blockers") or []), *red_lines]))
+        report["red_lines"] = red_lines
 
     report["article_hash"] = article_actual
     report["draft_hash"] = draft_actual
@@ -77,6 +100,21 @@ def build_review(*, run_id: str, article_version: str | None, draft_version: str
         "reportVersion": report_version,
         "gate": gate,
     }
+
+
+def _read_yaml_artifact(run_id: str, kind: str) -> dict | None:
+    """只读解析 YAML 产物（claims/sources/brief）；缺失或损坏返回 None，不阻断审稿主链。"""
+    try:
+        content, _version = projection.read_artifact_content(run_id, kind)
+    except FacadeError:
+        return None
+    import yaml
+
+    try:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def render_preview(*, run_id: str, kind: str, expected_version: str | None, theme_id: str) -> dict[str, Any]:
