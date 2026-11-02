@@ -339,6 +339,12 @@ export class AgentWorkflow {
       `数据根: ${this.options.homeLabel}`,
       `主 skill: ${this.options.mainSkillName}`,
       `请按主 skill 的流程执行（run 已创建，不要执行 wewrite run start/resume）。`,
+      `产物填写顺序（定稿规则，editorial_schema 必须为 2）：`,
+      `1) 先定稿正文 article；回读 article 拿真实 version；`,
+      `2) 写 sources：每条 source 带 evidence.text（完整原文直引）、evidence.locator，evidence.sha256 可省略由服务端补齐；`,
+      `3) 写 brief：editorial_schema: 2，goal.takeaway 或 goal.action 至少一个非空，delivery.article_hash 用回读的真实 version，delivery.anchors 给每个非空声明一个正文精确锚点 article_span；`,
+      `4) 写 claims：editorial_schema: 2，article_hash 同上；每条 type=fact 的 claim 带 article_span（正文切片与 text 严格相等）、source_ids、evidence_refs（mode=verbatim，quote 必须等于整段 evidence.text）；blocks 按空行切块逐块覆盖全部正文（fact 块 claim_ids 非空，其它块 claim_ids 空）；`,
+      `5) 再调用 wewrite_review。审稿 pass 只证明「引用链与声明结构完整」，未验证语义与来源真实性；不要伪造 pass，不手写 review_report。`,
     ].join('\n');
   }
 }

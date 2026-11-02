@@ -123,9 +123,44 @@ def put_cover(home: Path, run_id: str) -> dict:
     return resp["data"]
 
 
+def _artifact_version(home: Path, run_id: str, kind: str) -> str | None:
+    """读产物字节哈希（测试进程内直读，仅用于构造测试夹具，不经过 facade）。"""
+    import hashlib
+    mapping = {
+        "article": "article.md", "draft": "draft.md", "brief": "brief.yaml",
+        "claims": "claims.yaml", "sources": "sources.yaml",
+    }
+    p = home / "runs" / run_id / mapping[kind]
+    if not p.exists():
+        return None
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
 def write_review(home: Path, run_id: str, article_version: str, publishable: bool = True) -> None:
-    """直接写 review-report.json（绑定 article_version 哈希），供 build_gate 判定。"""
+    """直接写 review-report.json（新格式：editorial_schema 2 + editorial_verdict + input_hashes）。
+
+    供 build_gate 判定；不含阻塞的结构项（items 全 supported），使 publishable 决定门禁。
+    """
     import json
+    input_hashes = {
+        "article": _artifact_version(home, run_id, "article"),
+        "draft": _artifact_version(home, run_id, "draft"),
+        "brief": _artifact_version(home, run_id, "brief"),
+        "claims": _artifact_version(home, run_id, "claims"),
+        "sources": _artifact_version(home, run_id, "sources"),
+    }
+    items = [
+        {"rule": "fabrication", "id": None, "state": "supported", "code": "FABRICATION_CLEAR",
+         "reason": "未发现编造亲历/采访/场景信号"},
+        {"rule": "delivery", "id": None, "state": "supported", "code": "DELIVERY_DECLARED_AND_PRESENT",
+         "reason": "已声明且已落正文；未验证语义质量"},
+        {"rule": "source_input", "id": None, "state": "supported", "code": "VERBATIM_CHAIN_VALID",
+         "reason": "claims/sources 为 schema 2 且正文哈希一致"},
+        {"rule": "source_fact", "id": None, "state": "supported", "code": "VERBATIM_CHAIN_VALID",
+         "reason": "无已声明事实，引用检查不适用"},
+        {"rule": "article_coverage", "id": None, "state": "supported", "code": "VERBATIM_CHAIN_VALID",
+         "reason": "正文覆盖完整"},
+    ]
     report = {
         "version": 1,
         "decision": "pass" if publishable else "revise",
@@ -135,12 +170,20 @@ def write_review(home: Path, run_id: str, article_version: str, publishable: boo
         "dimension_average": 5.0,
         "blockers": [],
         "major_issues": [],
-        "notes": "",
+        "notes": "守卫诊断：{\"version\": 1, \"scope\": \"引用链与声明结构校验，未验证语义与来源真实性\", \"items\": []}",
         "draft_chars": 3,
         "final_chars": 3,
         "edit_ratio": 0.0,
         "structure_changed": False,
         "article_hash": article_version,
+        "editorial_schema": 2,
+        "input_hashes": input_hashes,
+        "editorial_verdict": {
+            "version": 1,
+            "producer": "facade_editorial_guard",
+            "input_hashes": input_hashes,
+            "items": items,
+        },
     }
     (home / "runs" / run_id / "review-report.json").write_text(
         json.dumps(report, ensure_ascii=False), encoding="utf-8"

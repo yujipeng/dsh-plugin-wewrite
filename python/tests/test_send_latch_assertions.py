@@ -89,21 +89,20 @@ def test_article_write_run_busy_while_latched(latched_home):
     assert article_path.stat().st_size == before_bytes, "article.md 字节数变化"
 
 
-def test_sources_write_succeeds_while_latched(latched_home):
+def test_sources_write_run_busy_while_latched(latched_home):
     home, run_id = latched_home
-    # sources 有预建文件，需读当前版本。
+    # sources 现已纳入发送门闩（影响门禁的内容写需串行化）。
     get_resp = call_facade(str(home), "artifact.get", {"runId": run_id, "kind": "sources"})
     current_version = get_resp["data"]["version"]
-    new_content = "version: 2\nrun_id: r\nsources:\n  - id: s-new\n    title: 新来源\n"
+    new_content = "version: 2\neditorial_schema: 2\nsources: []\n"
 
     resp = _run_with_latch(home, run_id, lambda: _write_artifact(home, run_id, "sources", new_content, current_version))
 
-    assert resp["ok"] is True, resp  # 必须成功，不是「不是 RUN_BUSY」
-    get2 = call_facade(str(home), "artifact.get", {"runId": run_id, "kind": "sources"})
-    assert get2["data"]["content"] == new_content
+    assert resp["ok"] is False, resp
+    assert resp["error"]["code"] == "RUN_BUSY", resp
 
 
-def test_review_report_write_run_busy_while_latched(latched_home):
+def test_review_report_write_forbidden_while_latched(latched_home):
     home, run_id = latched_home
     run_dir = home / "runs" / run_id
     report_path = run_dir / "review-report.json"
@@ -114,7 +113,7 @@ def test_review_report_write_run_busy_while_latched(latched_home):
     resp = _run_with_latch(home, run_id, lambda: _write_artifact(home, run_id, "review_report", '{"version": 1, "decision": "revise", "publishable": false}', None))
 
     assert resp["ok"] is False, resp
-    assert resp["error"]["code"] == "RUN_BUSY", resp
+    assert resp["error"]["code"] == "FORBIDDEN", resp
     assert _sha(str(report_path)) == before_sha, "review-report.json 被改写"
 
 
@@ -154,7 +153,7 @@ def test_reverse_wrongly_latching_sources_fails(monkeypatch, latched_home):
     from dsh_wewrite_facade import service
 
     monkeypatch.setattr(service, "_SEND_LATCHED_KINDS",
-                        frozenset({"article", "draft", "review_report", "sources"}))
+                        frozenset({"article", "draft", "brief", "claims", "sources"}))
 
     def run_in_process():
         from dsh_wewrite_facade import service as svc

@@ -1,44 +1,92 @@
 {
   "version": 1,
   "provider": "wewrite-python-bundle",
-  "sourceRevision": "wewrite@220db1dcf141d92c03ddb704628a774ecd2b79f7",
-  "sourceHash": "220db1dcf141d92c03ddb704628a774ecd2b79f7",
+  "sourceRevision": "imraywang/wewrite@2860fbe958311fcc04009d8132908989e43e6eaa",
+  "sourceHash": "2860fbe958311fcc04009d8132908989e43e6eaa",
   "skills": [
     {
       "name": "wewrite",
       "description": "WeWrite 一键写作主流程：接收已创建 run，按 topic/write/review 步骤产出 brief/claims/draft/article/report，审稿通过才 ready",
       "path": "wewrite/SKILL.md",
-      "sha256": "main-skill"
+      "sha256": "0ab39f62866227715f1d32be5ad746859ba727579920fa83d4a38b3c30485b9f"
     },
     {
       "name": "wewrite-topic",
-      "description": "选题与主题构思（从热榜与主题目录中选题并确定写作角度）",
+      "description": "选题与主题构思（从工作台热榜与主题目录中选题，按 topic-selection 规则评分并确定写作角度）",
       "path": "wewrite-topic/SKILL.md",
-      "sha256": "topic"
+      "sha256": "bbfd8de4d65b0f1fbe151225e5b9abb56bfc8a7cbaedc764e629dfa1dbc0b1ad"
     },
     {
       "name": "wewrite-write",
-      "description": "正文写作流程（brief → claims → draft → article，全部经 wewrite_artifact_write 落盘）",
+      "description": "正文写作流程（brief → claims → draft → article，全部经 wewrite_artifact_write 落盘，含任务书、主张与证据、素材与初稿）",
       "path": "wewrite-write/SKILL.md",
-      "sha256": "write"
+      "sha256": "d631bef9e712e27b9c20c1b288beccc53a0895769506bf484b692ea1b24ad406"
     },
     {
       "name": "wewrite-review",
-      "description": "审稿流程（五维评估 → wewrite_review → 通过后 wewrite_run_finish）",
+      "description": "审稿流程（五维评估 → wewrite_review → 通过后 wewrite_run_finish，含事实核对、改稿与成稿门禁）",
       "path": "wewrite-review/SKILL.md",
-      "sha256": "review"
+      "sha256": "9f5b9caecd1bdacef8453f734f91d825e4aff152142849a73bf45c228ce00145"
     },
     {
       "name": "wewrite-visual",
-      "description": "可选视觉流程（默认 visualMode=none，不启用）",
+      "description": "可选视觉流程（默认 visualMode=none；cover/full/prompts 按需启用，生成封面与内文配图或只交付提示词）",
       "path": "wewrite-visual/SKILL.md",
-      "sha256": "visual"
+      "sha256": "9d6852819883d8b282b44c2f88d52415d9008b3184eb76eed01fc46cc4ab02c0"
     },
     {
       "name": "wewrite-publish",
-      "description": "预览与请求草稿推送（S3 只到预览 + 预检 + 发请求，不真实推送到微信）",
+      "description": "预览与请求草稿推送（本地预览 + 预检 + 逐篇确认请求；不真实推送到微信）",
       "path": "wewrite-publish/SKILL.md",
-      "sha256": "publish"
+      "sha256": "282453c90f93cec56b098bc7702d2831022271a2e29b1d25afc5f7c7dd095fe7"
+    }
+  ],
+  "references": [
+    {
+      "path": "wewrite/references/pipeline-state.md",
+      "sha256": "fc55c4dab631d8a072336fd0c81e10c95909d5ab02c57ac35c197c7116e80828",
+      "adapted": true,
+      "note": "已按受控工具适配，语义与上游一致（6 处 CLI 引用改为受控工具）"
+    },
+    {
+      "path": "wewrite-topic/references/topic-selection.md",
+      "sha256": "8a021f79aa4e260135d517d374abe09ab8ac11af03394daff4549fa0e8f7ef80",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-write/references/article-brief.md",
+      "sha256": "564cb1f236f7c02dcd609440dd4335e43b92324c5a9a0eef4e24a2b3a232c9db",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-write/references/content-enhance.md",
+      "sha256": "cd85cf595aeb9376ca97203e638705147d893969bd9f6eefef71812155df84b0",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-write/references/editorial-quality.md",
+      "sha256": "31832c5c4ed014bb523d3cb48d6327492e0cc6a91ab64fe511c6c000f9054e96",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-write/references/frameworks-quick.md",
+      "sha256": "e06497ee2af03d9ef27064389af0534769842fce7376eb22dde307326d1776b1",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-review/references/seo-rules.md",
+      "sha256": "d01942ba8abf63a2d1cb52921780711c260865bc1c5de4fedd2accafaee6bbb1",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-visual/references/visual-guide.md",
+      "sha256": "30f8a71927a0d555ac9900b412a84369cf35e2819bb3eab50392a0677ff53ed0",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-publish/references/wechat-constraints.md",
+      "sha256": "7736bacc8d41a525f5536995944cb9a5528bf78bc29bd6566a9e77f8da1d7028",
+      "adapted": false
     }
   ]
 }

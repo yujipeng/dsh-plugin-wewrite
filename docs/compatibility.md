@@ -32,9 +32,10 @@
 
 - 能力探测逐项检查 `connection.rpc` / `skills` / `agents` / `approval` / `effect`。
 - 缺失项进入诊断快照（`snapshot` 的 `diagnostics`），并写宿主日志，**不是静默失败**。
-- 首版能力面：`read` 可用（snapshot 最小诊断版）；`write`/`preview`/`push` 明确标不可用，属后续 stage。
+- 当前能力面（S1–S4 已完成）：`read`/`write`/`agent`/`skills`/`preview`/`push` 均已实现；
+  其中 `push` 默认 `publishTransport: fake`（dry-run），真实微信推送需用户单次批准后核对。
 
-## 已知边界（S1）
+## 已知边界
 
-- 不实现业务 RPC（除 `snapshot` 最小诊断版）、不实现 Python facade、不做 UI 面板、不做推送。
-- 不修改 `yujipeng/wewrite` 与 `jerryjiao/dsh-wewrite`。
+- 微信推送逐篇由用户确认；不包含自动群发；不含 `freepublish` / `mass/send`。
+- 不修改 `yujipeng/wewrite`、`imraywang/wewrite` 与 `jerryjiao/dsh-wewrite`。

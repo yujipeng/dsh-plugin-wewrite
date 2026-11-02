@@ -12,6 +12,27 @@
 - 用途：本插件的设计以该仓库为业务真源。当前 S1 阶段仅记录来源契约（runId 形态、状态/产物、错误码等），
   后续 stage 的 Python facade 将以独立包名 `dsh_wewrite_facade` 复用其公开方法，不修改上游、不放残缺遮蔽包。
 
+### 编辑知识层 references（方案 A，来源 imraywang/wewrite）
+
+`skills/**/references/*.md`（9 个文件，共 855 行）编辑方法论与事实核查纪律逐字保留自上游
+`https://github.com/imraywang/wewrite`，锁定修订 `2860fbe958311fcc04009d8132908989e43e6eaa`
+（版本 4.2.1，MIT License）：
+
+| 文件 | 归属 skill |
+|---|---|
+| `references/pipeline-state.md` | `wewrite`（CLI 引用已按受控工具适配，结构/字段/生命周期语义与上游一致） |
+| `references/topic-selection.md` | `wewrite-topic` |
+| `references/article-brief.md` / `content-enhance.md` / `editorial-quality.md` / `frameworks-quick.md` | `wewrite-write` |
+| `references/seo-rules.md` | `wewrite-review` |
+| `references/visual-guide.md` | `wewrite-visual` |
+| `references/wechat-constraints.md` | `wewrite-publish` |
+
+9 份 `references/*.md` 的逐文件 sha256 已全部登记在 `skills/manifest.json` 的 `references`
+数组中（64 位小写十六进制真实值）。其中 `pipeline-state.md` 因 CLI 引用改写而哈希不同于上游，
+manifest 中以 `"adapted": true` + `"note": "已按受控工具适配，语义与上游一致（6 处 CLI 引用改为受控工具）"`
+标注；其余 8 个文件逐字保留、`"adapted": false`，sha256 与上游同文件一致。manifest 逐文件哈希与磁盘
+`sha256sum` 的一致性由 `tests/host/manifest-integrity.test.ts` 钉定。
+
 ### Python facade 复用来源（S2 起）
 
 `python/src/dsh_wewrite_facade/` 是独立包名 `dsh-wewrite-facade` 的受控通道，运行时依赖固定版本

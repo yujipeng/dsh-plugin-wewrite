@@ -225,11 +225,30 @@ def _editable(state: dict) -> bool:
     return status not in ("completed", "unreadable")
 
 
+def _artifact_hash(run_id: str, kind: str) -> str | None:
+    """只读取产物字节哈希；缺失返回 None。"""
+    try:
+        fd, _st = paths.open_artifact(run_id, kind)
+    except FacadeError:
+        return None
+    with os.fdopen(fd, "rb") as f:
+        return _sha256(f.read())
+
+
+def _report_gate_failure(article_version: str, report_version: str, code: str, message: str) -> dict[str, Any]:
+    return {
+        "publishable": False,
+        "issues": [{"code": code, "message": message, "blocking": True}],
+        "articleVersion": article_version,
+        "reportVersion": report_version,
+    }
+
+
 def build_gate(state: dict, run_id: str) -> dict[str, Any] | None:
     """从 state 与 review_report 投影 Gate；未审稿或审稿失效返回 None。
 
-    除审稿文件的 publishable 外，还必须核对审稿绑定的正文哈希与当前正文哈希一致，
-    不一致即不展示 pass（正文已更新、旧审稿未删、journal 未提交 → 不返回 pass）。
+    §6/§9 定稿：除正文哈希外，还要核对 brief/claims/sources/draft 五份输入哈希
+    与 editorial_verdict 完整性。任一变化或旧报告缺记录 → 门禁失效，要求重审。
     """
     from . import storage
     storage.check_no_pending_transaction(run_id)
@@ -252,43 +271,57 @@ def build_gate(state: dict, run_id: str) -> dict[str, Any] | None:
         return None
 
     # 当前正文哈希。
-    article_version = None
-    try:
-        fd2, _st2 = paths.open_artifact(run_id, "article")
-    except FacadeError as exc:
-        if exc.code != "NOT_FOUND":
-            raise
-        # GateSchema.articleVersion 必须是真实哈希；无正文时返回业务失败，禁止伪造。
-        raise FacadeError("ARTIFACT_MISSING", "缺少正文，无法验证审稿绑定") from exc
-    else:
-        with os.fdopen(fd2, "rb") as f2:
-            article_version = _sha256(f2.read())
+    article_version = _artifact_hash(run_id, "article")
+    if article_version is None:
+        raise FacadeError("ARTIFACT_MISSING", "缺少正文，无法验证审稿绑定")
 
-    # 审稿绑定的正文哈希（report.article_hash 或 report.articleVersion）。
-    bound_hash = report.get("article_hash", report.get("articleVersion"))
-    if not isinstance(bound_hash, str) or len(bound_hash) != 64 or any(c not in "0123456789abcdef" for c in bound_hash):
-        return {
-            "publishable": False,
-            "issues": [{"code": "REVIEW_BINDING_MISSING", "message": "审稿缺少有效正文绑定，需要重新审稿", "blocking": True}],
-            "articleVersion": article_version,
-            "reportVersion": report_version,
-        }
-    if bound_hash != article_version:
-        # 正文已更新、旧审稿未删：审稿失效，不展示 pass。
-        return {
-            "publishable": False,
-            "issues": [
-                {"code": "REVIEW_REQUIRED", "message": "正文已更新，需要重新审稿", "blocking": True}
-            ],
-            "articleVersion": article_version,
-            "reportVersion": report_version,
-        }
+    # 旧报告：无 editorial_verdict / input_hashes / editorial_schema 即不可发布。
+    verdict = report.get("editorial_verdict")
+    input_hashes = report.get("input_hashes")
+    if not isinstance(verdict, dict) or not isinstance(input_hashes, dict):
+        return _report_gate_failure(
+            article_version, report_version, "REVIEW_BINDING_MISSING",
+            "审稿缺少结构校验记录（旧格式），需重新审稿")
+    if report.get("editorial_schema") != 2:
+        return _report_gate_failure(
+            article_version, report_version, "REVIEW_BINDING_MISSING",
+            "审稿报告为旧格式，需重新审稿")
+
+    # 五份输入哈希逐一核对。
+    for kind in ("article", "draft", "brief", "claims", "sources"):
+        current = _artifact_hash(run_id, kind)
+        bound = input_hashes.get(kind)
+        if current != bound:
+            return _report_gate_failure(
+                article_version, report_version, "REVIEW_REQUIRED",
+                f"{kind} 已变化或审稿记录过期，需要重新审稿")
+
+    # verdict 完整性：producer/version/items 齐全，且无 unknown/unsupported。
+    if verdict.get("producer") != "facade_editorial_guard" or verdict.get("version") != 1:
+        return _report_gate_failure(
+            article_version, report_version, "REVIEW_BINDING_MISSING",
+            "审稿结构校验记录不完整，需重新审稿")
+    items = verdict.get("items")
+    if not isinstance(items, list):
+        return _report_gate_failure(
+            article_version, report_version, "REVIEW_BINDING_MISSING",
+            "审稿结构校验记录不完整，需重新审稿")
+    for item in items:
+        if isinstance(item, dict) and item.get("state") in ("unknown", "unsupported"):
+            return _report_gate_failure(
+                article_version, report_version, "REVIEW_REQUIRED",
+                "存在未通过的结构校验项，需重新审稿")
+    # verdict 的 input_hashes 必须与顶层一致。
+    if verdict.get("input_hashes") != input_hashes:
+        return _report_gate_failure(
+            article_version, report_version, "REVIEW_BINDING_MISSING",
+            "审稿结构校验记录输入哈希不一致，需重新审稿")
 
     publishable = report.get("publishable") is True
     issues = [
         {"code": "REVIEW_REQUIRED", "message": "需要先完成审稿", "blocking": True}
         if not publishable
-        else {"code": "REVIEW_PASSED", "message": "审稿通过", "blocking": False}
+        else {"code": "REVIEW_PASSED", "message": "结构审稿通过，语义及来源真实性仍需核验", "blocking": False}
     ]
     return {
         "publishable": publishable,
