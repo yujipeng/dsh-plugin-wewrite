@@ -60,6 +60,8 @@ _FABRICATED_MARKERS = (
 
 _FACT_TYPE = "fact"
 _BLOCK_KINDS = ("fact", "opinion", "other")
+_CLAIM_TYPES = ("fact", "inference", "opinion", "user_experience")
+_SOURCE_STATUSES = ("verified", "unverified", "user_provided")
 
 
 def _as_list(value: Any) -> list:
@@ -183,6 +185,153 @@ def _source_supported(entry: dict) -> tuple[bool, str | None]:
     if not isinstance(locator, str) or not locator:
         return False, "EVIDENCE_REFERENCE_INVALID"
     return True, None
+
+
+def validate_editorial_inputs(claims: dict, sources: dict) -> list[str]:
+    """统一严格输入校验（§3.1/§3.3）：结构/类型/唯一性/引用双向闭合。
+
+    返回错误列表；空列表表示输入合法。任何一处不合规即 unknown + EVIDENCE_INPUT_REQUIRED，
+    由调用方终止后续判定。不做静默降级，不按 id 覆盖，枚举正向匹配之外拒绝未知值。
+    """
+    errors: list[str] = []
+
+    # ── claims 顶层 ──────────────────────────────────────────────────────────
+    if not isinstance(claims, dict):
+        return ["claims 必须是 YAML 对象"]
+    if claims.get("editorial_schema") != EDITORIAL_SCHEMA:
+        return ["claims 缺少 editorial_schema: 2 或为旧格式"]
+    if not isinstance(claims.get("article_hash"), str) or not re.fullmatch(r"[a-f0-9]{64}", claims["article_hash"]):
+        errors.append("claims.article_hash 缺失或不是 64 位哈希")
+
+    claim_list = claims.get("claims")
+    if not isinstance(claim_list, list):
+        errors.append("claims.claims 必须是数组")
+        claim_list = []
+
+    # claim id 唯一 + 类型/字段校验。
+    claim_ids: set[str] = set()
+    for c in claim_list:
+        if not isinstance(c, dict):
+            errors.append("claims.claims 存在非对象条目")
+            continue
+        cid = c.get("id")
+        if not isinstance(cid, str) or not cid:
+            errors.append("claim 缺少合法 id")
+            continue
+        if cid in claim_ids:
+            errors.append(f"claim id 重复：{cid}")
+        claim_ids.add(cid)
+        ctype = c.get("type")
+        if ctype not in _CLAIM_TYPES:
+            errors.append(f"claim {cid} 的 type 非法：{ctype}")
+        if not isinstance(c.get("text"), str) or not c["text"]:
+            errors.append(f"claim {cid} 缺少 text")
+        if not _is_span_valid(c.get("article_span")):
+            errors.append(f"claim {cid} 的 article_span 非法")
+
+    # blocks 顶层。
+    blocks = claims.get("blocks")
+    if not isinstance(blocks, list):
+        errors.append("claims.blocks 必须是数组")
+        blocks = []
+
+    block_kinds_seen: set[str] = set()
+    for b in blocks:
+        if not isinstance(b, dict):
+            errors.append("claims.blocks 存在非对象条目")
+            continue
+        kind = b.get("kind")
+        if kind not in _BLOCK_KINDS:
+            errors.append(f"block 的 kind 非法：{kind}")
+        else:
+            block_kinds_seen.add(kind)
+        if not _is_span_valid(b.get("article_span")):
+            errors.append("block 的 article_span 非法")
+        cids = b.get("claim_ids")
+        if not isinstance(cids, list):
+            errors.append("block 的 claim_ids 必须是数组")
+
+    # ── sources 顶层 ─────────────────────────────────────────────────────────
+    if not isinstance(sources, dict):
+        return errors + ["sources 必须是 YAML 对象"]
+    if sources.get("editorial_schema") != EDITORIAL_SCHEMA:
+        return errors + ["sources 缺少 editorial_schema: 2 或为旧格式"]
+
+    source_list = sources.get("sources")
+    if not isinstance(source_list, list):
+        return errors + ["sources.sources 必须是数组"]
+        source_list = []
+
+    # 来源 id 唯一 + status 枚举 + evidence 字段。
+    source_ids: set[str] = set()
+    for s in source_list:
+        if not isinstance(s, dict):
+            errors.append("sources.sources 存在非对象条目")
+            continue
+        sid = s.get("id")
+        if not isinstance(sid, str) or not sid:
+            errors.append("source 缺少合法 id")
+            continue
+        if sid in source_ids:
+            errors.append(f"source id 重复：{sid}")
+        source_ids.add(sid)
+        if s.get("status") not in _SOURCE_STATUSES:
+            errors.append(f"source {sid} 的 status 非法：{s.get('status')}")
+        evidence = s.get("evidence")
+        if not isinstance(evidence, dict):
+            errors.append(f"source {sid} 缺少 evidence")
+            continue
+        if not isinstance(evidence.get("text"), str) or not evidence["text"]:
+            errors.append(f"source {sid} 的 evidence.text 缺失")
+        if not isinstance(evidence.get("locator"), str) or not evidence["locator"]:
+            errors.append(f"source {sid} 的 evidence.locator 缺失")
+        sha = evidence.get("sha256")
+        if not isinstance(sha, str) or not re.fullmatch(r"[a-f0-9]{64}", sha):
+            errors.append(f"source {sid} 的 evidence.sha256 非法")
+        elif sha != _sha256(evidence["text"]):
+            errors.append(f"source {sid} 的 evidence.sha256 与 text 不一致")
+
+    # ── 引用双向闭合（每条 fact 的 source_ids ↔ evidence_refs 严格一一对应）───
+    for c in claim_list:
+        if not isinstance(c, dict):
+            continue
+        if c.get("type") != _FACT_TYPE:
+            continue
+        cid = c.get("id")
+        source_ids_of_claim = c.get("source_ids")
+        evidence_refs = c.get("evidence_refs")
+        if not isinstance(source_ids_of_claim, list) or not isinstance(evidence_refs, list):
+            errors.append(f"fact 主张 {cid} 的 source_ids/evidence_refs 必须是数组")
+            continue
+
+        # source_ids 重复。
+        if len(source_ids_of_claim) != len(set(source_ids_of_claim)):
+            errors.append(f"fact 主张 {cid} 的 source_ids 存在重复")
+
+        # evidence_refs 的 source_id 重复。
+        ref_sids = [r.get("source_id") for r in evidence_refs if isinstance(r, dict)]
+        if len(ref_sids) != len(set(ref_sids)):
+            errors.append(f"fact 主张 {cid} 的 evidence_refs 存在重复 source_id")
+
+        # 双向一一对应：source_ids 与 refs 的 source_id 集合必须完全相等。
+        ref_sid_set = set(ref_sids)
+        sid_set = set(source_ids_of_claim)
+        if sid_set != ref_sid_set:
+            errors.append(f"fact 主张 {cid} 的 source_ids 与 evidence_refs 不一一对应（悬空或多出引用）")
+
+        # 每个 ref 必须 mode=verbatim + quote 非空。
+        for r in evidence_refs:
+            if not isinstance(r, dict):
+                errors.append(f"fact 主张 {cid} 存在非法 evidence_ref")
+                continue
+            if r.get("mode") != "verbatim":
+                errors.append(f"fact 主张 {cid} 的 evidence_ref mode 非法")
+            if not isinstance(r.get("quote"), str) or not r["quote"]:
+                errors.append(f"fact 主张 {cid} 的 evidence_ref quote 缺失")
+            if not isinstance(r.get("evidence_sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", r["evidence_sha256"]):
+                errors.append(f"fact 主张 {cid} 的 evidence_ref evidence_sha256 非法")
+
+    return errors
 
 
 def _fact_source_state(
@@ -323,6 +472,14 @@ def compute_verdict(
     claims_data = claims if isinstance(claims, dict) else {}
     sources_data = sources if isinstance(sources, dict) else {}
     brief_data = brief if isinstance(brief, dict) else {}
+
+    # §3.1/§3.3 统一严格输入校验：任何不合规 → unknown + EVIDENCE_INPUT_REQUIRED 并终止。
+    input_errors = validate_editorial_inputs(claims_data, sources_data)
+    if input_errors:
+        items.append({"rule": "source_input", "id": None, "state": UNKNOWN,
+                      "code": "EVIDENCE_INPUT_REQUIRED",
+                      "reason": "；".join(input_errors[:5])})
+        return {"items": items}
 
     # 红线一：编造亲历。
     fstate, fcode, freason = _fabrication_state(article, personal_materials_available)
