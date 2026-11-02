@@ -1,106 +1,66 @@
-"""编辑红线守卫（方案 A 返修 3）：审稿时按 editorial-quality.md 的「不可交付」红线做确定性拦截。
+"""编辑红线守卫（方案 A 定稿设计 v2）：确定性结构校验，替代文本/词表启发式。
 
-判定方向（按项目编排裁决，不再依赖宽泛关键词表）：
-- 来源支持 = 断言要素被覆盖：数字/量级要素必须逐一被来源覆盖（同一数值 + 主体词一致），
-  非数字事实断言要求来源覆盖断言主干（主体 + 谓述核心词）；数值不一致 / 主体不一致 /
-  来源无该数值，一律判「来源不支持」，fail-closed。
-- 第四条红线 = 明确结论必须存在：结尾区必须出现真正的结论句（结论动词 + 具体主张），
-  空泛收尾命中时不再被普通正向词豁免；无法识别明确结论时判 revise。
-- blocker 写清「哪条断言、缺哪个要素、哪条来源不覆盖」，便于复验核对。
+- 来源支持 = 原文直引可验证子集：claim.text 与 evidence.text 严格相等，证据哈希一致，
+  定位合法，正文覆盖完整。不做相似度、要素三元组或极性判断。
+- 第四条红线 = 明确结论声明存在且落正文（takeaway/action 显式声明 + 正文精确锚点）。
+- 三态：supported / unsupported / unknown。unknown 与 unsupported 一律阻断，
+  不因任何一条 supported 抵消。
+- 红线一（编造亲历/采访/场景）沿用现状。
 
-不替代模型编辑判断，只做「伪 pass 拦截」。判定基于产物文本与来源账本（sources.yaml）、
-主张清单（claims.yaml）与任务书（brief.yaml 的 personal_materials.available），不依赖模型自评分数。
+产物内容契约（editorial_schema: 2）：
+- sources 每项新增 evidence.text / evidence.sha256 / evidence.locator。
+- claims 新增 article_hash、每条 fact 的 article_span 与 evidence_refs，以及 blocks 覆盖清单。
+- brief 新增 delivery.article_hash 与 delivery.anchors。
+
+本模块只产生内部判定项（verdict items），不写盘、不读文件系统。
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable
+from typing import Any
 
-# 四条红线的开关名（保留给反证/调试，缺省全部开启）。
-GUARD_FABRICATION = "fabrication"
-GUARD_UNSOURCED_FACT = "unsourced_fact"
-GUARD_DISCONNECT = "disconnect"
-GUARD_NO_CONCLUSION = "no_conclusion"
-GUARD_NAMES = (GUARD_FABRICATION, GUARD_UNSOURCED_FACT, GUARD_DISCONNECT, GUARD_NO_CONCLUSION)
+# ── 三态 ────────────────────────────────────────────────────────────────────
+SUPPORTED = "supported"
+UNSUPPORTED = "unsupported"
+UNKNOWN = "unknown"
 
-# ── 红线一：编造亲历/采访/场景 ──────────────────────────────────────────────
+# 诊断键（全部守卫诊断键，供模型文本清洗用）。
+DIAGNOSTIC_CODES = (
+    "EVIDENCE_INPUT_REQUIRED",
+    "CLAIM_LOCATION_INVALID",
+    "EVIDENCE_REFERENCE_INVALID",
+    "VERBATIM_QUOTE_MISMATCH",
+    "VERBATIM_CLAIM_MISMATCH",
+    "VERBATIM_CHAIN_VALID",
+    "ARTICLE_COVERAGE_REQUIRED",
+    "DELIVERY_DECLARATION_REQUIRED",
+    "DELIVERY_LOCATION_INVALID",
+    "DELIVERY_TEXT_MISMATCH",
+    "DELIVERY_DECLARED_AND_PRESENT",
+    "FABRICATED_PERSONAL_EXPERIENCE",
+    "FABRICATION_CLEAR",
+)
+
+# 模型自由文本清洗保留词（含诊断键 + 结构字段名 + 前缀）。
+RESERVED_TOKENS = frozenset(DIAGNOSTIC_CODES) | frozenset({
+    "editorial_verdict",
+    "facade_editorial_guard",
+    "守卫诊断",
+})
+
+EDITORIAL_SCHEMA = 2
+
+# 红线一：编造亲历/采访/场景的显式信号。
 _FABRICATED_MARKERS = (
-    "采访了",
-    "我采访",
-    "接受采访",
-    "我的朋友",
-    "我的同事",
-    "我朋友",
-    "我同事",
-    "我的邻居",
-    "我的同学",
-    "亲历",
-    "我亲",
-    "亲眼",
-    "我见过",
-    "我遇到过",
-    "那天我",
-    "上周我",
-    "上个月我",
-    "昨天我",
-    "我参加",
-    "我所在",
-    "我们公司",
-    "我们团队",
-)
-
-# ── 红线二/三：核心具体事实与来源对应 ──────────────────────────────────────
-# 具体事实的显式信号（数字/百分比/引用/研究/数据/统计/调查/报道）。
-_FACT_MARKERS = (
-    "研究表明",
-    "研究显示",
-    "数据表明",
-    "数据显示",
-    "据统计",
-    "调查显示",
-    "调查发现",
-    "报告显示",
-    "报告指出",
-    "官方数据显示",
-    "实验证明",
-    "测评显示",
-)
-
-# 数字 + 量级单位（要求逐一被来源覆盖）。
-_NUMBER_UNIT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(%|％|倍|成|个百分点)")
-_ALNUM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._%\-]*")
-
-# 常见实物名词（用于从数字后提取主体词；命中即返回，未命中回退为相邻 CJK 两字）。
-_SUBJECT_NOUNS = (
-    "用户", "读者", "消费者", "受访者", "人群", "企业", "公司", "学生", "家长",
-    "员工", "网民", "客户", "商户", "开发者", "教师", "医生", "患者", "车主",
-    "购房者", "求职者", "投资人", "商家",
-)
-
-# 谓述比对时剔除的虚词/功能字。
-_FUNCTION_CHARS = set("的了是在对有与和之地得吗呢么又很也就还着过把被让等个些这那们及而或可会")
-
-# 空泛收尾信号（红线四的 fail 信号）。
-_HEDGE_PHRASES = (
-    "莫衷一是", "无法给出答案", "无法给出", "留待以后", "以后再", "以后再谈",
-    "争议不断", "孰是孰非", "有很多看法", "尚无定论", "暂无定论", "没有定论",
-    "见仁见智", "众说纷纭", "众说纷", "看法不一", "各有各的", "不好说",
-    "难以判断", "自行判断", "留待", "暂且无法", "尚需观察", "待观察",
-    "未有定论", "未有结论",
-)
-
-# 明确结论信号（结论动词 + 具体主张）；不再包含「可以/判断/方法/需要/首先/其次」等宽泛词。
-_STRONG_CONCLUSION_MARKERS = (
-    "结论是", "我的结论", "本文结论", "得出结论", "综上", "总之", "因此", "所以",
-    "建议", "应该", "取决于", "关键在于", "核心是", "最重要的是", "我认为",
-    "我的判断", "判断是", "答案是", "推荐", "应当",
+    "采访了", "我采访", "接受采访", "我的朋友", "我的同事", "我朋友", "我同事",
+    "我的邻居", "我的同学", "亲历", "我亲", "亲眼", "我见过", "我遇到过",
+    "那天我", "上周我", "上个月我", "昨天我", "我参加", "我所在", "我们公司", "我们团队",
 )
 
 _FACT_TYPE = "fact"
+_BLOCK_KINDS = ("fact", "opinion", "other")
 
-
-# ── 工具函数 ────────────────────────────────────────────────────────────────
 
 def _as_list(value: Any) -> list:
     return value if isinstance(value, list) else []
@@ -110,232 +70,409 @@ def _as_dict(value: Any) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _num_key(num: str):
-    """数值归一化：同一数值（90 / 90.0）视为相等；文本回退按字符串。"""
-    try:
-        return float(num)
-    except (TypeError, ValueError):
-        return num
+def _as_str(value: Any) -> str:
+    return value if isinstance(value, str) else ""
 
 
-def _subject_after(text: str, pos: int) -> str:
-    """从数字+单位之后提取主体词：优先命中常见实物名词，否则回退相邻 CJK 两字。"""
-    tail = text[pos:pos + 24]
-    for noun in sorted(_SUBJECT_NOUNS, key=len, reverse=True):
-        if noun in tail:
-            return noun
-    m = re.match(r"[\s的之其中受访者人群]*([\u4e00-\u9fff]{2})", tail)
-    return m.group(1) if m else ""
+def _sha256(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _number_elements(text: str) -> list[dict[str, str]]:
-    """抽取 (num, unit, subject) 三元组。"""
-    elems: list[dict[str, str]] = []
-    for m in _NUMBER_UNIT_RE.finditer(text):
-        elems.append({
-            "num": m.group(1),
-            "unit": m.group(2),
-            "subject": _subject_after(text, m.end()),
-        })
-    return elems
+def _is_span_valid(span: Any) -> bool:
+    if not isinstance(span, dict):
+        return False
+    start = span.get("start")
+    end = span.get("end")
+    if isinstance(start, bool) or isinstance(end, bool):
+        return False
+    if not isinstance(start, int) or not isinstance(end, int):
+        return False
+    return start >= 0 and end > start
 
 
-def _content_bigrams(text: str) -> set[str]:
-    """抽取用于谓述比对的内容 bigram（剔除虚词/功能字）+ 字母数字 token。"""
-    cleaned = re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)
-    bigrams: set[str] = set()
-    cjk = re.findall(r"[\u4e00-\u9fff]", cleaned)
-    for i in range(len(cjk) - 1):
-        a, b = cjk[i], cjk[i + 1]
-        if a in _FUNCTION_CHARS or b in _FUNCTION_CHARS:
-            continue
-        bigrams.add(a + b)
-    for t in _ALNUM_RE.findall(text):
-        t = t.lower()
-        if len(t) >= 2:
-            bigrams.add(t)
-    return bigrams
+def _slice_of(article: str, span: dict[str, Any]) -> str | None:
+    if not _is_span_valid(span):
+        return None
+    start = span["start"]
+    end = span["end"]
+    if start < 0 or end > len(article) or end <= start:
+        return None
+    return article[start:end]
 
 
-def _assertion_subject(text: str) -> str:
-    for noun in sorted(_SUBJECT_NOUNS, key=len, reverse=True):
-        if noun in text:
-            return noun
-    return ""
+# ── 正文切块（按空行；码点零基左闭右开）──────────────────────────────────────
 
+def split_blocks(article: str) -> list[dict[str, Any]]:
+    """按空行把正文切成连续非空块，返回 [{text,start,end}, ...]。
 
-def _fact_assertion_segments(article: str) -> list[str]:
-    """拆分正文，返回含具体事实/数字断言的句子片段。"""
-    sentences = re.split(r"[。！？!?\n]+", article)
-    segments: list[str] = []
-    for s in sentences:
-        s = s.strip()
-        if not s:
-            continue
-        if any(marker in s for marker in _FACT_MARKERS) or _NUMBER_UNIT_RE.search(s):
-            segments.append(s)
-    return segments
-
-
-def _assertion_supported(assertion: str, source_text: str) -> tuple[bool, str | None]:
-    """判断一条事实断言是否被单个来源支持。返回 (supported, reason)。
-
-    数字/量级要素逐一核对：同一数值 + 同一单位 + 主体词一致（主体需出现在来源文本）。
-    非数字断言：主体必须出现在来源，且谓述内容 bigram 至少共享 2 个。
+    - 空行 = 去掉该行空白后为空的行（识别 LF 与 CRLF）；连续空行都是分隔符。
+    - 块起止去掉首尾 Unicode 空白，内部原样保留；跨度按原文码点计算（CRLF 占两码点）。
     """
-    elems = _number_elements(assertion)
-    if elems:
-        source_elems = _number_elements(source_text)
-        for elem in elems:
-            covered = any(
-                _num_key(se["num"]) == _num_key(elem["num"]) and se["unit"] == elem["unit"]
-                and (not elem["subject"] or elem["subject"] in source_text)
-                for se in source_elems
-            )
-            if not covered:
-                subject = elem["subject"] or "（未识别主体）"
-                return False, f"数值 {elem['num']}{elem['unit']}（主体「{subject}」）未被来源覆盖或数值不一致"
-        return True, None
+    lines: list[tuple[str, int, int]] = []
+    pos = 0
+    n = len(article)
+    while pos < n:
+        start = pos
+        j = pos
+        while j < n and article[j] not in "\r\n":
+            j += 1
+        text = article[start:j]
+        if j < n:
+            if article[j] == "\r" and j + 1 < n and article[j + 1] == "\n":
+                end = j + 2
+            else:
+                end = j + 1
+        else:
+            end = j
+        lines.append((text, start, end))
+        pos = end
 
-    # 非数字事实断言：主干覆盖（主体 + 谓述核心词）。
-    subject = _assertion_subject(assertion)
-    if subject and subject not in source_text:
-        return False, f"断言主体「{subject}」未出现在来源中"
-    shared = _content_bigrams(assertion) & _content_bigrams(source_text)
-    if len(shared) < 2:
-        return False, f"来源与断言仅共享 {len(shared)} 个内容词，谓述不覆盖"
+    groups: list[list[tuple[str, int, int]]] = []
+    cur: list[tuple[str, int, int]] = []
+    for text, s, e in lines:
+        if text.strip() == "":
+            if cur:
+                groups.append(cur)
+                cur = []
+        else:
+            cur.append((text, s, e))
+    if cur:
+        groups.append(cur)
+
+    blocks: list[dict[str, Any]] = []
+    for g in groups:
+        first_start = g[0][1]
+        last_end = g[-1][2]
+        full = article[first_start:last_end]
+        stripped_left = full.lstrip()
+        lead = len(full) - len(stripped_left)
+        trimmed = stripped_left.rstrip()
+        start = first_start + lead
+        end = first_start + lead + len(trimmed)
+        if not trimmed:
+            continue
+        blocks.append({"text": trimmed, "start": start, "end": end})
+    return blocks
+
+
+# ── 来源直引链 ──────────────────────────────────────────────────────────────
+
+def _source_entry_by_id(sources: dict) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for s in _as_list(sources.get("sources")):
+        if isinstance(s, dict) and s.get("id"):
+            out[s.get("id")] = s
+    return out
+
+
+def _source_supported(entry: dict) -> tuple[bool, str | None]:
+    """校验单个来源的证据字段；返回 (ok, code)。"""
+    evidence = entry.get("evidence")
+    if not isinstance(evidence, dict):
+        return False, "EVIDENCE_REFERENCE_INVALID"
+    text = evidence.get("text")
+    if not isinstance(text, str) or not text:
+        return False, "EVIDENCE_REFERENCE_INVALID"
+    sha = evidence.get("sha256")
+    if not isinstance(sha, str) or not re.fullmatch(r"[a-f0-9]{64}", sha):
+        return False, "EVIDENCE_REFERENCE_INVALID"
+    if sha != _sha256(text):
+        return False, "EVIDENCE_REFERENCE_INVALID"
+    locator = evidence.get("locator")
+    if not isinstance(locator, str) or not locator:
+        return False, "EVIDENCE_REFERENCE_INVALID"
     return True, None
 
 
-def _verified_sources(sources: dict) -> list[dict]:
-    return [s for s in _as_list(sources.get("sources"))
-            if isinstance(s, dict) and s.get("status") == "verified"]
+def _fact_source_state(
+    claim: dict,
+    source_by_id: dict[str, dict],
+    article: str,
+) -> tuple[str, str, str]:
+    """判定单个 fact 主张的来源状态。返回 (state, code, reason)。"""
+    text = claim.get("text")
+    if not isinstance(text, str):
+        return UNKNOWN, "EVIDENCE_INPUT_REQUIRED", "fact 主张缺少 text"
+
+    span = claim.get("article_span")
+    slice_text = _slice_of(article, span) if isinstance(span, dict) else None
+    if slice_text is None or slice_text != text:
+        return UNKNOWN, "CLAIM_LOCATION_INVALID", f"主张 {claim.get('id') or '?'} 的定位不合法或正文切片与 text 不一致"
+
+    source_ids = _as_list(claim.get("source_ids"))
+    evidence_refs = _as_list(claim.get("evidence_refs"))
+    if not source_ids or not evidence_refs:
+        return UNKNOWN, "EVIDENCE_REFERENCE_INVALID", f"fact 主张 {claim.get('id') or '?'} 缺少 source_ids 或 evidence_refs"
+
+    refs_by_source: dict[str, list[dict]] = {}
+    for ref in evidence_refs:
+        if not isinstance(ref, dict):
+            return UNKNOWN, "EVIDENCE_REFERENCE_INVALID", f"主张 {claim.get('id') or '?'} 存在非法 evidence_ref"
+        refs_by_source.setdefault(ref.get("source_id"), []).append(ref)
+
+    for sid in source_ids:
+        if sid not in source_by_id:
+            return UNKNOWN, "EVIDENCE_REFERENCE_INVALID", f"主张 {claim.get('id') or '?'} 引用的来源 {sid} 不存在"
+        refs = refs_by_source.get(sid)
+        if not refs or len(refs) != 1:
+            return UNKNOWN, "EVIDENCE_REFERENCE_INVALID", f"主张 {claim.get('id') or '?'} 的来源 {sid} 缺恰一条 evidence_ref"
+
+    for sid in source_ids:
+        entry = source_by_id[sid]
+        if entry.get("status") != "verified":
+            return UNKNOWN, "EVIDENCE_REFERENCE_INVALID", f"来源 {sid} 状态不是 verified"
+        ok, code = _source_supported(entry)
+        if not ok:
+            return UNKNOWN, code, f"来源 {sid} 证据缺失/哈希不符/locator 空"
+        ref = refs_by_source[sid][0]
+        if ref.get("evidence_sha256") != entry["evidence"]["sha256"]:
+            return UNKNOWN, "EVIDENCE_REFERENCE_INVALID", f"来源 {sid} 的 evidence_ref 哈希与来源证据不一致"
+
+    for sid in source_ids:
+        entry = source_by_id[sid]
+        ref = refs_by_source[sid][0]
+        if ref.get("mode") != "verbatim":
+            return UNSUPPORTED, "VERBATIM_QUOTE_MISMATCH", f"来源 {sid} 的引用 mode 不是 verbatim"
+        quote = ref.get("quote")
+        if not isinstance(quote, str) or quote != entry["evidence"]["text"]:
+            return UNSUPPORTED, "VERBATIM_QUOTE_MISMATCH", f"来源 {sid} 的 quote 不等于完整证据段"
+
+    for sid in source_ids:
+        entry = source_by_id[sid]
+        ref = refs_by_source[sid][0]
+        if text != ref.get("quote"):
+            return UNSUPPORTED, "VERBATIM_CLAIM_MISMATCH", f"主张 {claim.get('id') or '?'} 的 text 与直引不一致"
+
+    return SUPPORTED, "VERBATIM_CHAIN_VALID", f"主张 {claim.get('id') or '?'} 引用链完整"
 
 
-def _source_text(entry: dict) -> str:
-    return (entry.get("claim") or "") + " " + (entry.get("title") or "")
+# ── 第四条红线：声明存在 + 正文锚点 ─────────────────────────────────────────
+
+def _delivery_state(brief: dict, article: str) -> tuple[str, str, str]:
+    if brief.get("editorial_schema") != EDITORIAL_SCHEMA:
+        return UNKNOWN, "DELIVERY_DECLARATION_REQUIRED", "brief 缺少 editorial_schema: 2 或为旧格式，需补录"
+
+    goal = brief.get("goal")
+    if not isinstance(goal, dict):
+        return UNKNOWN, "DELIVERY_DECLARATION_REQUIRED", "brief 缺少 goal 声明"
+    takeaway = goal.get("takeaway")
+    action = goal.get("action")
+    if not isinstance(takeaway, str) and not isinstance(action, str):
+        return UNKNOWN, "DELIVERY_DECLARATION_REQUIRED", "takeaway/action 缺失或类型错误"
+    takeaway = takeaway if isinstance(takeaway, str) else ""
+    action = action if isinstance(action, str) else ""
+    if not takeaway.strip() and not action.strip():
+        return UNKNOWN, "DELIVERY_DECLARATION_REQUIRED", "takeaway 与 action 均为空"
+
+    delivery = brief.get("delivery")
+    if not isinstance(delivery, dict):
+        return UNKNOWN, "DELIVERY_DECLARATION_REQUIRED", "brief 缺少 delivery 锚点"
+    article_hash = delivery.get("article_hash")
+    if article_hash != _sha256(article):
+        return UNKNOWN, "DELIVERY_LOCATION_INVALID", "delivery.article_hash 与当前正文不一致"
+
+    anchors = _as_list(delivery.get("anchors"))
+    by_field: dict[str, list[dict]] = {}
+    for a in anchors:
+        if isinstance(a, dict) and a.get("field") in ("takeaway", "action"):
+            by_field.setdefault(a["field"], []).append(a)
+
+    for field, text in (("takeaway", takeaway), ("action", action)):
+        if not text.strip():
+            if by_field.get(field):
+                return UNKNOWN, "DELIVERY_LOCATION_INVALID", f"空声明 {field} 不得有锚点"
+            continue
+        field_anchors = by_field.get(field)
+        if not field_anchors or len(field_anchors) != 1:
+            return UNKNOWN, "DELIVERY_DECLARATION_REQUIRED", f"声明 {field} 必须有且仅有一个锚点"
+        anchor = field_anchors[0]
+        span = anchor.get("article_span")
+        slice_text = _slice_of(article, span) if isinstance(span, dict) else None
+        if slice_text is None:
+            return UNKNOWN, "DELIVERY_LOCATION_INVALID", f"声明 {field} 的锚点越界或非法"
+        if slice_text != text.strip():
+            return UNSUPPORTED, "DELIVERY_TEXT_MISMATCH", f"声明 {field} 未落正文或正文文本不一致"
+
+    return SUPPORTED, "DELIVERY_DECLARED_AND_PRESENT", "已声明且已落正文；未验证语义质量"
 
 
-def _ending(text: str) -> str:
-    tail = text.strip()
-    if len(tail) > 200:
-        tail = tail[-200:]
-    return tail
+# ── 红线一：编造亲历/采访/场景 ──────────────────────────────────────────────
+
+def _fabrication_state(article: str, personal_materials_available: bool | None) -> tuple[str, str, str]:
+    if not any(m in article for m in _FABRICATED_MARKERS):
+        return SUPPORTED, "FABRICATION_CLEAR", "未发现编造亲历/采访/场景信号"
+    if personal_materials_available is True:
+        return SUPPORTED, "FABRICATION_CLEAR", "有用户提供材料，亲历叙述可追溯"
+    return UNSUPPORTED, "FABRICATED_PERSONAL_EXPERIENCE", \
+        "正文出现第一人称经历/采访/场景叙述，但没有本次任务用户明确提供的材料来源"
 
 
-def _has_hedge(text: str) -> bool:
-    return any(h in text for h in _HEDGE_PHRASES)
+# ── 主入口 ──────────────────────────────────────────────────────────────────
 
-
-def _has_conclusion(text: str) -> bool:
-    return any(m in text for m in _STRONG_CONCLUSION_MARKERS)
-
-
-# ── 主判定 ──────────────────────────────────────────────────────────────────
-
-def editorial_blockers(
+def compute_verdict(
     *,
     article: str,
-    claims: dict | None = None,
-    sources: dict | None = None,
+    brief: dict,
+    claims: dict,
+    sources: dict,
     personal_materials_available: bool | None = None,
-    disabled: Iterable[str] = (),
-) -> list[str]:
-    """返回审稿红线阻断项（中文，一句话一条）。无红线信号返回空列表。"""
-    disabled_set = set(disabled or ())
-    blockers: list[str] = []
-    claims_data = _as_dict(claims)
-    sources_data = _as_dict(sources)
-    source_list = _as_list(sources_data.get("sources"))
-    source_by_id = {
-        s.get("id"): s
-        for s in source_list
-        if isinstance(s, dict) and s.get("id")
-    }
-    statuses = {s.get("status") for s in source_list if isinstance(s, dict)}
-    fact_claims = [
-        c for c in _as_list(claims_data.get("claims"))
-        if isinstance(c, dict) and c.get("type") == _FACT_TYPE
-    ]
+) -> dict[str, Any]:
+    """计算编辑红线判定项列表。返回 {items: [...]}，每条含 rule/id/state/code/reason。"""
+    items: list[dict[str, Any]] = []
+    claims_data = claims if isinstance(claims, dict) else {}
+    sources_data = sources if isinstance(sources, dict) else {}
+    brief_data = brief if isinstance(brief, dict) else {}
 
-    # 红线一：编造亲历/采访/场景。
-    if GUARD_FABRICATION not in disabled_set:
-        if any(marker in article for marker in _FABRICATED_MARKERS):
-            has_user_material = "user_provided" in statuses or personal_materials_available is True
-            if not has_user_material:
-                blockers.append(
-                    "编造亲历/采访/场景：正文出现第一人称经历/采访/场景叙述，但没有本次任务用户明确提供的材料来源"
-                )
+    # 红线一：编造亲历。
+    fstate, fcode, freason = _fabrication_state(article, personal_materials_available)
+    items.append({"rule": "fabrication", "id": None, "state": fstate, "code": fcode, "reason": freason})
 
-    # 红线二：核心具体事实没有来源（或来源不支持正文说法）。
-    if GUARD_UNSOURCED_FACT not in disabled_set:
-        segments = _fact_assertion_segments(article)
-        if segments:
-            verified = _verified_sources(sources_data)
-            if not verified:
-                blockers.append(
-                    "核心具体事实无来源：正文出现数字/研究/数据类断言，但来源账本没有 verified 来源"
-                )
-            else:
-                for seg in segments:
-                    supported = any(
-                        _assertion_supported(seg, _source_text(s))[0]
-                        for s in verified
-                    )
-                    if not supported:
-                        blockers.append(
-                            f"核心具体事实无来源或来源不支持：断言「{seg}」缺匹配的 verified 来源"
-                        )
+    # 第四条：声明存在 + 锚点。
+    dstate, dcode, dreason = _delivery_state(brief_data, article)
+    items.append({"rule": "delivery", "id": None, "state": dstate, "code": dcode, "reason": dreason})
 
-    # 红线三：论点与证据脱节。fact 主张的 source_ids 必须解析到真实 verified 来源，
-    # 且来源 claim 必须支撑该主张断言。
-    if GUARD_DISCONNECT not in disabled_set:
-        for claim in fact_claims:
-            text = claim.get("text") or ""
-            source_ids = _as_list(claim.get("source_ids"))
-            if not source_ids:
-                blockers.append(
-                    "论点与证据脱节：fact 类型主张缺少 source_ids（必须引用来源，否则删除或标为 unsupported）"
-                )
-                continue
+    # 来源输入：claims/sources 必须是 schema 2。
+    if claims_data.get("editorial_schema") != EDITORIAL_SCHEMA or sources_data.get("editorial_schema") != EDITORIAL_SCHEMA:
+        items.append({"rule": "source_input", "id": None, "state": UNKNOWN,
+                      "code": "EVIDENCE_INPUT_REQUIRED",
+                      "reason": "claims 或 sources 缺少 editorial_schema: 2 或为旧格式，需补录"})
+    else:
+        claim_list = _as_list(claims_data.get("claims"))
+        blocks = _as_list(claims_data.get("blocks"))
+        source_by_id = _source_entry_by_id(sources_data)
+        articles_hash = claims_data.get("article_hash")
 
-            resolved: list[dict] = []
-            missing: list[str] = []
-            unverified: list[str] = []
-            for sid in source_ids:
-                entry = source_by_id.get(sid)
-                if entry is None:
-                    missing.append(str(sid))
-                elif entry.get("status") != "verified":
-                    unverified.append(str(sid))
+        if articles_hash != _sha256(article):
+            items.append({"rule": "source_input", "id": None, "state": UNKNOWN,
+                          "code": "CLAIM_LOCATION_INVALID",
+                          "reason": "claims.article_hash 与当前正文不一致"})
+        else:
+            items.append({"rule": "source_input", "id": None, "state": SUPPORTED,
+                          "code": "VERBATIM_CHAIN_VALID", "reason": "claims/sources 为 schema 2 且正文哈希一致"})
+
+        # 逐 fact 判定。
+        facts = [c for c in claim_list if isinstance(c, dict) and c.get("type") == _FACT_TYPE]
+        if not facts:
+            items.append({"rule": "source_fact", "id": None, "state": SUPPORTED,
+                          "code": "VERBATIM_CHAIN_VALID",
+                          "reason": "无已声明事实，引用检查不适用"})
+        else:
+            for c in facts:
+                st, code, reason = _fact_source_state(c, source_by_id, article)
+                items.append({"rule": "source_fact", "id": c.get("id"), "state": st, "code": code, "reason": reason})
+
+        coverage_state = _coverage_state(article, claims_data, facts, source_by_id)
+        items.append(coverage_state)
+
+    return {"items": items}
+
+
+def _coverage_state(article: str, claims: dict, facts: list[dict], source_by_id: dict[str, dict]) -> dict[str, Any]:
+    """正文按空行切块，claims.blocks 必须一一覆盖。"""
+    blocks = _as_list(claims.get("blocks"))
+    expected = split_blocks(article)
+    expected_spans = [(b["start"], b["end"]) for b in expected]
+
+    got_spans: list[tuple[int, int]] = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            return {"rule": "article_coverage", "id": None, "state": UNKNOWN,
+                    "code": "ARTICLE_COVERAGE_REQUIRED", "reason": "blocks 存在非法条目"}
+        span = b.get("article_span")
+        if not _is_span_valid(span):
+            return {"rule": "article_coverage", "id": None, "state": UNKNOWN,
+                    "code": "ARTICLE_COVERAGE_REQUIRED", "reason": "blocks 存在非法 article_span"}
+        got_spans.append((span["start"], span["end"]))
+
+    if got_spans != expected_spans:
+        return {"rule": "article_coverage", "id": None, "state": UNKNOWN,
+                "code": "ARTICLE_COVERAGE_REQUIRED",
+                "reason": "blocks 未按顺序覆盖全部正文块（存在遗漏/重复/额外块）"}
+
+    fact_by_id = {c.get("id"): c for c in facts if isinstance(c, dict)}
+    for b, (start, end) in zip(blocks, expected_spans):
+        kind = b.get("kind")
+        if kind not in _BLOCK_KINDS:
+            return {"rule": "article_coverage", "id": None, "state": UNKNOWN,
+                    "code": "ARTICLE_COVERAGE_REQUIRED", "reason": f"block 的 kind 不合法：{kind}"}
+        cids = _as_list(b.get("claim_ids"))
+        if kind == "fact":
+            if not cids:
+                return {"rule": "article_coverage", "id": None, "state": UNKNOWN,
+                        "code": "ARTICLE_COVERAGE_REQUIRED", "reason": "fact 块缺少 claim_ids"}
+            for cid in cids:
+                claim = fact_by_id.get(cid)
+                if claim is None:
+                    return {"rule": "article_coverage", "id": None, "state": UNKNOWN,
+                            "code": "ARTICLE_COVERAGE_REQUIRED", "reason": f"fact 块引用未登记的主张 {cid}"}
+                span = claim.get("article_span")
+                if not _is_span_valid(span) or not (start <= span["start"] and span["end"] <= end):
+                    return {"rule": "article_coverage", "id": None, "state": UNKNOWN,
+                            "code": "ARTICLE_COVERAGE_REQUIRED", "reason": f"主张 {cid} 跨块或不在本块内"}
+        else:
+            if cids:
+                return {"rule": "article_coverage", "id": None, "state": UNKNOWN,
+                        "code": "ARTICLE_COVERAGE_REQUIRED", "reason": f"{kind} 块不得有 claim_ids"}
+
+    return {"rule": "article_coverage", "id": None, "state": SUPPORTED,
+            "code": "VERBATIM_CHAIN_VALID", "reason": "正文覆盖完整"}
+
+
+def has_blocking(verdict: dict[str, Any]) -> bool:
+    """任一未知/不支持即阻断。"""
+    for item in verdict.get("items", []):
+        if item.get("state") in (UNKNOWN, UNSUPPORTED):
+            return True
+    return False
+
+
+def guard_blockers(verdict: dict[str, Any]) -> list[str]:
+    """把 unknown/unsupported 的判定项转成中文 blocker 文本。"""
+    out: list[str] = []
+    for item in verdict.get("items", []):
+        if item.get("state") in (UNKNOWN, UNSUPPORTED):
+            out.append(f"[{item.get('code')}] {item.get('reason')}")
+    return out
+
+
+# ── 模型自由文本清洗 ────────────────────────────────────────────────────────
+
+def scrub_reserved(text: str) -> str:
+    """把模型自由文本中的守卫保留词（诊断键/结构字段名/前缀）替换为中文占位。
+
+    不区分大小写匹配 ASCII 保留词；中文前缀按字面匹配。清洗只改文本，不删除条目。
+    """
+    if not isinstance(text, str):
+        return text
+    out = text
+    for token in sorted(RESERVED_TOKENS, key=len, reverse=True):
+        if token in ("守卫诊断",):
+            out = out.replace(token, "模型自报诊断标记（未采用）")
+        else:
+            # ASCII 保留词不区分大小写。
+            pattern = re.compile(re.escape(token), re.IGNORECASE)
+            out = pattern.sub("模型自报诊断标记（未采用）", out)
+    return out
+
+
+def scrub_assessment(assessment: dict[str, Any]) -> dict[str, Any]:
+    """复制 assessment，对 notes、blockers 每项、major_issues 每项做保留词清洗。
+
+    清洗只改自由文本，不删除 blocker 条目、不改变 decision/分数/pass_number；
+    替换后空字符串用「模型提出阻断意见，需复核」补齐。
+    """
+    out = dict(assessment) if isinstance(assessment, dict) else {}
+    if isinstance(out.get("notes"), str):
+        out["notes"] = scrub_reserved(out["notes"])
+    for field in ("blockers", "major_issues"):
+        if isinstance(out.get(field), list):
+            cleaned: list[str] = []
+            for item in out[field]:
+                if isinstance(item, str):
+                    s = scrub_reserved(item)
+                    cleaned.append(s if s.strip() else "模型提出阻断意见，需复核")
                 else:
-                    resolved.append(entry)
-
-            if missing:
-                blockers.append(
-                    "论点与证据脱节：fact 主张引用的来源编号 " + "、".join(missing) + " 在来源账本中无法解析"
-                )
-            if unverified:
-                blockers.append(
-                    "论点与证据脱节：fact 主张引用的来源 " + "、".join(unverified) + " 状态不是 verified"
-                )
-            if resolved and text and not any(
-                _assertion_supported(text, _source_text(entry))[0]
-                for entry in resolved
-            ):
-                blockers.append(
-                    "论点与证据脱节：fact 主张引用的来源 claim 不支撑该断言（缺要素或数值不一致）"
-                )
-
-    # 红线四：文章必须给目标读者明确的结论、行动或判断方法（fail-closed）。
-    if GUARD_NO_CONCLUSION not in disabled_set:
-        ending = _ending(article)
-        hedge = _has_hedge(ending)
-        conclusion = _has_conclusion(ending)
-        if not conclusion:
-            if hedge:
-                blockers.append("文章没有给目标读者明确的结论、行动或判断方法")
-            else:
-                blockers.append("未能识别明确结论，请补结论/行动/判断方法")
-
-    return list(dict.fromkeys(blockers))
+                    cleaned.append(item)
+            out[field] = cleaned
+    return out

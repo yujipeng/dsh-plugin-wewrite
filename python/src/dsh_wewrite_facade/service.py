@@ -225,6 +225,13 @@ def op_run_finish(payload: dict) -> dict[str, Any]:
         if payload.get("context"):
             binding.require_active_binding(run_id, payload["context"]["workflowId"],
                                            payload["context"]["generation"])
+
+        # §9 定稿：封存必须在锁内先过同一报告门禁（不依赖上游「有 draft 才核 editorial」）。
+        gate = projection.build_gate({}, run_id)
+        if not isinstance(gate, dict) or gate.get("publishable") is not True:
+            from .errors import FacadeError
+            raise FacadeError("REVIEW_REQUIRED", "需要先完成审稿且通过", retryable=False)
+
         from wewrite.runs import finish_run as _upstream
         try:
             state = _upstream(run_id=run_id)
@@ -250,17 +257,33 @@ def op_artifact_get(payload: dict) -> dict[str, Any]:
     if "STATE_CORRUPTED" in diags:
         raise FacadeError("STATE_CORRUPTED", "状态不可读，无法读取产物", run_id=run_id)
     content, version = projection.read_artifact_content(run_id, kind)
+    editable = projection.run_summary(state, run_id)["editable"]
+    if kind == "review_report":
+        # §9：审稿报告只读，不由通用写口或工作台编辑。
+        editable = False
     return business_success({
         "runId": run_id,
         "kind": kind,
         "content": content,
         "version": version,
-        "editable": projection.run_summary(state, run_id)["editable"],
+        "editable": editable,
     })
 
 
-# 改写审批摘要的 kind：article/draft/review_report 必须取 send 门闩（设计 §4 第 96 行）。
-_SEND_LATCHED_KINDS = frozenset({"article", "draft", "review_report"})
+# 通用写口白名单（§9 方案 A）：review_report 只读，不由 artifact.write 生成。
+_ARTIFACT_WRITE_WHITELIST = frozenset({
+    "brief", "claims", "draft", "article", "sources",
+    "illustrated_article", "image_prompts", "images_manifest",
+})
+
+# 改写审批摘要的 kind：影响门禁的内容写入需取 send 门闩（门闩 → run 锁）。
+# review_report 已从通用写口移除（写入被白名单拒绝），不再列入本集合。
+_SEND_LATCHED_KINDS = frozenset({"article", "draft", "brief", "claims", "sources"})
+
+
+def _reject_review_report_write() -> FacadeError:
+    from .errors import forbidden
+    return forbidden("审稿报告仅能由审稿流程生成，请调用 wewrite_review")
 
 
 def op_artifact_write(payload: dict) -> dict[str, Any]:
@@ -269,7 +292,10 @@ def op_artifact_write(payload: dict) -> dict[str, Any]:
     content = payload["content"]
     expected = payload["expectedVersion"]
 
-    # 裁定 A：article/draft/review_report 取 send 门闩（门闩 → run 锁）；其余 kind 只取 run 短锁。
+    # §9：写口白名单在写入、版本读取、创建发送门闩之前检查；review_report 一律拒绝。
+    _ensure_writable_kind(kind)
+
+    # 影响门禁的 kind 取 send 门闩（门闩 → run 锁）；其余 kind 只取 run 短锁。
     if kind in _SEND_LATCHED_KINDS:
         with storage.send_lock(run_id, create=True):
             with storage.run_lock(run_id, create=False):
@@ -278,11 +304,24 @@ def op_artifact_write(payload: dict) -> dict[str, Any]:
         return _artifact_write_locked(payload)
 
 
+def _ensure_writable_kind(kind: str) -> None:
+    """写口白名单（§9 方案 A）：review_report 及其它未知 kind 一律 FORBIDDEN。"""
+    if kind not in _ARTIFACT_WRITE_WHITELIST:
+        if kind == "review_report":
+            raise _reject_review_report_write()
+        from .errors import invalid_input
+        raise invalid_input("该 kind 不可写入")
+
+
 def _artifact_write_locked(payload: dict) -> dict[str, Any]:
     run_id = payload["runId"]
     kind = payload["kind"]
     content = payload["content"]
     expected = payload["expectedVersion"]
+
+    # §9：内部调用入口再次检查同一白名单，防止未来绕过。
+    _ensure_writable_kind(kind)
+
     storage.ensure_writable_state(run_id)
     if payload.get("context"):
         binding.require_active_binding(run_id, payload["context"]["workflowId"],
@@ -293,6 +332,11 @@ def _artifact_write_locked(payload: dict) -> dict[str, Any]:
         raise version_conflict("内容版本冲突，请刷新后重试")
     # JSON/YAML 产物必须解析为对应结构，不能任意 blob 写入（设计 §4）。
     _validate_structured_artifact(kind, content)
+
+    # sources 写入：缺失 evidence.sha256 由服务端补齐；显式给出但不相等则拒绝。
+    if kind == "sources":
+        content = _fill_sources_evidence_hashes(content)
+
     storage.write_run_file(run_id, paths.KIND_FILES[kind], content.encode("utf-8"))
     new_version = storage.sha256_hex(content.encode("utf-8"))
     return business_success({
@@ -300,6 +344,40 @@ def _artifact_write_locked(payload: dict) -> dict[str, Any]:
         "kind": kind,
         "version": new_version,
     })
+
+
+def _fill_sources_evidence_hashes(content: str) -> str:
+    """sources 写入时为缺失 evidence.sha256 计算并补齐；显式不相等则拒绝。
+
+    这是产物内容规则（§10 第 2 步），不增加工具参数/返回字段。
+    """
+    import yaml
+    try:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError:
+        raise invalid_input("产物必须是合法 YAML")
+    if not isinstance(data, dict):
+        raise invalid_input("产物必须是 YAML 对象")
+    changed = False
+    for item in data.get("sources") if isinstance(data.get("sources"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        evidence = item.get("evidence")
+        if not isinstance(evidence, dict):
+            continue
+        text = evidence.get("text")
+        if not isinstance(text, str):
+            continue
+        computed = storage.sha256_hex(text.encode("utf-8"))
+        given = evidence.get("sha256")
+        if given is None:
+            evidence["sha256"] = computed
+            changed = True
+        elif given != computed:
+            raise invalid_input("evidence.sha256 与 evidence.text 不一致")
+    if changed:
+        return yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+    return content
 
 
 def _current_version(run_id: str, kind: str) -> str | None:
@@ -316,7 +394,7 @@ def _validate_structured_artifact(kind: str, content: str) -> None:
     """JSON/YAML 产物写入前必须解析为对应结构（设计 §4），否则 INVALID_INPUT。"""
     import yaml
 
-    if kind in ("review_report", "images_manifest"):
+    if kind == "images_manifest":
         try:
             data = json.loads(content)
         except json.JSONDecodeError:

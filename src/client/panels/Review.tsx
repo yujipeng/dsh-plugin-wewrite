@@ -39,7 +39,7 @@ export function ReviewPanel({ client, runId }: ReviewPanelProps): JSX.Element {
     <PanelState loading={loading} error={error} forbidden={false} empty={gate === null} emptyText="尚无审稿报告">
       <div className="ww-review" data-testid="wewrite-review">
         <span className={`ww-review__verdict ${gate?.publishable ? 'is-pass' : 'is-blocked'}`} data-testid="ww-review-verdict">
-          {gate?.publishable ? '审稿通过' : '需要修改'}
+          {gate?.publishable ? '结构审稿通过（语义及来源真实性仍需核验）' : '需要修改'}
         </span>
         <ul className="ww-review__issues">
           {(gate?.issues ?? []).map((issue, i) => (

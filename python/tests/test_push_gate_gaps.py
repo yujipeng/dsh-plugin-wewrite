@@ -16,7 +16,7 @@ import json
 import struct
 import zlib
 
-from conftest import call_facade, create_run, make_home, make_publishable_run, write_article
+from conftest import call_facade, create_run, make_home, make_publishable_run, write_article, write_review
 
 
 def _png_bytes() -> bytes:
@@ -281,11 +281,11 @@ def test_red_probe_summary_reverify_is_load_bearing(tmp_path, monkeypatch):
     assert resp_a["ok"] is False, resp_a
 
     # 相 2：注入回退（等价于修复前无此项比对），改审稿后发送恢复成功。
-    # S4 prepare 要求审稿通过，故先恢复通过→prepare，再改不通过→发送。
+    # 新门禁要求同版本 publishable，故先恢复通过→prepare，再改不通过→发送。
     monkeypatch.setattr(draft_dispatch, "_verify_summary", lambda *a, **k: True)
-    _write_review(home, run_id, version, True)
+    write_review(home, run_id, version, True)
     iid_b = new_intent()
-    _write_review(home, run_id, version, False)
+    write_review(home, run_id, version, False)
     resp_b = _send_inproc(draft_dispatch, run_id, iid_b, version)
     assert resp_b["ok"] is True, resp_b
     assert resp_b["data"]["status"] == "succeeded"
