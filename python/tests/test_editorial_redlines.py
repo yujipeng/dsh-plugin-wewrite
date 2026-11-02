@@ -1,21 +1,14 @@
-"""方案 A 负向用例：编辑红线守卫（editorial-quality.md 的「不可交付」红线）。
+"""方案 A 负向用例（返修 3）：编辑红线守卫（editorial-quality.md 的「不可交付」红线）。
 
-审稿 build_report 之上叠加确定性拦截：正文/sources/claims/brief 出现可判定的红线信号时，
-无论模型自报 decision/blockers 如何，report.decision 都必须降级为 revise、publishable 必须 false。
+全部走完整 review.build 链路（真实 facade 子进程），不直接调 editorial_blockers。
+覆盖：来源不支持断言（含数值冲突）、第四条红线（无明确结论）、以及保留正向对照。
 """
 
 from __future__ import annotations
 
 import yaml
 
-import pytest
-
 from conftest import call_facade, create_run, make_home, write_article
-from dsh_wewrite_facade.editorial import (
-    GUARD_NO_CONCLUSION,
-    GUARD_UNSOURCED_FACT,
-    editorial_blockers,
-)
 
 
 def _write_artifact(home, run_id, kind, content, expected=None):
@@ -28,49 +21,14 @@ def _write_artifact(home, run_id, kind, content, expected=None):
     })
 
 
-def _claims_with_fact_unsourced() -> str:
-    return yaml.safe_dump({
-        "version": 1,
-        "claims": [
-            {"id": "C1", "text": "核心事实主张", "type": "fact", "source_ids": [],
-             "status": "unsupported", "boundary": ""},
-        ],
-    }, allow_unicode=True, sort_keys=False)
+def _sources(items):
+    return yaml.safe_dump({"version": 1, "run_id": "r", "sources": items},
+                          allow_unicode=True, sort_keys=False)
 
 
-def _sources_empty() -> str:
-    return yaml.safe_dump({"version": 1, "run_id": "r", "sources": []}, allow_unicode=True, sort_keys=False)
-
-
-def _sources_verified() -> str:
-    return yaml.safe_dump({
-        "version": 1, "run_id": "r",
-        "sources": [{"id": "s1", "title": "官方", "publisher": "p", "url": "https://example.com/a",
-                     "published_at": "2026-01-01", "claim": "支持主张", "status": "verified"}],
-    }, allow_unicode=True, sort_keys=False)
-
-
-def _sources_unrelated_verified() -> str:
-    """一条 verified 来源，但主题与正文断言无关（讲天气）。"""
-    return yaml.safe_dump({
-        "version": 1, "run_id": "r",
-        "sources": [{"id": "s2", "title": "气象局", "publisher": "气象局",
-                     "url": "https://example.com/weather",
-                     "published_at": "2026-01-01", "claim": "今天局部地区有阵雨", "status": "verified"}],
-    }, allow_unicode=True, sort_keys=False)
-
-
-def _brief(personal_available: bool) -> str:
-    return yaml.safe_dump({
-        "version": 1,
-        "audience": {"who": "读者", "context": "场景", "question": "问题"},
-        "goal": {"takeaway": "结论", "action": "行动"},
-        "thesis": {"statement": "判断", "novelty": "新", "boundary": "边界", "counterpoint": "反方"},
-        "personal_materials": {"available": personal_available, "items": []},
-        "framework": "观点",
-        "sections": [],
-        "constraints": {"desired_length": "1200-2500 字", "must_include": [], "must_avoid": []},
-    }, allow_unicode=True, sort_keys=False)
+def _source(status="verified", claim="", title="", sid="s1", url="https://example.com/a"):
+    return {"id": sid, "title": title, "publisher": "p", "url": url,
+            "published_at": "2026-01-01", "claim": claim, "status": status}
 
 
 def _assess(decision="pass", blockers=None):
@@ -86,113 +44,35 @@ def _review(home, run_id, article_version):
     })
 
 
-def test_unsourced_core_fact_must_revise(tmp_path):
-    """负向 1：无来源的核心事实 → 审稿必须判 revise，不能 pass。"""
-    home = make_home(tmp_path)
+def _seed(home, article, sources_items=None, fact_text=None, fact_source_ids=None):
+    """构造 run + article + sources + claims（fact 引用来源），返回 (run_id, article_version)。"""
     run_id = create_run(home)
-    article = "研究表明，90% 的用户会更喜欢这种方式。"
     version = write_article(home, run_id, article)
-    assert _write_artifact(home, run_id, "sources", _sources_empty())["ok"] is True
-    assert _write_artifact(home, run_id, "claims", _claims_with_fact_unsourced())["ok"] is True
-    resp = _review(home, run_id, version)
-    assert resp["ok"] is True, resp
-    report = resp["data"]["report"]
-    assert report["decision"] == "revise"
-    assert report["publishable"] is False
-    assert any("无来源" in b for b in report["blockers"])
+    if sources_items is not None:
+        assert _write_artifact(home, run_id, "sources", _sources(sources_items))["ok"] is True
+    if fact_text is not None:
+        claims = yaml.safe_dump({
+            "version": 1,
+            "claims": [{"id": "C1", "text": fact_text, "type": "fact",
+                        "source_ids": fact_source_ids if fact_source_ids is not None else [],
+                        "status": "supported", "boundary": ""}],
+        }, allow_unicode=True, sort_keys=False)
+        assert _write_artifact(home, run_id, "claims", claims)["ok"] is True
+    return run_id, version
 
 
-def test_fabricated_personal_experience_blocked(tmp_path):
-    """负向 2：编造亲历/采访/场景 → 审稿必须拦截。"""
-    home = make_home(tmp_path)
-    run_id = create_run(home)
-    article = "上周我采访了一位行业专家，我的朋友也告诉我同样的结论。"
-    version = write_article(home, run_id, article)
-    assert _write_artifact(home, run_id, "sources", _sources_empty())["ok"] is True
-    assert _write_artifact(home, run_id, "brief", _brief(personal_available=False))["ok"] is True
-    resp = _review(home, run_id, version)
-    assert resp["ok"] is True, resp
-    report = resp["data"]["report"]
-    assert report["decision"] == "revise"
-    assert report["publishable"] is False
-    assert any("编造" in b for b in report["blockers"])
-
-
-def test_claim_evidence_disconnect_blocked(tmp_path):
-    """负向 3：论点与证据脱节（fact 主张无 source_ids）→ 必须拦截。"""
-    home = make_home(tmp_path)
-    run_id = create_run(home)
-    article = "本文给出一个可迁移的判断框架。"
-    version = write_article(home, run_id, article)
-    assert _write_artifact(home, run_id, "sources", _sources_verified())["ok"] is True
-    assert _write_artifact(home, run_id, "claims", _claims_with_fact_unsourced())["ok"] is True
-    resp = _review(home, run_id, version)
-    assert resp["ok"] is True, resp
-    report = resp["data"]["report"]
-    assert report["decision"] == "revise"
-    assert report["publishable"] is False
-    assert any("脱节" in b for b in report["blockers"])
-
-
-def test_second_round_still_blocked(tmp_path):
-    """负向 4：第二轮仍不过 → 必须保持 revise，不能伪造 pass。"""
-    home = make_home(tmp_path)
-    run_id = create_run(home)
-    article = "研究表明，90% 的用户会更喜欢这种方式。"
-    version = write_article(home, run_id, article)
-    assert _write_artifact(home, run_id, "sources", _sources_empty())["ok"] is True
-    assert _write_artifact(home, run_id, "claims", _claims_with_fact_unsourced())["ok"] is True
-    resp = call_facade(str(home), "review.build", {
-        "requestId": "rv2", "runId": run_id, "articleVersion": version, "draftVersion": None,
-        "assessment": _assess(decision="pass", blockers=[]),
-    })
-    assert resp["ok"] is True, resp
-    report = resp["data"]["report"]
-    # 模型第二轮仍自报 pass，但红线守卫必须强制 revise（缩小承诺路径由 skill 指引）。
-    assert report["decision"] == "revise"
-    assert report["publishable"] is False
-
-
-def test_sources_ledger_roundtrip(tmp_path):
-    """验收：wewrite_artifact_write kind=sources 有真实用例——写入来源账本、sources 产物非空、run/detail 可读到。"""
-    home = make_home(tmp_path)
-    run_id = create_run(home)
-    # 读当前 sources 版本（create_run 预建空账本）。
-    resp = call_facade(str(home), "artifact.get", {"runId": run_id, "kind": "sources"})
-    assert resp["ok"] is True, resp
-    version = resp["data"]["version"]
-    ledger = yaml.safe_dump({
-        "version": 1, "run_id": run_id,
-        "sources": [
-            {"id": "s1", "title": "官方文档", "publisher": "官方", "url": "https://example.com/a",
-             "published_at": "2026-01-01", "claim": "支持核心事实", "status": "verified"},
-        ],
-    }, allow_unicode=True, sort_keys=False)
-    resp = _write_artifact(home, run_id, "sources", ledger, expected=version)
-    assert resp["ok"] is True, resp
-    # run/detail 中 sources 产物非空，且内容可读回。
-    detail = call_facade(str(home), "run.detail", {"runId": run_id})
-    assert detail["ok"] is True, detail
-    sources_artifact = [a for a in detail["data"]["artifacts"] if a["kind"] == "sources"][0]
-    assert sources_artifact["exists"] is True
-    assert sources_artifact["nonEmpty"] is True
-    got = call_facade(str(home), "artifact.get", {"runId": run_id, "kind": "sources"})
-    assert got["ok"] is True
-    assert "verified" in got["data"]["content"]
-
+# ── 返修要求 1：来源支持必须是「断言要素被覆盖」 ─────────────────────────────
 
 def test_unrelated_source_cannot_pass(tmp_path):
-    """返修 1：来源不支持正文断言 → 必须 revise，不能 pass。
-
-    正文「研究表明，90% 的用户支持」+ 一条讲天气的 verified 来源，
-    旧实现只看「有没有 verified」→ 误判 pass；现在按断言与来源相关性判 revise。
-    """
+    """回归 1：天气 verified 来源 + 90% 用户断言 + fact 引用该来源 → revise。"""
     home = make_home(tmp_path)
-    run_id = create_run(home)
-    article = "研究表明，90% 的用户支持这种方式。"
-    version = write_article(home, run_id, article)
-    assert _write_artifact(home, run_id, "sources", _sources_unrelated_verified())["ok"] is True
-    assert _write_artifact(home, run_id, "claims", _claims_with_fact_unsourced())["ok"] is True
+    run_id, version = _seed(
+        home,
+        "研究表明，90% 的用户支持这种方式。",
+        sources_items=[_source(claim="今天局部地区有阵雨", title="气象局")],
+        fact_text="90% 的用户支持这种方式",
+        fact_source_ids=["s1"],
+    )
     resp = _review(home, run_id, version)
     assert resp["ok"] is True, resp
     report = resp["data"]["report"]
@@ -202,30 +82,30 @@ def test_unrelated_source_cannot_pass(tmp_path):
     assert any("不支持" in b or "无来源" in b for b in report["blockers"])
 
 
-def test_unrelated_source_guard_off_fails(tmp_path):
-    """返修 1 反证：关掉 GUARD_UNSOURCED_FACT 后，上述场景应回到旧实现（误判为无阻断）。"""
+def test_number_conflict_source_cannot_pass(tmp_path):
+    """回归 2：来源 claim 数字冲突（90% vs 35%）→ revise，必须抓数值不一致。"""
     home = make_home(tmp_path)
-    run_id = create_run(home)
-    article = "研究表明，90% 的用户支持这种方式。"
-    _ = home, run_id, article
-    # 直接对判定函数做反证：有无关 verified 来源时，打开守卫有阻断，关掉守卫无阻断。
-    unrelated = yaml.safe_load(_sources_unrelated_verified())
-    on = editorial_blockers(article=article, claims={"claims": []}, sources=unrelated)
-    off = editorial_blockers(
-        article=article, claims={"claims": []}, sources=unrelated,
-        disabled={GUARD_UNSOURCED_FACT},
+    run_id, version = _seed(
+        home,
+        "研究表明，90% 的用户支持这种方式。",
+        sources_items=[_source(claim="调研显示约 35% 的用户支持这种新型订阅方式", title="调研报告")],
+        fact_text="90% 的用户支持这种方式",
+        fact_source_ids=["s1"],
     )
-    assert any("不支持" in b or "无来源" in b for b in on)
-    assert off == [], "关掉守卫应退回旧行为（无阻断），反证才成立"
+    resp = _review(home, run_id, version)
+    assert resp["ok"] is True, resp
+    report = resp["data"]["report"]
+    assert report["decision"] == "revise"
+    assert report["publishable"] is False
+    assert report["blockers"], "必须有非空 blockers"
 
 
-def test_no_conclusion_blocked(tmp_path):
-    """返修 2：第四条红线（无结论/行动/判断方法）→ 必须 revise。"""
+# ── 返修要求 2：第四条红线（明确结论必须存在） ──────────────────────────────
+
+def test_no_conclusion_mozhongyishi(tmp_path):
+    """回归 3：「各方意见莫衷一是，暂且无法给出答案。」→ revise。"""
     home = make_home(tmp_path)
-    run_id = create_run(home)
-    article = "关于这个问题，有很多看法。"
-    version = write_article(home, run_id, article)
-    assert _write_artifact(home, run_id, "sources", _sources_empty())["ok"] is True
+    run_id, version = _seed(home, "各方意见莫衷一是，暂且无法给出答案。")
     resp = _review(home, run_id, version)
     assert resp["ok"] is True, resp
     report = resp["data"]["report"]
@@ -234,35 +114,155 @@ def test_no_conclusion_blocked(tmp_path):
     assert any("结论" in b or "行动" in b or "判断方法" in b for b in report["blockers"])
 
 
-def test_no_conclusion_guard_off_fails(tmp_path):
-    """返修 2 反证：关掉 GUARD_NO_CONCLUSION 后，无结论正文应不再命中第四条红线。"""
-    article = "关于这个问题，有很多看法。"
-    on = editorial_blockers(article=article, claims={"claims": []}, sources={"sources": []})
-    off = editorial_blockers(
-        article=article, claims={"claims": []}, sources={"sources": []},
-        disabled={GUARD_NO_CONCLUSION},
-    )
-    assert any("结论" in b or "行动" in b or "判断方法" in b for b in on)
-    assert off == [], "关掉守卫应不再命中第四条红线，反证才成立"
-
-
-def test_clean_article_with_sources_passes(tmp_path):
-    """正向对照：有 verified 来源、无红线信号时，pass 不被误伤。"""
+def test_no_conclusion_liudai(tmp_path):
+    """回归 4：「这个话题争议不断，孰是孰非留待以后再看。」→ revise。"""
     home = make_home(tmp_path)
-    run_id = create_run(home)
-    article = "官方文档给出了明确的行为定义，读者可以据此判断。"
-    version = write_article(home, run_id, article)
-    assert _write_artifact(home, run_id, "sources", _sources_verified())["ok"] is True
-    claims = yaml.safe_dump({
-        "version": 1,
-        "claims": [
-            {"id": "C1", "text": "主张", "type": "fact", "source_ids": ["s1"],
-             "status": "supported", "boundary": ""},
-        ],
-    }, allow_unicode=True, sort_keys=False)
-    assert _write_artifact(home, run_id, "claims", claims)["ok"] is True
+    run_id, version = _seed(home, "这个话题争议不断，孰是孰非留待以后再看。")
+    resp = _review(home, run_id, version)
+    assert resp["ok"] is True, resp
+    report = resp["data"]["report"]
+    assert report["decision"] == "revise"
+    assert report["publishable"] is False
+
+
+def test_no_conclusion_can_online(tmp_path):
+    """回归 5a：「有很多看法，相关资料可以在网上找到。」→ revise（宽泛「可以」不再豁免）。"""
+    home = make_home(tmp_path)
+    run_id, version = _seed(home, "关于这个问题，有很多看法，相关资料可以在网上找到。")
+    resp = _review(home, run_id, version)
+    assert resp["ok"] is True, resp
+    report = resp["data"]["report"]
+    assert report["decision"] == "revise"
+    assert report["publishable"] is False
+
+
+def test_no_conclusion_zixing_panduan(tmp_path):
+    """回归 5b：「目前尚无定论，各位读者自行判断。」→ revise（宽泛「判断」不再豁免）。"""
+    home = make_home(tmp_path)
+    run_id, version = _seed(home, "目前尚无定论，各位读者自行判断。")
+    resp = _review(home, run_id, version)
+    assert resp["ok"] is True, resp
+    report = resp["data"]["report"]
+    assert report["decision"] == "revise"
+    assert report["publishable"] is False
+
+
+# ── 正向对照：合规文章不得被误伤 ─────────────────────────────────────────────
+
+def test_positive_number_match_passes(tmp_path):
+    """正向：正文 90% 与来源 90% 同主体 → 仍 pass。"""
+    home = make_home(tmp_path)
+    run_id, version = _seed(
+        home,
+        "研究表明，90% 的用户支持这种方式。综上，应继续采用该方式。",
+        sources_items=[_source(claim="约 90% 的用户支持这种方式")],
+        fact_text="90% 的用户支持这种方式",
+        fact_source_ids=["s1"],
+    )
     resp = _review(home, run_id, version)
     assert resp["ok"] is True, resp
     report = resp["data"]["report"]
     assert report["decision"] == "pass"
     assert report["publishable"] is True
+
+
+def test_positive_conclusion_with_source_passes(tmp_path):
+    """正向：给出明确结论 + 有匹配来源 → 仍 pass。"""
+    home = make_home(tmp_path)
+    run_id, version = _seed(
+        home,
+        "综上，本文认为应选择方案 A。",
+        sources_items=[_source(claim="应选择方案 A")],
+        fact_text="应选择方案 A",
+        fact_source_ids=["s1"],
+    )
+    resp = _review(home, run_id, version)
+    assert resp["ok"] is True, resp
+    report = resp["data"]["report"]
+    assert report["decision"] == "pass"
+    assert report["publishable"] is True
+
+
+# ── 保留的既有负向用例 ──────────────────────────────────────────────────────
+
+def test_unsourced_core_fact_must_revise(tmp_path):
+    """负向：无来源的核心事实 → revise。"""
+    home = make_home(tmp_path)
+    run_id, version = _seed(
+        home,
+        "研究表明，90% 的用户会更喜欢这种方式。",
+        sources_items=[],
+        fact_text="核心事实主张",
+        fact_source_ids=[],
+    )
+    resp = _review(home, run_id, version)
+    assert resp["ok"] is True, resp
+    report = resp["data"]["report"]
+    assert report["decision"] == "revise"
+    assert report["publishable"] is False
+    assert any("无来源" in b for b in report["blockers"])
+
+
+def test_fabricated_personal_experience_blocked(tmp_path):
+    """负向：编造亲历/采访/场景 → 拦截。"""
+    home = make_home(tmp_path)
+    run_id = create_run(home)
+    article = "上周我采访了一位行业专家，我的朋友也告诉我同样的结论。"
+    version = write_article(home, run_id, article)
+    assert _write_artifact(home, run_id, "sources", _sources([]))["ok"] is True
+    brief = yaml.safe_dump({
+        "version": 1,
+        "audience": {"who": "读者", "context": "场景", "question": "问题"},
+        "goal": {"takeaway": "结论", "action": "行动"},
+        "thesis": {"statement": "判断", "novelty": "新", "boundary": "边界", "counterpoint": "反方"},
+        "personal_materials": {"available": False, "items": []},
+        "framework": "观点", "sections": [],
+        "constraints": {"desired_length": "1200-2500 字", "must_include": [], "must_avoid": []},
+    }, allow_unicode=True, sort_keys=False)
+    assert _write_artifact(home, run_id, "brief", brief)["ok"] is True
+    resp = _review(home, run_id, version)
+    assert resp["ok"] is True, resp
+    report = resp["data"]["report"]
+    assert report["decision"] == "revise"
+    assert report["publishable"] is False
+    assert any("编造" in b for b in report["blockers"])
+
+
+def test_claim_evidence_disconnect_blocked(tmp_path):
+    """负向：fact 主张无 source_ids → 拦截（论点与证据脱节）。"""
+    home = make_home(tmp_path)
+    run_id, version = _seed(
+        home,
+        "本文给出一个可迁移的判断框架。",
+        sources_items=[_source(claim="支持主张")],
+        fact_text="核心事实主张",
+        fact_source_ids=[],
+    )
+    resp = _review(home, run_id, version)
+    assert resp["ok"] is True, resp
+    report = resp["data"]["report"]
+    assert report["decision"] == "revise"
+    assert report["publishable"] is False
+    assert any("脱节" in b for b in report["blockers"])
+
+
+def test_sources_ledger_roundtrip(tmp_path):
+    """验收：wewrite_artifact_write kind=sources 真实用例——写入来源账本、run/detail 可读。"""
+    home = make_home(tmp_path)
+    run_id = create_run(home)
+    got = call_facade(str(home), "artifact.get", {"runId": run_id, "kind": "sources"})
+    version = got["data"]["version"]
+    ledger = yaml.safe_dump({
+        "version": 1, "run_id": run_id,
+        "sources": [_source(sid="s1", claim="支持核心事实", title="官方文档")],
+    }, allow_unicode=True, sort_keys=False)
+    resp = _write_artifact(home, run_id, "sources", ledger, expected=version)
+    assert resp["ok"] is True, resp
+    detail = call_facade(str(home), "run.detail", {"runId": run_id})
+    assert detail["ok"] is True, detail
+    sources_artifact = [a for a in detail["data"]["artifacts"] if a["kind"] == "sources"][0]
+    assert sources_artifact["exists"] is True
+    assert sources_artifact["nonEmpty"] is True
+    got = call_facade(str(home), "artifact.get", {"runId": run_id, "kind": "sources"})
+    assert got["ok"] is True
+    assert "verified" in got["data"]["content"]

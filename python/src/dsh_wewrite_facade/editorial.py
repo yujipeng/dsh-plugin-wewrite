@@ -1,15 +1,15 @@
-"""编辑红线守卫（方案 A 返修）：审稿时按 editorial-quality.md 的「不可交付」红线做确定性拦截。
+"""编辑红线守卫（方案 A 返修 3）：审稿时按 editorial-quality.md 的「不可交付」红线做确定性拦截。
 
-- 不替代模型编辑判断，只做「伪 pass 拦截」：正文/sources/claims 出现可判定的红线信号时，
-  无论模型自报的 decision/blocks 如何，一律降级为 revise 并返回阻断项。
-- 判定全部基于产物文本与来源账本（sources.yaml）、主张清单（claims.yaml）与任务书
-  （brief.yaml 的 personal_materials.available），不依赖模型自评分数。
-- 覆盖四条红线：
-  1. 编造亲历/采访/场景；
-  2. 核心具体事实没有来源（含「来源存在但不支持正文说法」）；
-  3. 论点与证据脱节（source_ids 必须解析到真实 verified 来源，且来源 claim 与主张相关）；
-  4. 文章没有给目标读者明确的结论、行动或判断方法。
-- 每条判定带可关闭开关（`disabled` 集合），供反证用例演示「关掉逻辑 → 用例 FAIL」。
+判定方向（按项目编排裁决，不再依赖宽泛关键词表）：
+- 来源支持 = 断言要素被覆盖：数字/量级要素必须逐一被来源覆盖（同一数值 + 主体词一致），
+  非数字事实断言要求来源覆盖断言主干（主体 + 谓述核心词）；数值不一致 / 主体不一致 /
+  来源无该数值，一律判「来源不支持」，fail-closed。
+- 第四条红线 = 明确结论必须存在：结尾区必须出现真正的结论句（结论动词 + 具体主张），
+  空泛收尾命中时不再被普通正向词豁免；无法识别明确结论时判 revise。
+- blocker 写清「哪条断言、缺哪个要素、哪条来源不覆盖」，便于复验核对。
+
+不替代模型编辑判断，只做「伪 pass 拦截」。判定基于产物文本与来源账本（sources.yaml）、
+主张清单（claims.yaml）与任务书（brief.yaml 的 personal_materials.available），不依赖模型自评分数。
 """
 
 from __future__ import annotations
@@ -17,14 +17,14 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable
 
-# 四条红线的开关名（反证用例用）。
+# 四条红线的开关名（保留给反证/调试，缺省全部开启）。
 GUARD_FABRICATION = "fabrication"
 GUARD_UNSOURCED_FACT = "unsourced_fact"
 GUARD_DISCONNECT = "disconnect"
 GUARD_NO_CONCLUSION = "no_conclusion"
 GUARD_NAMES = (GUARD_FABRICATION, GUARD_UNSOURCED_FACT, GUARD_DISCONNECT, GUARD_NO_CONCLUSION)
 
-# 编造亲历/采访/场景的显式信号（第一人称事件/访谈/场景标记）。
+# ── 红线一：编造亲历/采访/场景 ──────────────────────────────────────────────
 _FABRICATED_MARKERS = (
     "采访了",
     "我采访",
@@ -50,7 +50,8 @@ _FABRICATED_MARKERS = (
     "我们团队",
 )
 
-# 核心具体事实的显式信号（数字/百分比/引用/研究/数据/统计/调查/报道 等需要来源支撑的说法）。
+# ── 红线二/三：核心具体事实与来源对应 ──────────────────────────────────────
+# 具体事实的显式信号（数字/百分比/引用/研究/数据/统计/调查/报道）。
 _FACT_MARKERS = (
     "研究表明",
     "研究显示",
@@ -64,60 +65,42 @@ _FACT_MARKERS = (
     "官方数据显示",
     "实验证明",
     "测评显示",
-    "％",
-    "%",
 )
 
-# 数字断言信号：数字 + 比例/倍数/百分点等量级单位（不含年份等弱信号）。
-_NUMBER_ASSERTION_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:%|％|倍|成|个百分点)")
+# 数字 + 量级单位（要求逐一被来源覆盖）。
+_NUMBER_UNIT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(%|％|倍|成|个百分点)")
+_ALNUM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._%\-]*")
 
-# 空泛收尾信号（红线四：没有明确结论/行动/判断方法的空泛表述）。
-_EMPTY_HEDGE_MARKERS = (
-    "有很多看法",
-    "众说纷纭",
-    "没有定论",
-    "难以判断",
-    "见仁见智",
-    "仁者见仁",
-    "不好说",
-    "各有各的",
-    "看法不一",
+# 常见实物名词（用于从数字后提取主体词；命中即返回，未命中回退为相邻 CJK 两字）。
+_SUBJECT_NOUNS = (
+    "用户", "读者", "消费者", "受访者", "人群", "企业", "公司", "学生", "家长",
+    "员工", "网民", "客户", "商户", "开发者", "教师", "医生", "患者", "车主",
+    "购房者", "求职者", "投资人", "商家",
 )
 
-# 结论/行动/判断方法的正向信号（只要出现其一，即不判「无结论」）。
-_CONCLUSION_MARKERS = (
-    "结论",
-    "综上",
-    "总之",
-    "因此",
-    "所以",
-    "应该",
-    "建议",
-    "判断",
-    "取决于",
-    "选择",
-    "标准",
-    "方法",
-    "步骤",
-    "首先",
-    "其次",
-    "才能",
-    "需要",
-    "可以",
-    "不妨",
-    "关键在于",
-    "核心是",
-    "最重要的是",
-    "我认为",
-    "行动",
+# 谓述比对时剔除的虚词/功能字。
+_FUNCTION_CHARS = set("的了是在对有与和之地得吗呢么又很也就还着过把被让等个些这那们及而或可会")
+
+# 空泛收尾信号（红线四的 fail 信号）。
+_HEDGE_PHRASES = (
+    "莫衷一是", "无法给出答案", "无法给出", "留待以后", "以后再", "以后再谈",
+    "争议不断", "孰是孰非", "有很多看法", "尚无定论", "暂无定论", "没有定论",
+    "见仁见智", "众说纷纭", "众说纷", "看法不一", "各有各的", "不好说",
+    "难以判断", "自行判断", "留待", "暂且无法", "尚需观察", "待观察",
+    "未有定论", "未有结论",
 )
 
-# fact 主张类型（对应 article-brief.md：fact 必须有能直接支持它的来源）。
+# 明确结论信号（结论动词 + 具体主张）；不再包含「可以/判断/方法/需要/首先/其次」等宽泛词。
+_STRONG_CONCLUSION_MARKERS = (
+    "结论是", "我的结论", "本文结论", "得出结论", "综上", "总之", "因此", "所以",
+    "建议", "应该", "取决于", "关键在于", "核心是", "最重要的是", "我认为",
+    "我的判断", "判断是", "答案是", "推荐", "应当",
+)
+
 _FACT_TYPE = "fact"
 
-# 文本归一化时剔除的常见虚词（保证「90% 用户支持」与「90% 的用户支持」可对齐）。
-_STOP_CHARS = set("的了是在对有与和之地得吗呢么又很也就还着过把被让")
 
+# ── 工具函数 ────────────────────────────────────────────────────────────────
 
 def _as_list(value: Any) -> list:
     return value if isinstance(value, list) else []
@@ -127,36 +110,58 @@ def _as_dict(value: Any) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _normalize(text: str) -> str:
-    """归一化文本：去空白/标点、统一小写、剔除常见虚词（保留 CJK 与字母数字）。"""
-    cleaned = re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE).lower()
-    return "".join(ch for ch in cleaned if ch not in _STOP_CHARS)
+def _num_key(num: str):
+    """数值归一化：同一数值（90 / 90.0）视为相等；文本回退按字符串。"""
+    try:
+        return float(num)
+    except (TypeError, ValueError):
+        return num
 
 
-_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
-_ALNUM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._%\-]*")
+def _subject_after(text: str, pos: int) -> str:
+    """从数字+单位之后提取主体词：优先命中常见实物名词，否则回退相邻 CJK 两字。"""
+    tail = text[pos:pos + 24]
+    for noun in sorted(_SUBJECT_NOUNS, key=len, reverse=True):
+        if noun in tail:
+            return noun
+    m = re.match(r"[\s的之其中受访者人群]*([\u4e00-\u9fff]{2})", tail)
+    return m.group(1) if m else ""
 
 
-def _tokens(text: str) -> set[str]:
-    """抽取用于相关性比对的内容 token：CJK 连续段 + 其二元组 + 字母数字段。"""
-    toks: set[str] = set()
-    for m in _CJK_RUN_RE.finditer(text):
-        seg = m.group(0)
-        toks.add(seg)
-        for i in range(len(seg) - 1):
-            toks.add(seg[i:i + 2])
-    for m in _ALNUM_RE.finditer(text):
-        t = m.group(0).lower()
+def _number_elements(text: str) -> list[dict[str, str]]:
+    """抽取 (num, unit, subject) 三元组。"""
+    elems: list[dict[str, str]] = []
+    for m in _NUMBER_UNIT_RE.finditer(text):
+        elems.append({
+            "num": m.group(1),
+            "unit": m.group(2),
+            "subject": _subject_after(text, m.end()),
+        })
+    return elems
+
+
+def _content_bigrams(text: str) -> set[str]:
+    """抽取用于谓述比对的内容 bigram（剔除虚词/功能字）+ 字母数字 token。"""
+    cleaned = re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)
+    bigrams: set[str] = set()
+    cjk = re.findall(r"[\u4e00-\u9fff]", cleaned)
+    for i in range(len(cjk) - 1):
+        a, b = cjk[i], cjk[i + 1]
+        if a in _FUNCTION_CHARS or b in _FUNCTION_CHARS:
+            continue
+        bigrams.add(a + b)
+    for t in _ALNUM_RE.findall(text):
+        t = t.lower()
         if len(t) >= 2:
-            toks.add(t)
-    return toks
+            bigrams.add(t)
+    return bigrams
 
 
-def _related(a: str, b: str) -> bool:
-    """两个文本是否共享内容 token（保守：任一共现即视为相关）。"""
-    if not a or not b:
-        return False
-    return bool(_tokens(a) & _tokens(b))
+def _assertion_subject(text: str) -> str:
+    for noun in sorted(_SUBJECT_NOUNS, key=len, reverse=True):
+        if noun in text:
+            return noun
+    return ""
 
 
 def _fact_assertion_segments(article: str) -> list[str]:
@@ -167,23 +172,66 @@ def _fact_assertion_segments(article: str) -> list[str]:
         s = s.strip()
         if not s:
             continue
-        if any(marker in s for marker in _FACT_MARKERS) or _NUMBER_ASSERTION_RE.search(s):
+        if any(marker in s for marker in _FACT_MARKERS) or _NUMBER_UNIT_RE.search(s):
             segments.append(s)
     return segments
 
 
-def _has_empty_hedge(article: str) -> bool:
-    return any(marker in article for marker in _EMPTY_HEDGE_MARKERS)
+def _assertion_supported(assertion: str, source_text: str) -> tuple[bool, str | None]:
+    """判断一条事实断言是否被单个来源支持。返回 (supported, reason)。
 
+    数字/量级要素逐一核对：同一数值 + 同一单位 + 主体词一致（主体需出现在来源文本）。
+    非数字断言：主体必须出现在来源，且谓述内容 bigram 至少共享 2 个。
+    """
+    elems = _number_elements(assertion)
+    if elems:
+        source_elems = _number_elements(source_text)
+        for elem in elems:
+            covered = any(
+                _num_key(se["num"]) == _num_key(elem["num"]) and se["unit"] == elem["unit"]
+                and (not elem["subject"] or elem["subject"] in source_text)
+                for se in source_elems
+            )
+            if not covered:
+                subject = elem["subject"] or "（未识别主体）"
+                return False, f"数值 {elem['num']}{elem['unit']}（主体「{subject}」）未被来源覆盖或数值不一致"
+        return True, None
 
-def _has_conclusion(article: str) -> bool:
-    return any(marker in article for marker in _CONCLUSION_MARKERS)
+    # 非数字事实断言：主干覆盖（主体 + 谓述核心词）。
+    subject = _assertion_subject(assertion)
+    if subject and subject not in source_text:
+        return False, f"断言主体「{subject}」未出现在来源中"
+    shared = _content_bigrams(assertion) & _content_bigrams(source_text)
+    if len(shared) < 2:
+        return False, f"来源与断言仅共享 {len(shared)} 个内容词，谓述不覆盖"
+    return True, None
 
 
 def _verified_sources(sources: dict) -> list[dict]:
     return [s for s in _as_list(sources.get("sources"))
             if isinstance(s, dict) and s.get("status") == "verified"]
 
+
+def _source_text(entry: dict) -> str:
+    return (entry.get("claim") or "") + " " + (entry.get("title") or "")
+
+
+def _ending(text: str) -> str:
+    tail = text.strip()
+    if len(tail) > 200:
+        tail = tail[-200:]
+    return tail
+
+
+def _has_hedge(text: str) -> bool:
+    return any(h in text for h in _HEDGE_PHRASES)
+
+
+def _has_conclusion(text: str) -> bool:
+    return any(m in text for m in _STRONG_CONCLUSION_MARKERS)
+
+
+# ── 主判定 ──────────────────────────────────────────────────────────────────
 
 def editorial_blockers(
     *,
@@ -193,10 +241,7 @@ def editorial_blockers(
     personal_materials_available: bool | None = None,
     disabled: Iterable[str] = (),
 ) -> list[str]:
-    """返回审稿红线阻断项（中文，一句话一条）。无红线信号返回空列表。
-
-    `disabled` 为需要关闭的开关名集合（反证用），缺省全部开启。
-    """
+    """返回审稿红线阻断项（中文，一句话一条）。无红线信号返回空列表。"""
     disabled_set = set(disabled or ())
     blockers: list[str] = []
     claims_data = _as_dict(claims)
@@ -213,7 +258,7 @@ def editorial_blockers(
         if isinstance(c, dict) and c.get("type") == _FACT_TYPE
     ]
 
-    # 红线一：编造亲历/采访/场景。有第一人称事件/访谈标记，却没有用户提供的材料来源。
+    # 红线一：编造亲历/采访/场景。
     if GUARD_FABRICATION not in disabled_set:
         if any(marker in article for marker in _FABRICATED_MARKERS):
             has_user_material = "user_provided" in statuses or personal_materials_available is True
@@ -224,29 +269,26 @@ def editorial_blockers(
 
     # 红线二：核心具体事实没有来源（或来源不支持正文说法）。
     if GUARD_UNSOURCED_FACT not in disabled_set:
-        body_has_fact_signal = any(marker in article for marker in _FACT_MARKERS) or bool(_NUMBER_ASSERTION_RE.search(article))
-        if body_has_fact_signal:
+        segments = _fact_assertion_segments(article)
+        if segments:
             verified = _verified_sources(sources_data)
             if not verified:
                 blockers.append(
-                    "核心具体事实无来源：正文出现数字/研究/数据/统计类断言，但来源账本没有 verified 来源"
+                    "核心具体事实无来源：正文出现数字/研究/数据类断言，但来源账本没有 verified 来源"
                 )
             else:
-                # 每条事实断言必须至少被一条 verified 来源的 claim/title 支撑。
-                uncovered = [
-                    seg for seg in _fact_assertion_segments(article)
-                    if not any(
-                        _related(seg, (s.get("claim") or "") + (s.get("title") or ""))
+                for seg in segments:
+                    supported = any(
+                        _assertion_supported(seg, _source_text(s))[0]
                         for s in verified
                     )
-                ]
-                if uncovered:
-                    blockers.append(
-                        "核心具体事实无来源：正文断言与来源账本中任何 verified 来源都不相关，来源不支持正文说法"
-                    )
+                    if not supported:
+                        blockers.append(
+                            f"核心具体事实无来源或来源不支持：断言「{seg}」缺匹配的 verified 来源"
+                        )
 
     # 红线三：论点与证据脱节。fact 主张的 source_ids 必须解析到真实 verified 来源，
-    # 且来源 claim 与主张文本相关；解析不到或无关来源即脱节。
+    # 且来源 claim 必须支撑该主张断言。
     if GUARD_DISCONNECT not in disabled_set:
         for claim in fact_claims:
             text = claim.get("text") or ""
@@ -278,18 +320,22 @@ def editorial_blockers(
                     "论点与证据脱节：fact 主张引用的来源 " + "、".join(unverified) + " 状态不是 verified"
                 )
             if resolved and text and not any(
-                _related(text, entry.get("claim") or "") for entry in resolved
+                _assertion_supported(text, _source_text(entry))[0]
+                for entry in resolved
             ):
                 blockers.append(
-                    "论点与证据脱节：fact 主张引用的来源 claim 不支撑该断言"
+                    "论点与证据脱节：fact 主张引用的来源 claim 不支撑该断言（缺要素或数值不一致）"
                 )
 
-    # 红线四：文章没有给目标读者明确的结论、行动或判断方法。
+    # 红线四：文章必须给目标读者明确的结论、行动或判断方法（fail-closed）。
     if GUARD_NO_CONCLUSION not in disabled_set:
-        if _has_empty_hedge(article) and not _has_conclusion(article):
-            blockers.append(
-                "文章没有给目标读者明确的结论、行动或判断方法"
-            )
+        ending = _ending(article)
+        hedge = _has_hedge(ending)
+        conclusion = _has_conclusion(ending)
+        if not conclusion:
+            if hedge:
+                blockers.append("文章没有给目标读者明确的结论、行动或判断方法")
+            else:
+                blockers.append("未能识别明确结论，请补结论/行动/判断方法")
 
-    # 去重（保持顺序）。
     return list(dict.fromkeys(blockers))
