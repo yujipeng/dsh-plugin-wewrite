@@ -78,4 +78,27 @@ describe('manifest 完整性（方案 A + 返修 4）', () => {
       expect(r.adapted).toBe(false);
     }
   });
+
+  it('方案 B 批一：两个新 skill 的 SKILL.md 不含 Bash/Write/Edit/Glob 工具与 wewrite CLI 调用', () => {
+    for (const rel of ['skills/wewrite-style/SKILL.md', 'skills/wewrite-learn/SKILL.md']) {
+      const raw = readFileSync(resolve(ROOT, rel), 'utf8');
+      expect(raw, `${rel} 含 Bash`).not.toMatch(/\bBash\b/);
+      expect(raw, `${rel} 含 Write`).not.toMatch(/\bWrite\b/);
+      expect(raw, `${rel} 含 Edit`).not.toMatch(/\bEdit\b/);
+      expect(raw, `${rel} 含 Glob`).not.toMatch(/\bGlob\b/);
+      expect(raw, `${rel} 含 wewrite CLI 调用`).not.toMatch(/`wewrite /);
+      expect(raw, `${rel} 含 allowed-tools`).not.toMatch(/allowed-tools/);
+    }
+  });
+
+  it('方案 B 批一：三个 references 行数与上游一致（88 / 60 / 51）', () => {
+    const lines = (rel: string) => {
+      const text = readFileSync(resolve(ROOT, rel), 'utf8');
+      // 与 `wc -l` 一致：统计换行符数量。
+      return (text.match(/\n/g) ?? []).length;
+    };
+    expect(lines('skills/wewrite-style/references/onboard.md')).toBe(88);
+    expect(lines('skills/wewrite-style/references/style-template.md')).toBe(60);
+    expect(lines('skills/wewrite-learn/references/learn-edits.md')).toBe(51);
+  });
 });
