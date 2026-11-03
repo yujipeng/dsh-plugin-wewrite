@@ -37,6 +37,14 @@ OPERATIONS = (
     "draft.send",
     "draft.status",
     "draft.recover",
+    "style.get",
+    "style.put",
+    "style.validate",
+    "learn.record",
+    "learn.list",
+    "exemplar.put",
+    "exemplar.list",
+    "exemplar.get",
 )
 
 KINDS = ("brief", "claims", "draft", "article", "review_report", "sources",
@@ -84,6 +92,25 @@ def _require_request_id(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise invalid_input("requestId 不合法")
     return value
+
+
+def _optional_binding_context_any_run(p: dict) -> dict | None:
+    """可选 fencing 上下文（不绑 runId 的账号级操作）：只校验形状。
+
+    账号级写操作（style.put/learn.record/exemplar.put）一旦携带 context 即属 Agent
+    写路径，业务层据此返回 FORBIDDEN；这里只保证 context 形状合法。
+    """
+    ctx = p.get("context")
+    if ctx is None:
+        return None
+    if not isinstance(ctx, dict):
+        raise invalid_input("context 不合法")
+    run_id = _require_run_id(ctx.get("runId"))
+    workflow_id = _require_str(ctx.get("workflowId"), "context.workflowId")
+    generation = ctx.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise invalid_input("context.generation 不合法")
+    return {"runId": run_id, "workflowId": workflow_id, "generation": generation}
 
 
 def _optional_binding_context(p: dict, run_id: str) -> dict | None:
@@ -408,6 +435,69 @@ def _v_draft_recover(p: dict) -> dict:
     return {"requestId": request_id, "runId": run_id, "intentId": intent_id}
 
 
+def _v_style_get(p: dict) -> dict:
+    allowed = set()
+    unknown = set(p.keys()) - allowed
+    if unknown:
+        raise invalid_input(f"未知字段: {', '.join(sorted(unknown))}")
+    return {}
+
+
+def _v_style_put(p: dict) -> dict:
+    style = p.get("style")
+    if not isinstance(style, dict):
+        raise invalid_input("style 不合法")
+    context = _optional_binding_context_any_run(p)
+    return {"style": style, "context": context}
+
+
+def _v_style_validate(p: dict) -> dict:
+    style = p.get("style")
+    if not isinstance(style, dict):
+        raise invalid_input("style 不合法")
+    return {"style": style}
+
+
+def _v_learn_record(p: dict) -> dict:
+    draft = _require_str(p.get("draft"), "draft", allow_empty=True)
+    final = _require_str(p.get("final"), "final", allow_empty=True)
+    diff_summary = p.get("diffSummary")
+    if not isinstance(diff_summary, dict):
+        raise invalid_input("diffSummary 不合法")
+    patterns = p.get("patterns", [])
+    if not isinstance(patterns, list):
+        raise invalid_input("patterns 不合法")
+    context = _optional_binding_context_any_run(p)
+    return {"draft": draft, "final": final, "diffSummary": diff_summary,
+            "patterns": patterns, "context": context}
+
+
+def _v_learn_list(p: dict) -> dict:
+    return {}
+
+
+def _v_exemplar_put(p: dict) -> dict:
+    title = _require_str(p.get("title"), "title")
+    content = p.get("content")
+    if not isinstance(content, str):
+        raise invalid_input("content 不合法")
+    context = _optional_binding_context_any_run(p)
+    out: dict = {"title": title, "content": content, "context": context}
+    for field in ("source", "category", "ownership", "authenticity"):
+        if p.get(field) is not None:
+            out[field] = p[field]
+    return out
+
+
+def _v_exemplar_list(p: dict) -> dict:
+    return {}
+
+
+def _v_exemplar_get(p: dict) -> dict:
+    exemplar_id = _require_str(p.get("id"), "id")
+    return {"id": exemplar_id}
+
+
 _VALIDATORS = {
     "diagnose": _v_diagnose,
     "snapshot": _v_snapshot,
@@ -432,4 +522,12 @@ _VALIDATORS = {
     "draft.send": _v_draft_send,
     "draft.status": _v_draft_status,
     "draft.recover": _v_draft_recover,
+    "style.get": _v_style_get,
+    "style.put": _v_style_put,
+    "style.validate": _v_style_validate,
+    "learn.record": _v_learn_record,
+    "learn.list": _v_learn_list,
+    "exemplar.put": _v_exemplar_put,
+    "exemplar.list": _v_exemplar_list,
+    "exemplar.get": _v_exemplar_get,
 }

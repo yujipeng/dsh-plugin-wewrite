@@ -81,8 +81,8 @@ function registerPushStub(scopedTools: ToolRuntime) {
 describe('S4 推送工具注册条件（第一闸门禁）', () => {
   it('pushEnabled=false 时 AGENT_TOOL_NAMES 不含 wewrite_push_draft', () => {
     expect([...AGENT_TOOL_NAMES]).not.toContain(PUSH_TOOL_NAME);
-    // 常驻工具 8 个，推送工具单独条件注册。
-    expect(AGENT_TOOL_NAMES).toHaveLength(8);
+    // 常驻工具 11 个（8 写作 + 3 账号级只读），推送工具单独条件注册。
+    expect(AGENT_TOOL_NAMES).toHaveLength(11);
   });
 
   it('buildPushTool 产出 wewrite_push_draft，且 guard 白名单包含它', () => {

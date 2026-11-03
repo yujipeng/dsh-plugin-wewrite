@@ -36,7 +36,7 @@ function makeService() {
 }
 
 describe('Agent 工具（设计 §5 表格）', () => {
-  it('8 个受控工具名与设计 §5 表格一致，且不注册 wewrite_push_draft', () => {
+  it('11 个受控工具名与设计 §5 表格一致（8 写作 + 3 账号级只读），且不注册 wewrite_push_draft', () => {
     expect([...AGENT_TOOL_NAMES].sort()).toEqual(
       [
         'wewrite_run_start',
@@ -47,6 +47,9 @@ describe('Agent 工具（设计 §5 表格）', () => {
         'wewrite_review',
         'wewrite_run_finish',
         'wewrite_preview',
+        'wewrite_style_get',
+        'wewrite_learn_list',
+        'wewrite_exemplar_list',
       ].sort(),
     );
     expect(AGENT_TOOL_NAMES).not.toContain('wewrite_push_draft');
@@ -54,7 +57,7 @@ describe('Agent 工具（设计 §5 表格）', () => {
 
   it('工具定义可构建，名与参数 schema 具备', () => {
     const defs = buildAgentTools(makeService());
-    expect(defs).toHaveLength(8);
+    expect(defs).toHaveLength(11);
     for (const def of defs) {
       expect(CONTROLLED_TOOL_SET.has(def.name)).toBe(true);
       expect(typeof def.execute).toBe('function');

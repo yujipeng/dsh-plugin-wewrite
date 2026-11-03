@@ -46,6 +46,14 @@ const HANDLERS: Record<string, EndpointHandler> = {
   'wechat/prepareDraft': (s, p) => s.prepareDraft(p as never),
   'wechat/pushDraft': (s, p) => s.pushDraft(p as never),
   'wechat/pushStatus': (s, p) => s.pushStatus(p as never),
+  'style/get': (s) => s.styleGet(),
+  'style/put': (s, p) => s.stylePut(p as never),
+  'style/validate': (s, p) => s.styleValidate(p as never),
+  'learn/record': (s, p) => s.learnRecord(p as never),
+  'learn/list': (s) => s.learnList(),
+  'exemplar/put': (s, p) => s.exemplarPut(p as never),
+  'exemplar/list': (s) => s.exemplarList(),
+  'exemplar/get': (s, p) => s.exemplarGet(p as never),
 };
 
 export function createHandler(service: WorkbenchService): RpcHandler {

@@ -76,7 +76,7 @@ print(json.dumps({"codes": ERROR_CODES, "messages": ERROR_MESSAGES,
     }
   });
 
-  it('端点全集覆盖设计 §4 的 17 个 RPC', () => {
+  it('端点全集覆盖设计 §4 的 17 个 RPC + 方案 B 批一 8 个账号级端点', () => {
     expect(Object.keys(rpcContract).sort()).toEqual(
       [
         'snapshot',
@@ -97,6 +97,14 @@ print(json.dumps({"codes": ERROR_CODES, "messages": ERROR_MESSAGES,
         'wechat/prepareDraft',
         'wechat/pushDraft',
         'wechat/pushStatus',
+        'style/get',
+        'style/put',
+        'style/validate',
+        'learn/record',
+        'learn/list',
+        'exemplar/put',
+        'exemplar/list',
+        'exemplar/get',
       ].sort(),
     );
   });
@@ -354,6 +362,20 @@ describe('合法请求与响应形状（表驱动抽查）', () => {
     expect(
       AssessmentSchema.safeParse({ ...base, dimensions: { ...dims(), readability: 6 } }).success,
     ).toBe(false);
+  });
+
+  it('方案 B 批一：style/learn/exemplar 请求 schema 拒绝非对象 style 与未知字段', () => {
+    const validStyle = { name: 'x', industry: 'y', topics: ['a'], tone: 't', theme: 'professional-clean' };
+    expect(rpcContract['style/put'].request.safeParse({ style: validStyle }).success).toBe(true);
+    expect(rpcContract['style/put'].request.safeParse({ style: 'not-object' }).success).toBe(false);
+    expect(rpcContract['style/put'].request.safeParse({ style: validStyle, __extra: 1 }).success).toBe(false);
+    expect(rpcContract['style/validate'].request.safeParse({ style: validStyle }).success).toBe(true);
+    expect(rpcContract['learn/record'].request.safeParse({
+      draft: 'a', final: 'b', diffSummary: {}, patterns: [],
+    }).success).toBe(true);
+    expect(rpcContract['learn/record'].request.safeParse({ draft: 'a', final: 'b', diffSummary: {} }).success).toBe(false);
+    expect(rpcContract['exemplar/put'].request.safeParse({ title: 't', content: 'c' }).success).toBe(true);
+    expect(rpcContract['exemplar/get'].request.safeParse({ id: '0123456789abcdef' }).success).toBe(true);
   });
 
   it('Report.pass_number 仅 1|2，decision 非法 enum 拒', () => {

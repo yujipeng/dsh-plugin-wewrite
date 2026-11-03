@@ -14,7 +14,7 @@ import type { ToolBindingContext } from '../../shared/contract';
 import type { WorkbenchService } from '../workbench-service';
 import { PUSH_TOOL_NAME } from '../push-approval';
 
-/** 工具名 → schema 名称（供 service 路由）。8 个常驻写作工具；推送工具条件注册。 */
+/** 工具名 → schema 名称（供 service 路由）。8 个常驻写作工具 + 3 个账号级只读工具；推送工具条件注册。 */
 export const AGENT_TOOL_NAMES = [
   'wewrite_run_start',
   'wewrite_run_detail',
@@ -24,6 +24,9 @@ export const AGENT_TOOL_NAMES = [
   'wewrite_review',
   'wewrite_run_finish',
   'wewrite_preview',
+  'wewrite_style_get',
+  'wewrite_learn_list',
+  'wewrite_exemplar_list',
 ] as const;
 
 export type AgentToolName = (typeof AGENT_TOOL_NAMES)[number];
@@ -296,7 +299,47 @@ export function buildAgentTools(service: WorkbenchService): ToolDefinition[] {
     }, (args, ctx) => service.toolPreview(args as never, ctx)),
   );
 
+  // ── 方案 B 批一：账号级只读工具（不绑定 runId，不参与 run/generation 栅栏）──────────
+  defs.push(
+    accountTool('wewrite_style_get', '读取账号级写作风格配置 style.yaml（topics/target_audience/blacklist/content_style 等字段与原文）。账号级配置，不绑定 runId。', {
+    }, (args) => service.styleGet()),
+  );
+
+  defs.push(
+    accountTool('wewrite_learn_list', '列出已记录的改稿学习条目（learn.record 历史，含 diff 摘要与 pattern 数）。账号级配置，不绑定 runId。', {
+    }, (args) => service.learnList()),
+  );
+
+  defs.push(
+    accountTool('wewrite_exemplar_list', '列出范文库（exemplar.list：id/title/source/category/ownership）。账号级配置，不绑定 runId。', {
+    }, (args) => service.exemplarList()),
+  );
+
   return defs;
+}
+
+/** 账号级工具：不查 run 绑定，不带 runId 参数（与现有 run/generation 绑定校验工具分开）。 */
+function accountTool(
+  name: AgentToolName,
+  description: string,
+  parameters: Record<string, unknown>,
+  run: (args: Record<string, unknown>) => Promise<unknown>,
+): ToolDefinition {
+  return defineTool({
+    name,
+    description,
+    parameters: parameters as never,
+    output: {
+      schema: { type: 'json' as const },
+      render: (_args, value) => [renderResult(value)],
+    },
+    isConcurrencySafe: () => false,
+    async execute(args) {
+      const service = serviceRef;
+      if (!service) throw new Error('工作台服务不可用');
+      return (await run(args as Record<string, unknown>)) as never;
+    },
+  });
 }
 
 /**

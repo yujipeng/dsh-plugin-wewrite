@@ -278,6 +278,67 @@ const StepStateSchema = z.strictObject({
 
 const OperationStatusSchema = z.enum(PUSH_STATUSES);
 
+// ── 方案 B 批一：style / learn / exemplar 账号级配置 schema ────────────────
+
+/** style.yaml 内容：字段结构由 facade 权威校验（拒绝未知字段），这里只约束容器形状。 */
+const StyleObjectSchema = z.record(z.unknown());
+
+const StyleViewSchema = z.strictObject({
+  exists: z.boolean(),
+  style: StyleObjectSchema,
+  raw: z.string(),
+  version: HashSchema,
+});
+
+const StylePutResultSchema = z.strictObject({
+  exists: z.literal(true),
+  style: StyleObjectSchema,
+  version: HashSchema,
+  backup: z.string(),
+});
+
+const StyleValidateResultSchema = z.strictObject({
+  valid: z.boolean(),
+  issues: z.array(z.string()),
+});
+
+const LearnRecordResultSchema = z.strictObject({
+  file: z.string(),
+  date: z.string(),
+  version: HashSchema,
+});
+
+const ExemplarIndexItemSchema = z.strictObject({
+  id: z.string(),
+  title: z.string(),
+  source: z.string(),
+  category: z.string(),
+  ownership: z.string(),
+  authenticity: z.string(),
+});
+
+const ExemplarPutResultSchema = z.strictObject({
+  id: z.string(),
+  title: z.string(),
+  source: z.string(),
+  category: z.string(),
+  ownership: z.string(),
+  authenticity: z.string(),
+  version: HashSchema,
+});
+
+const ExemplarGetResultSchema = z.strictObject({
+  id: z.string(),
+  title: z.string().nullable(),
+  source: z.string().nullable(),
+  category: z.string().nullable(),
+  ownership: z.string(),
+  authenticity: z.string(),
+  allowed_uses: z.array(z.string()),
+  personal_materials_reusable: z.boolean(),
+  content: z.string(),
+});
+
 export const rpcContract = {
   snapshot: {
     request: EmptyRequest,
@@ -486,6 +547,62 @@ export const rpcContract = {
       issue: IssueSchema.nullable(),
       dryRun: z.boolean(),
     })),
+  },
+  'style/get': {
+    request: EmptyRequest,
+    response: businessResult(StyleViewSchema),
+  },
+  'style/put': {
+    request: z.strictObject({
+      style: StyleObjectSchema,
+      // 账号级写操作不携带 run 绑定上下文；任何 context 都被视为 Agent 写路径并拒绝。
+      context: z.unknown().optional(),
+    }),
+    response: businessResult(StylePutResultSchema),
+  },
+  'style/validate': {
+    request: z.strictObject({ style: StyleObjectSchema }),
+    response: businessResult(StyleValidateResultSchema),
+  },
+  'learn/record': {
+    request: z.strictObject({
+      draft: z.string(),
+      final: z.string(),
+      diffSummary: z.record(z.unknown()),
+      patterns: z.array(z.record(z.unknown())),
+      context: z.unknown().optional(),
+    }),
+    response: businessResult(LearnRecordResultSchema),
+  },
+  'learn/list': {
+    request: EmptyRequest,
+    response: businessResult(z.strictObject({
+      items: z.array(z.record(z.unknown())),
+      total: z.number().int(),
+    })),
+  },
+  'exemplar/put': {
+    request: z.strictObject({
+      title: IdSchema,
+      content: z.string(),
+      source: z.string().optional(),
+      category: z.string().optional(),
+      ownership: z.string().optional(),
+      authenticity: z.string().optional(),
+      context: z.unknown().optional(),
+    }),
+    response: businessResult(ExemplarPutResultSchema),
+  },
+  'exemplar/list': {
+    request: EmptyRequest,
+    response: businessResult(z.strictObject({
+      items: z.array(ExemplarIndexItemSchema),
+      total: z.number().int(),
+    })),
+  },
+  'exemplar/get': {
+    request: z.strictObject({ id: z.string() }),
+    response: businessResult(ExemplarGetResultSchema),
   },
 } as const;
 

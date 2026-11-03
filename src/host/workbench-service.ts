@@ -229,6 +229,40 @@ export class WorkbenchService {
     return bridgeResult(await this.safeBridge('draft.status', payload));
   }
 
+  // ── 方案 B 批一：style / learn / exemplar 账号级能力 ──────────────────────
+
+  async styleGet(): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('style.get', {}));
+  }
+
+  async stylePut(payload: { style: unknown }): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('style.put', payload));
+  }
+
+  async styleValidate(payload: { style: unknown }): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('style.validate', payload));
+  }
+
+  async learnRecord(payload: { draft: string; final: string; diffSummary: unknown; patterns: unknown[] }): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('learn.record', payload));
+  }
+
+  async learnList(): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('learn.list', {}));
+  }
+
+  async exemplarPut(payload: { title: string; content: string; source?: string; category?: string; ownership?: string; authenticity?: string }): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('exemplar.put', payload));
+  }
+
+  async exemplarList(): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('exemplar.list', {}));
+  }
+
+  async exemplarGet(payload: { id: string }): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('exemplar.get', payload));
+  }
+
   /**
    * S4 推送工具第二闸：execute 内业务状态复验 + 经私有 stdin 传凭据发 draft.send。
    * 这是业务状态复验，不是第二次证明宿主审批（宿主 ask 的 allowed-once 是第一闸权威）。
