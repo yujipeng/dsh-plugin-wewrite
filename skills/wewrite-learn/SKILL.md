@@ -7,9 +7,10 @@ whenToUse: 需要记录改稿学习或查看范文库时
 
 ## 运行约定
 
-- **受控工具**：本批提供 `wewrite_learn_list`（列出改稿学习条目）与
-  `wewrite_exemplar_list`（列出范文库）两个只读工具。改稿记录（learn.record）与范文入库
-  （exemplar.put）由工作台在「从编辑器保存时记录差异」写入，Agent 没有文件写入能力。
+- **受控工具**：只读走 `wewrite_learn_list`（列出改稿学习条目）、`wewrite_exemplar_list`
+  （列出范文库）、`wewrite_exemplar_get`（读单篇范文）。`wewrite_learn_record` /
+  `wewrite_exemplar_put` 已注册，但**是账号级配置，只有 owner 可改**——Agent 调用一律
+  `FORBIDDEN`，实际写入由工作台（编辑器保存时记录差异 / 范文库入口）完成。
 - **{home}**：用户状态目录（工作台数据根）。lessons/exemplars 全在 {home}，不在仓库；
   references 文档中的状态路径同此约定。
 - **`读取: <路径>`** = 用受控工具或随包 references 真实读完该文件再继续，不是注释。
@@ -35,4 +36,5 @@ whenToUse: 需要记录改稿学习或查看范文库时
 ## 边界
 
 - 不执行 shell、网络抓取、代码执行、委派；lessons/exemplars 的写入只发生在工作台
-  （learn.record / exemplar.put 为 owner 账号级写操作），Agent 工具只有只读入口。
+  （learn.record / exemplar.put 为 owner 账号级写操作）。Agent 侧 `wewrite_learn_record` /
+  `wewrite_exemplar_put` 调用一律返回 `FORBIDDEN`（中文提示到工作台操作）。

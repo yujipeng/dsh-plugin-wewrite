@@ -36,7 +36,7 @@ function makeService() {
 }
 
 describe('Agent 工具（设计 §5 表格）', () => {
-  it('11 个受控工具名与设计 §5 表格一致（8 写作 + 3 账号级只读），且不注册 wewrite_push_draft', () => {
+  it('16 个受控工具名与设计 §5 表格一致（8 写作 + 8 账号级：3 写 5 读），且不注册 wewrite_push_draft', () => {
     expect([...AGENT_TOOL_NAMES].sort()).toEqual(
       [
         'wewrite_run_start',
@@ -48,8 +48,13 @@ describe('Agent 工具（设计 §5 表格）', () => {
         'wewrite_run_finish',
         'wewrite_preview',
         'wewrite_style_get',
+        'wewrite_style_validate',
+        'wewrite_style_put',
+        'wewrite_learn_record',
         'wewrite_learn_list',
+        'wewrite_exemplar_put',
         'wewrite_exemplar_list',
+        'wewrite_exemplar_get',
       ].sort(),
     );
     expect(AGENT_TOOL_NAMES).not.toContain('wewrite_push_draft');
@@ -57,7 +62,7 @@ describe('Agent 工具（设计 §5 表格）', () => {
 
   it('工具定义可构建，名与参数 schema 具备', () => {
     const defs = buildAgentTools(makeService());
-    expect(defs).toHaveLength(11);
+    expect(defs).toHaveLength(16);
     for (const def of defs) {
       expect(CONTROLLED_TOOL_SET.has(def.name)).toBe(true);
       expect(typeof def.execute).toBe('function');
@@ -70,6 +75,52 @@ describe('Agent 工具（设计 §5 表格）', () => {
     // 不包含 scope-local 名与 reserved run_code。
     expect(INHERITED_TOOL_ALLOWLIST).not.toContain('wewrite_run_start');
     expect(INHERITED_TOOL_ALLOWLIST).not.toContain(RUN_CODE_NAME);
+  });
+});
+
+describe('账号级工具：写工具注册但 Agent 调用即拒，读工具可用', () => {
+  it('三个写工具经 Agent 路径调用返回 FORBIDDEN（中文文案指向工作台）', async () => {
+    const service = makeService();
+    const stylePut = await service.toolStylePut();
+    const learnRecord = await service.toolLearnRecord();
+    const exemplarPut = await service.toolExemplarPut();
+    for (const r of [stylePut, learnRecord, exemplarPut]) {
+      expect(r.ok).toBe(false);
+      const err = (r as { ok: false; error: { code: string; message: string } }).error;
+      expect(err.code).toBe('FORBIDDEN');
+      expect(err.message).toContain('owner');
+    }
+  });
+
+  it('两个新只读工具正向可用（style_validate / exemplar_get 走 bridge）', async () => {
+    const workflow = new AgentWorkflow({
+      runtime: {
+        create: async () => { throw new Error('agents 缺失'); },
+        resume: async () => { throw new Error('agents 缺失'); },
+        get: () => undefined,
+      },
+      bridge: async () => ({ ok: false, error: { code: 'INTERNAL', message: '内部错误', retryable: false } }),
+      homeLabel: '数据根',
+      mainSkillName: 'wewrite',
+      randomId: () => 'id',
+    });
+    const calls: string[] = [];
+    const service = new WorkbenchService({
+      bridge: async (operation) => {
+        calls.push(operation);
+        if (operation === 'style.validate') return { ok: true, data: { valid: true, issues: [] } };
+        if (operation === 'exemplar.get') return { ok: true, data: { id: '0123456789abcdef', content: 'x' } };
+        return { ok: false, error: { code: 'INTERNAL', message: '内部错误', retryable: false } };
+      },
+      workflow,
+      randomId: () => 'id',
+    });
+    const v = await service.toolStyleValidate({ style: { name: 'x' } });
+    expect(v.ok).toBe(true);
+    expect(calls).toContain('style.validate');
+    const g = await service.toolExemplarGet({ id: '0123456789abcdef' });
+    expect(g.ok).toBe(true);
+    expect(calls).toContain('exemplar.get');
   });
 });
 

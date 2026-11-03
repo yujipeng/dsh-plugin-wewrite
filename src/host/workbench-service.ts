@@ -357,6 +357,41 @@ export class WorkbenchService {
     return this.articlePreview({ ...args, kind: args.kind });
   }
 
+  // ── 方案 B 批一：账号级工具（不绑定 runId）───────────────────────────────
+  // 读工具正常走 RPC；写工具「存在但 Agent 调用即拒」——账号级配置仅 owner 可改。
+
+  async toolStyleGet(): Promise<BusinessResult<unknown>> {
+    return this.styleGet();
+  }
+
+  async toolStyleValidate(args: { style: unknown }): Promise<BusinessResult<unknown>> {
+    return this.styleValidate({ style: args.style });
+  }
+
+  async toolStylePut(): Promise<BusinessResult<unknown>> {
+    return businessFailure('FORBIDDEN', '账号级配置仅 owner 可改，请在工作台设置面板操作');
+  }
+
+  async toolLearnRecord(): Promise<BusinessResult<unknown>> {
+    return businessFailure('FORBIDDEN', '账号级配置仅 owner 可改，请在工作台操作');
+  }
+
+  async toolLearnList(): Promise<BusinessResult<unknown>> {
+    return this.learnList();
+  }
+
+  async toolExemplarPut(): Promise<BusinessResult<unknown>> {
+    return businessFailure('FORBIDDEN', '账号级配置仅 owner 可改，请在工作台范文库操作');
+  }
+
+  async toolExemplarList(): Promise<BusinessResult<unknown>> {
+    return this.exemplarList();
+  }
+
+  async toolExemplarGet(args: { id: string }): Promise<BusinessResult<unknown>> {
+    return this.exemplarGet({ id: args.id });
+  }
+
   /** 工具入场上下文校验：参数 runId 必须与真实 Agent 绑定 runId 相同（服务端绑定，不信模型自报）。 */
   private assertToolContext(runId: string, ctx: ToolBindingContext): void {
     if (ctx.runId !== runId) {

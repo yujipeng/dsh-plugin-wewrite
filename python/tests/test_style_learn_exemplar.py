@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import yaml
 
-from conftest import call_facade, make_home
+from conftest import call_facade, facade_env, make_home
 
 VALID_STYLE = {
     "name": "零号AI",
@@ -139,30 +140,39 @@ def test_style_put_backs_up_previous_version(tmp_path):
     assert bak.read_bytes() == v1
 
 
-def test_style_put_atomic_no_partial_write_on_injected_failure(tmp_path, monkeypatch):
-    """注入异常让写入中途失败后，style.yaml 保持旧内容不变（不能半写）。
+def test_style_put_atomic_no_partial_write_on_injected_failure(tmp_path):
+    """注入 os.replace 失败（临时文件已生成、进入替换步骤才抛）后，style.yaml 保持旧内容不变。
 
-    原子性必须跨进程验证才有意义：这里用「目录只读」强制 replace 失败，
-    再经 facade 子进程发起第二次 put——原子写（临时文件 + replace）失败后旧内容不变。
+    用独立子进程 replace_fail_facade 走标准协议入口：REPLACE_FAIL_FILE=style.yaml，
+    storage._write_file_atomically 里 os.replace 抛 OSError → 临时文件被 unlink →
+    协议层收敛为业务失败 INTERNAL。断言的错误码收窄，不再用 in (...) 兜底。
     """
-    import os
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
 
     home = make_home(tmp_path)
     assert _style_put(home, VALID_STYLE)["ok"] is True
     old_bytes = (home / "style.yaml").read_bytes()
     old_hash = hashlib.sha256(old_bytes).hexdigest()
 
-    # 让 home 目录只读：临时文件可创建失败（O_EXCL）或 replace 失败，二者都不得半写 style.yaml。
-    # 注意：锁文件已存在，第二次 put 会先备份（写 style.yaml.bak）再写 style.yaml。
-    # 我们拦截备份后的落盘：直接把 style.yaml 换成只读的旧文件 + 只读目录，使 replace 失败。
-    os.chmod(home, 0o555)
-    try:
-        resp = _style_put(home, {**VALID_STYLE, "tone": "轻松有趣"})
-    finally:
-        os.chmod(home, 0o755)
+    env = facade_env(str(home))
+    env["REPLACE_FAIL_FILE"] = "style.yaml"
+    req = json.dumps({
+        "protocol": 1, "requestId": "r", "operation": "style.put",
+        "payload": {"style": {**VALID_STYLE, "tone": "轻松有趣"}},
+    }, ensure_ascii=False)
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parent / "replace_fail_facade.py")],
+        input=req + "\n", capture_output=True, text=True, env=env, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    resp = json.loads(proc.stdout)
 
-    assert resp["ok"] is False
-    assert resp["error"]["code"] in ("FORBIDDEN", "INTERNAL")
+    assert resp["ok"] is False, resp
+    # 注入的 OSError 在协议层收敛为业务失败 INTERNAL（不泄露栈），错误码收窄不兜底。
+    assert resp["error"]["code"] == "INTERNAL", resp
     # style.yaml 字节不变，未被半写。
     after = (home / "style.yaml").read_bytes()
     assert hashlib.sha256(after).hexdigest() == old_hash
@@ -271,3 +281,58 @@ def test_exemplar_get_not_found(tmp_path):
     resp = call_facade(str(home), "exemplar.get", {"id": "0123456789abcdef"})
     assert resp["ok"] is False
     assert resp["error"]["code"] == "NOT_FOUND"
+
+
+# ── 写入侧 symlink 逃逸负例 ────────────────────────────────────────────────
+
+def test_style_put_rejects_style_symlink_escape(tmp_path):
+    """style.yaml 被预置为指向 home 外的 symlink：写入必须拒绝，home 外文件字节不变。"""
+    home = make_home(tmp_path)
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("attacker-seed", encoding="utf-8")
+    os.symlink(outside, home / "style.yaml")
+
+    resp = _style_put(home, VALID_STYLE)
+    assert resp["ok"] is False, resp
+    assert resp["error"]["code"] == "FORBIDDEN", resp
+    assert "不是普通文件" in resp["error"]["message"]
+    # home 外文件未被改写；style.yaml 仍是指向 outside 的 symlink。
+    assert outside.read_text(encoding="utf-8") == "attacker-seed"
+    assert (home / "style.yaml").is_symlink()
+
+
+def test_learn_record_rejects_lessons_symlink_escape(tmp_path):
+    """lessons 子目录被预置为指向 home 外的 symlink：写入必须拒绝，home 外文件字节不变。"""
+    home = make_home(tmp_path)
+    outside = tmp_path / "outside-lessons"
+    outside.mkdir()
+    seed = outside / "seed.txt"
+    seed.write_text("seed", encoding="utf-8")
+    os.symlink(outside, home / "lessons")
+
+    resp = call_facade(str(home), "learn.record", {
+        "draft": "# 初稿\n", "final": "# 终稿\n",
+        "diffSummary": {"lines_added": 0, "lines_deleted": 0}, "patterns": [],
+    })
+    assert resp["ok"] is False, resp
+    assert resp["error"]["code"] in ("FORBIDDEN", "INTERNAL"), resp
+    # home 外目录内容不变（未新增 lesson 文件）。
+    assert sorted(p.name for p in outside.iterdir()) == ["seed.txt"]
+    assert seed.read_text(encoding="utf-8") == "seed"
+
+
+def test_exemplar_put_rejects_exemplars_symlink_escape(tmp_path):
+    """exemplars 子目录被预置为指向 home 外的 symlink：写入必须拒绝，home 外文件字节不变。"""
+    home = make_home(tmp_path)
+    outside = tmp_path / "outside-exemplars"
+    outside.mkdir()
+    seed = outside / "seed.txt"
+    seed.write_text("seed", encoding="utf-8")
+    os.symlink(outside, home / "exemplars")
+
+    resp = call_facade(str(home), "exemplar.put", {"title": "范文", "content": "# 正文\n"})
+    assert resp["ok"] is False, resp
+    assert resp["error"]["code"] in ("FORBIDDEN", "INTERNAL"), resp
+    # home 外目录内容不变（未新增 exemplar 文件）。
+    assert sorted(p.name for p in outside.iterdir()) == ["seed.txt"]
+    assert seed.read_text(encoding="utf-8") == "seed"

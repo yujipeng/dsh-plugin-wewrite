@@ -14,7 +14,7 @@ import type { ToolBindingContext } from '../../shared/contract';
 import type { WorkbenchService } from '../workbench-service';
 import { PUSH_TOOL_NAME } from '../push-approval';
 
-/** 工具名 → schema 名称（供 service 路由）。8 个常驻写作工具 + 3 个账号级只读工具；推送工具条件注册。 */
+/** 工具名 → schema 名称（供 service 路由）。8 个常驻写作工具 + 8 个账号级工具（3 写 5 读）；推送工具条件注册。 */
 export const AGENT_TOOL_NAMES = [
   'wewrite_run_start',
   'wewrite_run_detail',
@@ -25,8 +25,13 @@ export const AGENT_TOOL_NAMES = [
   'wewrite_run_finish',
   'wewrite_preview',
   'wewrite_style_get',
+  'wewrite_style_validate',
+  'wewrite_style_put',
+  'wewrite_learn_record',
   'wewrite_learn_list',
+  'wewrite_exemplar_put',
   'wewrite_exemplar_list',
+  'wewrite_exemplar_get',
 ] as const;
 
 export type AgentToolName = (typeof AGENT_TOOL_NAMES)[number];
@@ -299,20 +304,59 @@ export function buildAgentTools(service: WorkbenchService): ToolDefinition[] {
     }, (args, ctx) => service.toolPreview(args as never, ctx)),
   );
 
-  // ── 方案 B 批一：账号级只读工具（不绑定 runId，不参与 run/generation 栅栏）──────────
+  // ── 方案 B 批一：账号级工具（不绑定 runId，不参与 run/generation 栅栏）──────────────
+  // 读工具正常可用；写工具「注册存在但 Agent 调用即拒」（账号级仅 owner 可改）。
   defs.push(
     accountTool('wewrite_style_get', '读取账号级写作风格配置 style.yaml（topics/target_audience/blacklist/content_style 等字段与原文）。账号级配置，不绑定 runId。', {
-    }, (args) => service.styleGet()),
+    }, (args) => service.toolStyleGet()),
+  );
+
+  defs.push(
+    accountTool('wewrite_style_validate', '只校验 style 数据不写盘，返回中文问题清单。账号级配置，不绑定 runId。', {
+      style: { type: 'object' as const, additionalProperties: true, description: '待校验的 style 对象' },
+    }, (args) => service.toolStyleValidate(args as { style: unknown })),
+  );
+
+  defs.push(
+    accountTool('wewrite_style_put', '写账号级写作风格配置 style.yaml（账号级仅 owner 可改；Agent 调用一律 FORBIDDEN，请到工作台设置面板操作）。不绑定 runId。', {
+      style: { type: 'object' as const, additionalProperties: true, description: '待保存的 style 对象' },
+    }, (args) => service.toolStylePut()),
+  );
+
+  defs.push(
+    accountTool('wewrite_learn_record', '记录一次用户改稿差异（账号级仅 owner 可改；Agent 调用一律 FORBIDDEN，请在工作台操作）。不绑定 runId。', {
+      draft: stringParam('改稿前原文'),
+      final: stringParam('改稿后终稿'),
+      diffSummary: { type: 'object' as const, additionalProperties: true, description: 'diff 摘要' },
+      patterns: { type: 'array' as const, items: { type: 'object' as const, additionalProperties: true }, description: '学习 pattern 列表' },
+    }, (args) => service.toolLearnRecord()),
   );
 
   defs.push(
     accountTool('wewrite_learn_list', '列出已记录的改稿学习条目（learn.record 历史，含 diff 摘要与 pattern 数）。账号级配置，不绑定 runId。', {
-    }, (args) => service.learnList()),
+    }, (args) => service.toolLearnList()),
+  );
+
+  defs.push(
+    accountTool('wewrite_exemplar_put', '范文入库（账号级仅 owner 可改；Agent 调用一律 FORBIDDEN，请到工作台范文库操作）。不绑定 runId。', {
+      title: stringParam('范文标题'),
+      content: stringParam('范文正文'),
+      source: stringParam('来源（可选）', false),
+      category: stringParam('分类（可选）', false),
+      ownership: stringParam('所有权标记（可选）', false),
+      authenticity: stringParam('真实性标记（可选）', false),
+    }, (args) => service.toolExemplarPut()),
   );
 
   defs.push(
     accountTool('wewrite_exemplar_list', '列出范文库（exemplar.list：id/title/source/category/ownership）。账号级配置，不绑定 runId。', {
-    }, (args) => service.exemplarList()),
+    }, (args) => service.toolExemplarList()),
+  );
+
+  defs.push(
+    accountTool('wewrite_exemplar_get', '按 id 读单篇范文（含 frontmatter 与正文）。账号级配置，不绑定 runId。', {
+      id: stringParam('范文 id（16 位十六进制）'),
+    }, (args) => service.toolExemplarGet(args as { id: string })),
   );
 
   return defs;

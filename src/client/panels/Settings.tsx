@@ -1,11 +1,12 @@
 /**
- * Settings 面板：设置/诊断 + 写作风格（style.yaml）区块。
- * 读 style.get 展示当前配置，可编辑并 style.put 保存，style.validate 显示问题。
+ * Settings 面板：诊断 + 写作风格（style.yaml）+ 改稿学习 / 范文库列表。
+ * - style：读 style.get 展示，可编辑并 style.put 保存，style.validate 显示问题。
+ * - 学习/范文：learn.list / exemplar.list 列表视图，exemplar 提供入库入口。
  */
 
 import { useEffect, useState } from 'react';
+import { parse } from 'yaml';
 import type { WeWriteClient } from '../rpc';
-import { PanelState } from './common';
 
 interface SettingsPanelProps {
   readonly client: WeWriteClient;
@@ -22,10 +23,54 @@ interface StyleState {
   error: string | null;
   exists: boolean;
   text: string;
-  rawVersion: string | null;
+  version: string | null;
   issues: string[];
   saving: boolean;
   saved: boolean;
+  validating: boolean;
+}
+
+interface LearnItem {
+  file: string;
+  date?: string;
+  timestamp?: string;
+  patternCount?: number;
+}
+
+interface ExemplarItem {
+  id: string;
+  title: string;
+  source: string;
+  category: string;
+  ownership: string;
+  authenticity: string;
+}
+
+/** 与 yaml 解析能力一致的占位示例（缩进用两空格，列表项缩进两格）。 */
+export const STYLE_PLACEHOLDER = [
+  'name: "客户名称"',
+  'industry: "行业"',
+  'topics:',
+  '  - "方向1"',
+  '  - "方向2"',
+  'tone: "写作风格"',
+  'theme: "professional-clean"',
+  'target_audience: "目标受众"',
+  'content_style: "干货"',
+  'blacklist:',
+  '  words: []',
+  '  topics: []',
+].join('\n');
+
+/** 解析 style.yaml 文本为对象；非法/非对象返回 null（面板保存与校验共用）。 */
+export function parseStyleText(text: string): Record<string, unknown> | null {
+  try {
+    const obj = parse(text);
+    if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return null;
+    return obj as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 }
 
 export function SettingsPanel({ client }: SettingsPanelProps): JSX.Element {
@@ -37,11 +82,16 @@ export function SettingsPanel({ client }: SettingsPanelProps): JSX.Element {
     error: null,
     exists: false,
     text: '',
-    rawVersion: null,
+    version: null,
     issues: [],
     saving: false,
     saved: false,
+    validating: false,
   });
+  const [learn, setLearn] = useState<{ loading: boolean; error: string | null; items: LearnItem[] }>({ loading: true, error: null, items: [] });
+  const [exemplars, setExemplars] = useState<{ loading: boolean; error: string | null; items: ExemplarItem[] }>({ loading: true, error: null, items: [] });
+  const [exemplarDraft, setExemplarDraft] = useState<{ title: string; content: string; source: string }>({ title: '', content: '', source: '' });
+  const [exemplarMsg, setExemplarMsg] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -60,177 +110,209 @@ export function SettingsPanel({ client }: SettingsPanelProps): JSX.Element {
     return () => { active = false; };
   }, [client]);
 
+  async function reloadStyle() {
+    setStyle((s) => ({ ...s, loading: true, error: null, saved: false }));
+    const result = await client.styleGet();
+    if (!result.ok && result.error.code !== 'NOT_FOUND') {
+      setStyle((s) => ({ ...s, loading: false, error: result.error.message }));
+      return;
+    }
+    if (result.ok) {
+      const data = result.data as { raw: string; version: string };
+      setStyle((s) => ({ ...s, loading: false, exists: true, text: data.raw, version: data.version, issues: [] }));
+    } else {
+      setStyle((s) => ({ ...s, loading: false, exists: false, text: STYLE_PLACEHOLDER, version: null, issues: [] }));
+    }
+  }
+
+  async function reloadLists() {
+    setLearn((s) => ({ ...s, loading: true, error: null }));
+    setExemplars((s) => ({ ...s, loading: true, error: null }));
+    const [lr, er] = await Promise.all([client.learnList(), client.exemplarList()]);
+    if (lr.ok) setLearn({ loading: false, error: null, items: (lr.data as { items: LearnItem[] }).items ?? [] });
+    else setLearn({ loading: false, error: lr.error.message, items: [] });
+    if (er.ok) setExemplars({ loading: false, error: null, items: (er.data as { items: ExemplarItem[] }).items ?? [] });
+    else setExemplars({ loading: false, error: er.error.message, items: [] });
+  }
+
   useEffect(() => {
-    let active = true;
-    (async () => {
-      setStyle((s) => ({ ...s, loading: true, error: null, saved: false }));
-      const result = await client.styleGet();
-      if (!active) return;
-      if (!result.ok && result.error.code !== 'NOT_FOUND') {
-        setStyle((s) => ({ ...s, loading: false, error: result.error.message }));
-        return;
-      }
-      if (result.ok) {
-        const data = result.data as { exists: boolean; raw: string; version: string };
-        setStyle((s) => ({
-          ...s,
-          loading: false,
-          exists: true,
-          text: data.raw,
-          rawVersion: data.version,
-          issues: [],
-        }));
-      } else {
-        setStyle((s) => ({ ...s, loading: false, exists: false, text: '', rawVersion: null, issues: [] }));
-      }
-    })();
-    return () => { active = false; };
+    void reloadStyle();
+    void reloadLists();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client]);
 
-  async function validateStyle(text: string): Promise<string[]> {
+  async function validateStyle() {
+    setStyle((s) => ({ ...s, validating: true, issues: [], saved: false }));
     try {
-      const yaml = parseYaml(text);
-      if (yaml instanceof Error) return [`style.yaml 不是合法 YAML：${yaml.message}`];
-      const result = await client.styleValidate({ style: yaml });
-      if (!result.ok) return [result.error.message];
-      return ((result.data as { issues: string[] }).issues) ?? [];
+      const obj = parse(style.text);
+      if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
+        setStyle((s) => ({ ...s, validating: false, issues: ['style.yaml 必须是 YAML 对象'] }));
+        return;
+      }
+      const result = await client.styleValidate({ style: obj as Record<string, unknown> });
+      if (!result.ok) {
+        setStyle((s) => ({ ...s, validating: false, issues: [result.error.message] }));
+        return;
+      }
+      setStyle((s) => ({ ...s, validating: false, issues: ((result.data as { issues: string[] }).issues) ?? [] }));
     } catch (err) {
-      return [err instanceof Error ? err.message : String(err)];
+      setStyle((s) => ({ ...s, validating: false, issues: [err instanceof Error ? `YAML 解析失败：${err.message}` : String(err)] }));
     }
   }
 
   async function saveStyle() {
     setStyle((s) => ({ ...s, saving: true, saved: false, issues: [] }));
     try {
-      const yaml = parseYaml(style.text);
-      if (yaml instanceof Error) {
-        setStyle((s) => ({ ...s, saving: false, issues: [`style.yaml 不是合法 YAML：${yaml.message}`] }));
+      const obj = parse(style.text);
+      if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
+        setStyle((s) => ({ ...s, saving: false, issues: ['style.yaml 必须是 YAML 对象'] }));
         return;
       }
-      const result = await client.stylePut({ style: yaml });
+      const result = await client.stylePut({ style: obj as Record<string, unknown> });
       if (!result.ok) {
         setStyle((s) => ({ ...s, saving: false, issues: [result.error.message] }));
         return;
       }
       const data = result.data as { version: string };
-      setStyle((s) => ({ ...s, saving: false, saved: true, rawVersion: data.version, exists: true }));
+      setStyle((s) => ({ ...s, saving: false, saved: true, version: data.version, exists: true }));
     } catch (err) {
-      setStyle((s) => ({ ...s, saving: false, issues: [err instanceof Error ? err.message : String(err)] }));
+      setStyle((s) => ({ ...s, saving: false, issues: [err instanceof Error ? `YAML 解析失败：${err.message}` : String(err)] }));
     }
+  }
+
+  async function putExemplar() {
+    setExemplarMsg(null);
+    if (!exemplarDraft.title.trim() || !exemplarDraft.content.trim()) {
+      setExemplarMsg('标题与正文不能为空');
+      return;
+    }
+    const result = await client.exemplarPut({
+      title: exemplarDraft.title.trim(),
+      content: exemplarDraft.content,
+      source: exemplarDraft.source.trim() || undefined,
+    });
+    if (!result.ok) {
+      setExemplarMsg(result.error.message);
+      return;
+    }
+    setExemplarDraft({ title: '', content: '', source: '' });
+    setExemplarMsg('范文已入库');
+    void reloadLists();
+  }
+
+  if (loading) {
+    return <div className="ww-state ww-state--loading" data-testid="ww-loading">加载中…</div>;
+  }
+  if (error) {
+    return <div className="ww-state ww-state--error" data-testid="ww-error">{error}</div>;
   }
 
   return (
-    <PanelState loading={loading} error={error} forbidden={false} empty={diagnostics !== null && diagnostics.length === 0} emptyText="无诊断项">
-      <div className="ww-settings" data-testid="wewrite-settings">
-        <section className="ww-settings__style" data-testid="ww-style-section">
-          <h2>写作风格</h2>
-          {style.loading ? (
-            <div data-testid="ww-style-loading">加载中…</div>
-          ) : style.error ? (
-            <div data-testid="ww-style-error">{style.error}</div>
-          ) : (
-            <>
-              {!style.exists ? (
-                <div data-testid="ww-style-missing">尚未配置 style.yaml，可粘贴 YAML 并保存。</div>
-              ) : null}
-              <textarea
-                data-testid="ww-style-editor"
-                value={style.text}
-                rows={14}
-                onChange={(e) => setStyle((s) => ({ ...s, text: e.target.value, saved: false }))}
-                placeholder={'name: "客户名称"\nindustry: "行业"\ntopics:\n  - "方向1"\ntone: "写作风格"\ntheme: "professional-clean"\ntarget_audience: "目标受众"\ncontent_style: "干货"\nblacklist:\n  words: []\n  topics: []'}
-              />
-              <div className="ww-settings__style-actions">
-                <button
-                  type="button"
-                  data-testid="ww-style-save"
-                  disabled={style.saving}
-                  onClick={() => void saveStyle()}
-                >
-                  {style.saving ? '保存中…' : '保存风格配置'}
-                </button>
-                {style.saved ? <span data-testid="ww-style-saved">已保存</span> : null}
-              </div>
-              {style.issues.length > 0 ? (
-                <ul className="ww-settings__issues" data-testid="ww-style-issues">
-                  {style.issues.map((issue, i) => (
-                    <li key={i}>{issue}</li>
-                  ))}
-                </ul>
-              ) : null}
-            </>
-          )}
-        </section>
+    <div className="ww-settings" data-testid="wewrite-settings">
+      {/* 写作风格区块：独立于诊断空态，数据根就绪（diagnostics 为空）时也必须可见。 */}
+      <section className="ww-settings__style" data-testid="ww-style-section">
+        <h2>写作风格</h2>
+        {style.loading ? (
+          <div data-testid="ww-style-loading">加载中…</div>
+        ) : style.error ? (
+          <div data-testid="ww-style-error">{style.error}</div>
+        ) : (
+          <>
+            {!style.exists ? (
+              <div data-testid="ww-style-missing">尚未配置 style.yaml，可粘贴 YAML 并保存。</div>
+            ) : null}
+            <textarea
+              data-testid="ww-style-editor"
+              value={style.text}
+              rows={14}
+              onChange={(e) => setStyle((s) => ({ ...s, text: e.target.value, saved: false }))}
+              placeholder={STYLE_PLACEHOLDER}
+            />
+            <div className="ww-settings__style-actions">
+              <button type="button" data-testid="ww-style-save" disabled={style.saving} onClick={() => void saveStyle()}>
+                {style.saving ? '保存中…' : '保存风格配置'}
+              </button>
+              <button type="button" data-testid="ww-style-validate" disabled={style.validating} onClick={() => void validateStyle()}>
+                {style.validating ? '校验中…' : '校验'}
+              </button>
+              {style.saved ? <span data-testid="ww-style-saved">已保存</span> : null}
+            </div>
+            {style.issues.length > 0 ? (
+              <ul className="ww-settings__issues" data-testid="ww-style-issues">
+                {style.issues.map((issue, i) => (
+                  <li key={i}>{issue}</li>
+                ))}
+              </ul>
+            ) : null}
+          </>
+        )}
+      </section>
 
-        <ul className="ww-settings__diags">
-          {(diagnostics ?? []).map((d, i) => (
-            <li key={i} data-testid={`ww-diag-${i}`}>{d.blocking ? '⚠️' : 'ℹ️'} {d.code}：{d.message}</li>
-          ))}
-        </ul>
-      </div>
-    </PanelState>
+      {/* 改稿学习列表视图 */}
+      <section className="ww-settings__learn" data-testid="ww-learn-section">
+        <h2>改稿学习</h2>
+        {learn.loading ? (
+          <div>加载中…</div>
+        ) : learn.error ? (
+          <div>{learn.error}</div>
+        ) : learn.items.length === 0 ? (
+          <div data-testid="ww-learn-empty">暂无改稿学习记录（在编辑器保存时会记录差异）</div>
+        ) : (
+          <ul className="ww-settings__list" data-testid="ww-learn-list">
+            {learn.items.map((item, i) => (
+              <li key={i}>{item.file}{item.date ? `（${item.date}）` : ''}{item.patternCount !== undefined ? ` · ${item.patternCount} 个 pattern` : ''}</li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      {/* 范文库列表视图 + 入库入口 */}
+      <section className="ww-settings__exemplars" data-testid="ww-exemplars-section">
+        <h2>范文库</h2>
+        {exemplars.loading ? (
+          <div>加载中…</div>
+        ) : exemplars.error ? (
+          <div>{exemplars.error}</div>
+        ) : exemplars.items.length === 0 ? (
+          <div data-testid="ww-exemplars-empty">范文库为空</div>
+        ) : (
+          <ul className="ww-settings__list" data-testid="ww-exemplars-list">
+            {exemplars.items.map((item) => (
+              <li key={item.id}>{item.title} · {item.source} · {item.category} · {item.ownership}</li>
+            ))}
+          </ul>
+        )}
+        <div className="ww-settings__exemplar-form" data-testid="ww-exemplar-form">
+          <input
+            data-testid="ww-exemplar-title"
+            placeholder="范文标题"
+            value={exemplarDraft.title}
+            onChange={(e) => setExemplarDraft((d) => ({ ...d, title: e.target.value }))}
+          />
+          <input
+            data-testid="ww-exemplar-source"
+            placeholder="来源（可选）"
+            value={exemplarDraft.source}
+            onChange={(e) => setExemplarDraft((d) => ({ ...d, source: e.target.value }))}
+          />
+          <textarea
+            data-testid="ww-exemplar-content"
+            placeholder="范文正文（markdown）"
+            rows={4}
+            value={exemplarDraft.content}
+            onChange={(e) => setExemplarDraft((d) => ({ ...d, content: e.target.value }))}
+          />
+          <button type="button" data-testid="ww-exemplar-put" onClick={() => void putExemplar()}>范文入库</button>
+          {exemplarMsg ? <span data-testid="ww-exemplar-msg">{exemplarMsg}</span> : null}
+        </div>
+      </section>
+
+      {/* 诊断列表 */}
+      <ul className="ww-settings__diags">
+        {(diagnostics ?? []).map((d, i) => (
+          <li key={i} data-testid={`ww-diag-${i}`}>{d.blocking ? '⚠️' : 'ℹ️'} {d.code}：{d.message}</li>
+        ))}
+      </ul>
+    </div>
   );
-}
-
-/** 极简 YAML 子集解析（style.yaml 全为标量/列表/映射，不涉及锚点/多行块，足够展示与校验）。 */
-function parseYaml(text: string): Record<string, unknown> | Error {
-  const result: Record<string, unknown> = {};
-  const lines = text.split('\n');
-  const stack: Array<{ key: string; target: unknown; indent: number }> = [];
-
-  for (const raw of lines) {
-    if (raw.trim() === '' || raw.trimStart().startsWith('#')) continue;
-    const indent = raw.length - raw.trimStart().length;
-    const line = raw.trim();
-
-    const listMatch = /^- (.*)$/.exec(line);
-    if (listMatch !== null) {
-      const value = parseScalar(listMatch[1].trim());
-      const parent = stack.length > 0 ? stack[stack.length - 1]!.target : result;
-      if (!Array.isArray(parent)) {
-        return new Error('列表缩进不合法');
-      }
-      parent.push(value);
-      continue;
-    }
-
-    const mapMatch = /^([A-Za-z_][A-Za-z0-9_-]*):(.*)$/.exec(line);
-    if (mapMatch === null) return new Error(`无法解析行：${line}`);
-    const key = mapMatch[1]!;
-    const rawValue = mapMatch[2]!.trim();
-
-    while (stack.length > 0 && indent <= stack[stack.length - 1]!.indent) {
-      stack.pop();
-    }
-    const parent = stack.length > 0 ? stack[stack.length - 1]!.target : result;
-
-    if (rawValue === '') {
-      const child: Record<string, unknown> = {};
-      (parent as Record<string, unknown>)[key] = child;
-      stack.push({ key, target: child, indent });
-      continue;
-    }
-    if (rawValue.startsWith('[') && rawValue.endsWith(']')) {
-      (parent as Record<string, unknown>)[key] = parseInlineList(rawValue);
-      continue;
-    }
-    (parent as Record<string, unknown>)[key] = parseScalar(rawValue);
-  }
-  return result;
-}
-
-function parseInlineList(text: string): unknown[] {
-  const inner = text.slice(1, -1).trim();
-  if (inner === '') return [];
-  return inner.split(',').map((item) => parseScalar(item.trim().replace(/^"(.*)"$/, '$1')));
-}
-
-function parseScalar(text: string): unknown {
-  if (text === '' || text === '~' || text === 'null') return null;
-  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
-    return text.slice(1, -1);
-  }
-  if (/^-?\d+$/.test(text)) return Number(text);
-  if (/^(true|false)$/i.test(text)) return text.toLowerCase() === 'true';
-  return text;
 }

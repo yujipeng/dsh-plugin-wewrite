@@ -64,7 +64,28 @@ export function EditorPanel({ client, runId }: EditorPanelProps): JSX.Element {
       metadata: { title: '未命名文章', digest: '', themeId: 'professional-clean' },
     });
     if (result.ok) {
+      const previous = article?.content ?? '';
       setArticle({ content: draft, version: (result.data as { version: string }).version, editable: true });
+      // 从编辑器保存时记录差异：正文发生变化才记录改稿学习（draft → final）。
+      if (draft !== previous) {
+        const learn = await client.learnRecord({
+          draft: previous,
+          final: draft,
+          diffSummary: {
+            title_changed: false,
+            structure_changed: false,
+            lines_added: draft.split('\n').length - previous.split('\n').length,
+            lines_deleted: 0,
+            char_diff: draft.length - previous.length,
+          },
+          patterns: [],
+        });
+        // 记录失败不阻断正文保存（仅非阻断的学习飞轮）。
+        if (!learn.ok) {
+          // 静默降级：学习记录失败不影响正文交付。
+          console.warn('改稿学习记录失败', learn.error.message);
+        }
+      }
     } else {
       setError(result.error.message);
     }

@@ -49,5 +49,6 @@ whenToUse: 需要引导用户设置或修改写作风格配置（style.yaml）�
 ## 边界
 
 - 不执行 shell、网络抓取、代码执行、委派；style.yaml 的写入只发生在工作台面板（style.put）。
-- `style.put` 是账号级配置，只有 owner 通过工作台面板可改；Agent 工具只有只读入口
-  （`wewrite_style_get`），没有写入口。
+- `wewrite_style_put` 工具已注册，但**是账号级配置，只有 owner 可改**——Agent 调用一律返回
+  `FORBIDDEN`（中文提示「账号级配置仅 owner 可改，请在工作台设置面板操作」），不能代写；
+  Agent 只读走 `wewrite_style_get` / `wewrite_style_validate`。

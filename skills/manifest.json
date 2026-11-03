@@ -44,13 +44,13 @@
       "name": "wewrite-style",
       "description": "写作风格设置（style.yaml）：首次引导 onboard + 重设风格配置；产出 topics/target_audience/blacklist/content_style 等字段供选题与写作使用",
       "path": "wewrite-style/SKILL.md",
-      "sha256": "53280311696bd3d95a20b340c94f463e057ce22d2190c896761f1ae0192e3f4d"
+      "sha256": "32631e45f5061ecbc0367a91f144baf5e29166ab894b6dc3d140b35a886c96bd"
     },
     {
       "name": "wewrite-learn",
       "description": "自学习：记录人工改稿差异（learn）与范文库（exemplar）只读查看；写作偏好飞轮，重复出现的规则才成为硬约束",
       "path": "wewrite-learn/SKILL.md",
-      "sha256": "d3cdc17b27bad33e1c005f2050d048df7499ad235064b5439b8207b063206dbc"
+      "sha256": "87eddd32066f847240a466e459fc55193aca17273d33d479b803d91c98d3d93a"
     }
   ],
   "references": [

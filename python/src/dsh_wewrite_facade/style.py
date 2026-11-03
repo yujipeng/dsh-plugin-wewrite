@@ -88,12 +88,23 @@ def _write_home_file_atomic(name: str, data: bytes) -> None:
 
 
 def _backup_style(root_fd: int) -> None:
-    """把当前 style.yaml 备份为 style.yaml.bak（写入前调用，无旧版则跳过）。"""
+    """把当前 style.yaml 备份为 style.yaml.bak（写入前调用，无旧版则跳过）。
+
+    只把「确实不存在」（ENOENT）当无旧版；存在但不可读 / 是 symlink（ELOOP，O_NOFOLLOW 命中）
+    / 权限错等一律 fail-closed——不得静默跳过备份、更不得覆盖一个 symlink 目录项。
+    """
     try:
         fd = os.open(STYLE_FILENAME, os.O_RDONLY | paths._O_NOFOLLOW | paths._O_BINARY, dir_fd=root_fd)
-    except OSError:
+    except FileNotFoundError:
         return
+    except OSError as exc:
+        if getattr(exc, "errno", None) == 2:  # ENOENT 也统一按不存在处理（双保险）。
+            return
+        raise forbidden(f"style.yaml 不是普通文件，拒绝写入（{paths._os_reason(exc)}）") from exc
     with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink < 1:
+            raise forbidden("style.yaml 不是普通文件，拒绝写入")
         old = f.read()
     storage._write_file_atomically(root_fd, STYLE_BACKUP_FILENAME, old)
 

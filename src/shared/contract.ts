@@ -624,6 +624,14 @@ export const TOOL_NAMES = [
   'wewrite_run_finish',
   'wewrite_preview',
   'wewrite_push_draft',
+  'wewrite_style_get',
+  'wewrite_style_validate',
+  'wewrite_style_put',
+  'wewrite_learn_record',
+  'wewrite_learn_list',
+  'wewrite_exemplar_put',
+  'wewrite_exemplar_list',
+  'wewrite_exemplar_get',
 ] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
 
@@ -726,6 +734,52 @@ export const toolContract = {
       mediaId: z.string().nullable(),
       dryRun: z.boolean(),
     })),
+  },
+  // ── 方案 B 批一：账号级工具（不绑定 runId）──────────────────────────────
+  wewrite_style_get: {
+    request: z.strictObject({}),
+    response: rpcContract['style/get'].response,
+  },
+  wewrite_style_validate: {
+    request: z.strictObject({ style: StyleObjectSchema }),
+    response: rpcContract['style/validate'].response,
+  },
+  wewrite_style_put: {
+    request: z.strictObject({ style: StyleObjectSchema }),
+    // 工具已注册，但 Agent 调用路径一律返回 FORBIDDEN（账号级仅 owner 可改）。
+    response: rpcContract['style/put'].response,
+  },
+  wewrite_learn_record: {
+    request: z.strictObject({
+      draft: z.string(),
+      final: z.string(),
+      diffSummary: z.record(z.unknown()),
+      patterns: z.array(z.record(z.unknown())),
+    }),
+    response: rpcContract['learn/record'].response,
+  },
+  wewrite_learn_list: {
+    request: z.strictObject({}),
+    response: rpcContract['learn/list'].response,
+  },
+  wewrite_exemplar_put: {
+    request: z.strictObject({
+      title: IdSchema,
+      content: z.string(),
+      source: z.string().optional(),
+      category: z.string().optional(),
+      ownership: z.string().optional(),
+      authenticity: z.string().optional(),
+    }),
+    response: rpcContract['exemplar/put'].response,
+  },
+  wewrite_exemplar_list: {
+    request: z.strictObject({}),
+    response: rpcContract['exemplar/list'].response,
+  },
+  wewrite_exemplar_get: {
+    request: z.strictObject({ id: z.string() }),
+    response: rpcContract['exemplar/get'].response,
   },
 } as const;
 

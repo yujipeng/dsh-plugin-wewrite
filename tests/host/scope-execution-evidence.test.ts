@@ -137,7 +137,7 @@ describe('真实 scope 执行证据（JEE-1956 缺口 5）', () => {
     scope.dispose();
   });
 
-  it('11 个 native 插件工具可见（8 写作 + 3 账号级只读）', () => {
+  it('16 个 native 插件工具可见（8 写作 + 8 账号级：3 写 5 读）', () => {
     const { tools, agentKey, scope } = makeScope();
     setupAgentScope(scope.ctx, buildAgentTools(makeService()));
     const visible = tools.schemas(agentKey).map((s) => s.name);
