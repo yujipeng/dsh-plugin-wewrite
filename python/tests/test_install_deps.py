@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 INSTALL_SCRIPT = REPO_ROOT / "scripts" / "install_deps.py"
@@ -130,18 +131,20 @@ def test_write_profile_config_preserves_existing_custom_fields(tmp_path):
     home = tmp_path / "data"
     mod._update_profile_patch(path, venv, home, dry_run=False)
     text = path.read_text(encoding="utf-8")
+    parsed = yaml.safe_load(text)
+    assert isinstance(parsed, list) and len(parsed) == 1
+    entry = parsed[0]
+    assert entry["id"] == "wewrite-python"
     # 用户自定义字段保留。
-    assert "pushEnabled: true" in text
-    assert "publishTransport: wechat" in text
-    assert "bridgeTimeoutMs: 45000" in text
+    assert entry["config"]["pushEnabled"] is True
+    assert entry["config"]["publishTransport"] == "wechat"
+    assert entry["config"]["bridgeTimeoutMs"] == 45000
     # 目标字段被更新。
-    assert f"interpreter: {venv / 'bin' / 'python'}" in text
-    assert f"wewriteHome: {home}" in text
+    assert entry["config"]["interpreter"] == str(venv / "bin" / "python")
+    assert entry["config"]["wewriteHome"] == str(home)
     # 旧值被移除。
     assert "/old/python" not in text
     assert "/old/home" not in text
-    # 只保留一个 wewrite-python 覆盖块。
-    assert text.count("- id: wewrite-python") == 1
 
 
 def test_write_profile_config_creates_default_when_absent(tmp_path):
@@ -152,7 +155,123 @@ def test_write_profile_config_creates_default_when_absent(tmp_path):
     venv = tmp_path / "venv"
     home = tmp_path / "data"
     mod._update_profile_patch(path, venv, home, dry_run=False)
-    text = path.read_text(encoding="utf-8")
-    assert text.count("- id: wewrite-python") == 1
-    assert f"interpreter: {venv / 'bin' / 'python'}" in text
-    assert f"wewriteHome: {home}" in text
+    parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert isinstance(parsed, list) and len(parsed) == 1
+    entry = parsed[0]
+    assert entry["id"] == "wewrite-python"
+    assert entry["config"]["interpreter"] == str(venv / "bin" / "python")
+    assert entry["config"]["wewriteHome"] == str(home)
+
+
+@pytest.mark.parametrize("input_yaml", [
+    # 仅 id 一行。
+    "- id: wewrite-python\n",
+    # id + name。
+    "- id: wewrite-python\n  name: dsh-plugin-wewrite\n",
+    # id + name + 其他键（无 config）。
+    "- id: wewrite-python\n  name: dsh-plugin-wewrite\n  priority: 10\n",
+])
+def test_write_profile_config_block_without_config(tmp_path, input_yaml):
+    """返修：既有覆盖块没有 config: 时必须新建空映射再挂子键，且输出是合法 YAML。"""
+    mod = _load_module()
+    path = tmp_path / "profiles" / "wewrite" / "cordis.patch.yml"
+    path.parent.mkdir(parents=True)
+    path.write_text(input_yaml, encoding="utf-8")
+    venv = tmp_path / "venv"
+    home = tmp_path / "data"
+    mod._update_profile_patch(path, venv, home, dry_run=False)
+    parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert isinstance(parsed, list) and len(parsed) == 1
+    entry = parsed[0]
+    assert entry["id"] == "wewrite-python"
+    assert isinstance(entry["config"], dict)
+    assert entry["config"]["interpreter"] == str(venv / "bin" / "python")
+    assert entry["config"]["wewriteHome"] == str(home)
+
+
+def test_write_profile_config_empty_config(tmp_path):
+    """返修：既有块 config: 为空时也要能写入目标字段。"""
+    mod = _load_module()
+    path = tmp_path / "profiles" / "wewrite" / "cordis.patch.yml"
+    path.parent.mkdir(parents=True)
+    path.write_text("- id: wewrite-python\n  name: dsh-plugin-wewrite\n  config:\n", encoding="utf-8")
+    venv = tmp_path / "venv"
+    home = tmp_path / "data"
+    mod._update_profile_patch(path, venv, home, dry_run=False)
+    parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert isinstance(parsed, list) and len(parsed) == 1
+    entry = parsed[0]
+    assert entry["config"]["interpreter"] == str(venv / "bin" / "python")
+    assert entry["config"]["wewriteHome"] == str(home)
+
+
+def test_write_profile_config_shuffled_fields(tmp_path):
+    """返修：字段顺序打乱不影响只更新目标字段、其余保留。"""
+    mod = _load_module()
+    path = tmp_path / "profiles" / "wewrite" / "cordis.patch.yml"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "- id: wewrite-python\n"
+        "  name: dsh-plugin-wewrite\n"
+        "  priority: 3\n"
+        "  config:\n"
+        "    bridgeTimeoutMs: 45000\n"
+        "    pushEnabled: true\n"
+        "    publishTransport: wechat\n"
+        "    agentToolsEnabled: true\n",
+        encoding="utf-8",
+    )
+    venv = tmp_path / "venv"
+    home = tmp_path / "data"
+    mod._update_profile_patch(path, venv, home, dry_run=False)
+    parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+    entry = parsed[0]
+    assert entry["priority"] == 3
+    assert entry["config"]["pushEnabled"] is True
+    assert entry["config"]["publishTransport"] == "wechat"
+    assert entry["config"]["bridgeTimeoutMs"] == 45000
+    assert entry["config"]["interpreter"] == str(venv / "bin" / "python")
+    assert entry["config"]["wewriteHome"] == str(home)
+
+
+def test_write_profile_config_nested_keys_preserved(tmp_path):
+    """返修：块内嵌套子键不被破坏。"""
+    mod = _load_module()
+    path = tmp_path / "profiles" / "wewrite" / "cordis.patch.yml"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "- id: wewrite-python\n"
+        "  name: dsh-plugin-wewrite\n"
+        "  config:\n"
+        "    push:\n"
+        "      enabled: true\n"
+        "    extra:\n"
+        "      nested:\n"
+        "        value: keep\n",
+        encoding="utf-8",
+    )
+    venv = tmp_path / "venv"
+    home = tmp_path / "data"
+    mod._update_profile_patch(path, venv, home, dry_run=False)
+    parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+    entry = parsed[0]
+    assert entry["config"]["push"]["enabled"] is True
+    assert entry["config"]["extra"]["nested"]["value"] == "keep"
+    assert entry["config"]["interpreter"] == str(venv / "bin" / "python")
+    assert entry["config"]["wewriteHome"] == str(home)
+
+
+def test_write_profile_config_idempotent(tmp_path):
+    """幂等：连跑两次结果字节级一致，且不重复插入键。"""
+    mod = _load_module()
+    path = tmp_path / "profiles" / "wewrite" / "cordis.patch.yml"
+    path.parent.mkdir(parents=True)
+    path.write_text("- id: wewrite-python\n  name: dsh-plugin-wewrite\n", encoding="utf-8")
+    venv = tmp_path / "venv"
+    home = tmp_path / "data"
+    mod._update_profile_patch(path, venv, home, dry_run=False)
+    first = path.read_text(encoding="utf-8")
+    mod._update_profile_patch(path, venv, home, dry_run=False)
+    second = path.read_text(encoding="utf-8")
+    assert first == second
+    assert second.count("- id: wewrite-python") == 1

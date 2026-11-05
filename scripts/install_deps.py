@@ -26,12 +26,22 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 FACADE_MODULE = "dsh_wewrite_facade"
 WHEEL_PREFIX = "dsh_wewrite_facade-"
 
 # 与 src/host/index.ts 的 Config 对齐：profile 私有覆盖配置通过这两个键注入。
 PLUGIN_ID = "wewrite-python"
 PLUGIN_NAME = "dsh-plugin-wewrite"
+
+# 仅在「profile 尚无 wewrite-python 覆盖项」时用作默认整项；已有项只更新 interpreter/wewriteHome。
+_DEFAULT_CONFIG = {
+    "agentToolsEnabled": True,
+    "pushEnabled": False,
+    "publishTransport": "fake",
+    "bridgeTimeoutMs": 30000,
+}
 
 
 def _default_venv() -> Path:
@@ -174,88 +184,83 @@ def _profile_patch_path(dsh_home: Path, profile: str) -> Path:
     return dsh_home / "profiles" / profile / "cordis.patch.yml"
 
 
-def _override_entry(venv: Path, home: Path) -> list[str]:
-    """生成写进 profile cordis.patch.yml 的整项覆盖（补丁按整项替换，须给全 config）。
+def _parse_patch(text: str) -> list:
+    """把 cordis.patch.yml 解析为补丁项列表；空文件/纯注释返回 []。"""
+    if not text.strip():
+        return []
+    parsed = yaml.safe_load(text)
+    if parsed is None:
+        return []
+    if not isinstance(parsed, list):
+        raise SystemExit("cordis.patch.yml 顶层必须是列表（补丁项列表）")
+    return parsed
 
-    仅在「尚不存在 wewrite-python 覆盖块」时用作默认首项；已有块走 _merge_into_block 只更新
-    interpreter / wewriteHome 两个目标字段，保留用户其余自定义。
-    """
+
+def _dump_patch(patch: list) -> str:
+    """序列化补丁项列表；注释不保留，但保证 yaml.safe_load 能原样读回。"""
+    return yaml.safe_dump(patch, allow_unicode=True, sort_keys=False, default_flow_style=False)
+
+
+def _find_plugin_entry(patch: list) -> dict | None:
+    """定位 id == PLUGIN_ID 的覆盖项；找不到返回 None。"""
+    for entry in patch:
+        if isinstance(entry, dict) and entry.get("id") == PLUGIN_ID:
+            return entry
+    return None
+
+
+def _default_entry(venv: Path, home: Path) -> dict:
     python = _venv_python(venv)
-    return [
-        "- id: wewrite-python",
-        "  name: dsh-plugin-wewrite",
-        "  config:",
-        "    agentToolsEnabled: true",
-        "    pushEnabled: false",
-        "    publishTransport: fake",
-        "    bridgeTimeoutMs: 30000",
-        f"    interpreter: {python}",
-        f"    wewriteHome: {home}",
-    ]
-
-
-def _is_target_key(line: str) -> bool:
-    """判断一行是否为 interpreter / wewriteHome 配置键（config 块内 4 空格缩进）。"""
-    stripped = line.lstrip(" ")
-    indent = len(line) - len(stripped)
-    return indent >= 4 and stripped.split(":", 1)[0].strip() in ("interpreter", "wewriteHome")
-
-
-def _merge_into_block(lines: list[str], start: int, end: int, venv: Path, home: Path) -> list[str]:
-    """在既有 wewrite-python 覆盖块内只更新 interpreter/wewriteHome，其余字段原样保留。"""
-    python = _venv_python(venv)
-    block = lines[start:end]
-    kept: list[str] = []
-    # 1. 去掉旧的 interpreter / wewriteHome 行。
-    for line in block:
-        if _is_target_key(line):
-            continue
-        kept.append(line)
-    # 2. 在 `  config:` 之后插入新两行；找不到 config 行则追加到块尾。
-    new_lines = [f"    interpreter: {python}", f"    wewriteHome: {home}"]
-    merged: list[str] = []
-    inserted = False
-    for line in kept:
-        merged.append(line)
-        if not inserted and line.rstrip("\n") == "  config:":
-            merged.extend(new_lines)
-            inserted = True
-    if not inserted:
-        merged.extend(new_lines)
-    return merged
+    return {
+        "id": PLUGIN_ID,
+        "name": PLUGIN_NAME,
+        "config": {
+            **_DEFAULT_CONFIG,
+            "interpreter": str(python),
+            "wewriteHome": str(home),
+        },
+    }
 
 
 def _update_profile_patch(path: Path, venv: Path, home: Path, *, dry_run: bool) -> str:
-    """幂等写入 profile patch：已有 wewrite-python 覆盖则只更新 interpreter/wewriteHome，否则追加默认项。"""
+    """幂等写入 profile patch：结构化读入 YAML，只更新 interpreter/wewriteHome，其余字段原样保留。
+
+    - 已有 wewrite-python 覆盖项：config 缺失则新建空映射，config 内的其余键一律保留。
+    - 无该项：追加默认整项。
+    - 写回前用 yaml.safe_load 自校验，解析失败则中文报错且不落盘（保留原文件）。
+    """
     if dry_run:
         return f"[dry-run] 将写入 profile 覆盖配置：{path}"
+
     if path.exists():
-        lines = path.read_text(encoding="utf-8").splitlines()
+        raw = path.read_text(encoding="utf-8")
     else:
-        lines = []
-    out: list[str] = []
-    i = 0
-    replaced = False
-    while i < len(lines):
-        line = lines[i]
-        if line == "- id: wewrite-python":
-            # 定位该覆盖块边界（到下一个顶层 `- ` 或 EOF）。
-            j = i + 1
-            while j < len(lines) and not lines[j].startswith("- "):
-                j += 1
-            out.extend(_merge_into_block(lines, i, j, venv, home))
-            replaced = True
-            i = j
-            continue
-        out.append(line)
-        i += 1
-    if not replaced:
-        if out and out[-1].strip() != "":
-            out.append("")
-        out.extend(_override_entry(venv, home))
+        raw = ""
+    patch = _parse_patch(raw)
+
+    entry = _find_plugin_entry(patch)
+    replaced = entry is not None
+    if replaced:
+        config = entry.get("config")
+        if not isinstance(config, dict):
+            config = {}
+        config["interpreter"] = str(_venv_python(venv))
+        config["wewriteHome"] = str(home)
+        entry["config"] = config
+    else:
+        patch.append(_default_entry(venv, home))
+
+    text = _dump_patch(patch)
+
+    # 写回前自校验：解析失败则报错且不落盘，保留原文件。
+    try:
+        yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise SystemExit(f"生成的 profile 覆盖配置不是合法 YAML，已放弃写入：{exc}") from exc
+
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+    tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
     action = "已更新" if replaced else "已追加"
     return f"{action} profile 覆盖配置：{path}"
