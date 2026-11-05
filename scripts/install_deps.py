@@ -26,8 +26,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import yaml
-
 FACADE_MODULE = "dsh_wewrite_facade"
 WHEEL_PREFIX = "dsh_wewrite_facade-"
 
@@ -42,6 +40,65 @@ _DEFAULT_CONFIG = {
     "publishTransport": "fake",
     "bridgeTimeoutMs": 30000,
 }
+
+# 注意：本脚本的启动 / 建 venv / 装 wheel 三步**不得依赖任何第三方包**（只用标准库）。
+# PyYAML 只是待安装的 facade 依赖，因此 YAML 读写下沉到 venv 解释器（装完 facade 后必有
+# PyYAML）的子进程里执行，脚本自身绝不 `import yaml`。
+_YAML_PATCH_SCRIPT = r"""
+import json
+import sys
+import yaml
+
+payload = json.load(sys.stdin)
+raw = payload["raw"]
+python_value = payload["python"]
+home_value = payload["home"]
+plugin_id = payload["plugin_id"]
+plugin_name = payload["plugin_name"]
+default_config = payload["default_config"]
+
+if not raw.strip():
+    patch = []
+else:
+    parsed = yaml.safe_load(raw)
+    if parsed is None:
+        patch = []
+    elif not isinstance(parsed, list):
+        json.dump({"ok": False, "error": "cordis.patch.yml 顶层必须是列表（补丁项列表）"}, sys.stdout, ensure_ascii=False)
+        sys.exit(0)
+    else:
+        patch = parsed
+
+entry = None
+for item in patch:
+    if isinstance(item, dict) and item.get("id") == plugin_id:
+        entry = item
+        break
+
+replaced = entry is not None
+if replaced:
+    config = entry.get("config")
+    if not isinstance(config, dict):
+        config = {}
+    config["interpreter"] = python_value
+    config["wewriteHome"] = home_value
+    entry["config"] = config
+else:
+    patch.append({
+        "id": plugin_id,
+        "name": plugin_name,
+        "config": {**default_config, "interpreter": python_value, "wewriteHome": home_value},
+    })
+
+text = yaml.safe_dump(patch, allow_unicode=True, sort_keys=False, default_flow_style=False)
+try:
+    yaml.safe_load(text)
+except yaml.YAMLError as exc:
+    json.dump({"ok": False, "error": "生成的 profile 覆盖配置不是合法 YAML，已放弃写入：" + str(exc)}, sys.stdout, ensure_ascii=False)
+    sys.exit(0)
+
+json.dump({"ok": True, "text": text, "replaced": replaced}, sys.stdout, ensure_ascii=False)
+"""
 
 
 def _default_venv() -> Path:
@@ -184,50 +241,48 @@ def _profile_patch_path(dsh_home: Path, profile: str) -> Path:
     return dsh_home / "profiles" / profile / "cordis.patch.yml"
 
 
-def _parse_patch(text: str) -> list:
-    """把 cordis.patch.yml 解析为补丁项列表；空文件/纯注释返回 []。"""
-    if not text.strip():
-        return []
-    parsed = yaml.safe_load(text)
-    if parsed is None:
-        return []
-    if not isinstance(parsed, list):
-        raise SystemExit("cordis.patch.yml 顶层必须是列表（补丁项列表）")
-    return parsed
+def _run_yaml_patch(venv: Path, raw: str, python_value: str, home_value: str) -> tuple[str, bool]:
+    """用 venv 解释器（装完 facade 后必有 PyYAML）跑 YAML 处理，返回 (新文本, 是否更新已有项)。
 
-
-def _dump_patch(patch: list) -> str:
-    """序列化补丁项列表；注释不保留，但保证 yaml.safe_load 能原样读回。"""
-    return yaml.safe_dump(patch, allow_unicode=True, sort_keys=False, default_flow_style=False)
-
-
-def _find_plugin_entry(patch: list) -> dict | None:
-    """定位 id == PLUGIN_ID 的覆盖项；找不到返回 None。"""
-    for entry in patch:
-        if isinstance(entry, dict) and entry.get("id") == PLUGIN_ID:
-            return entry
-    return None
-
-
-def _default_entry(venv: Path, home: Path) -> dict:
-    python = _venv_python(venv)
-    return {
-        "id": PLUGIN_ID,
-        "name": PLUGIN_NAME,
-        "config": {
-            **_DEFAULT_CONFIG,
-            "interpreter": str(python),
-            "wewriteHome": str(home),
-        },
+    - 解析失败 / 写回自校验失败时，子进程返回 ok=false + 中文错误，这里转 SystemExit 且不落盘。
+    - 脚本自身不 import yaml，保证启动/建 venv/装 wheel 全程零第三方依赖。
+    """
+    venv_python = _venv_python(venv)
+    payload = {
+        "raw": raw,
+        "python": python_value,
+        "home": home_value,
+        "plugin_id": PLUGIN_ID,
+        "plugin_name": PLUGIN_NAME,
+        "default_config": _DEFAULT_CONFIG,
     }
+    proc = subprocess.run(
+        [str(venv_python), "-c", _YAML_PATCH_SCRIPT],
+        input=json.dumps(payload, ensure_ascii=False),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(f"profile 覆盖配置处理失败（venv 解释器退出码 {proc.returncode}：{(proc.stderr or '').strip()}）")
+    out = proc.stdout.strip()
+    if not out:
+        raise SystemExit("profile 覆盖配置处理失败：venv 解释器无输出。")
+    try:
+        result = json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise SystemExit("profile 覆盖配置处理失败：venv 解释器输出不是 JSON。") from exc
+    if result.get("ok") is not True:
+        raise SystemExit(result.get("error") or "profile 覆盖配置处理失败")
+    return str(result["text"]), bool(result.get("replaced", False))
 
 
 def _update_profile_patch(path: Path, venv: Path, home: Path, *, dry_run: bool) -> str:
-    """幂等写入 profile patch：结构化读入 YAML，只更新 interpreter/wewriteHome，其余字段原样保留。
+    """幂等写入 profile patch：用 venv 里的 PyYAML 结构化读写，只更新 interpreter/wewriteHome。
 
     - 已有 wewrite-python 覆盖项：config 缺失则新建空映射，config 内的其余键一律保留。
     - 无该项：追加默认整项。
-    - 写回前用 yaml.safe_load 自校验，解析失败则中文报错且不落盘（保留原文件）。
+    - 写回前由 venv 解释器 yaml.safe_load 自校验，解析失败则中文报错且不落盘（保留原文件）。
     """
     if dry_run:
         return f"[dry-run] 将写入 profile 覆盖配置：{path}"
@@ -236,27 +291,9 @@ def _update_profile_patch(path: Path, venv: Path, home: Path, *, dry_run: bool) 
         raw = path.read_text(encoding="utf-8")
     else:
         raw = ""
-    patch = _parse_patch(raw)
-
-    entry = _find_plugin_entry(patch)
-    replaced = entry is not None
-    if replaced:
-        config = entry.get("config")
-        if not isinstance(config, dict):
-            config = {}
-        config["interpreter"] = str(_venv_python(venv))
-        config["wewriteHome"] = str(home)
-        entry["config"] = config
-    else:
-        patch.append(_default_entry(venv, home))
-
-    text = _dump_patch(patch)
-
-    # 写回前自校验：解析失败则报错且不落盘，保留原文件。
-    try:
-        yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        raise SystemExit(f"生成的 profile 覆盖配置不是合法 YAML，已放弃写入：{exc}") from exc
+    python_value = str(_venv_python(venv))
+    home_value = str(home)
+    text, replaced = _run_yaml_patch(venv, raw, python_value, home_value)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")

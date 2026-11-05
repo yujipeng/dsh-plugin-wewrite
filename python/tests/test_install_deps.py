@@ -30,6 +30,15 @@ WHEEL = WHEEL_DIR / "dsh_wewrite_facade-0.1.0-py3-none-any.whl"
 # 这里取系统 python3（带 ensurepip）跑脚本。测试内寻找，避免硬编码机器绝对路径。
 SYSTEM_PYTHON = shutil.which("python3") or shutil.which("python") or sys.executable
 
+# _update_profile_patch 现在用 venv 解释器跑 YAML 处理（装完 facade 后必有 PyYAML）。
+# 测试环境本身就跑在装好 PyYAML 的 venv 里，直接用当前 venv 作为目标 venv。
+# 注意不能 resolve()（venv 的 bin/python 是 symlink，resolve 会跟到真实解释器）。
+VENV_WITH_YAML = Path(sys.executable).parent.parent
+
+
+def _venv_python(venv: Path) -> Path:
+    return venv / "bin" / "python"
+
 
 def _load_module():
     spec = importlib.util.spec_from_file_location("install_deps", INSTALL_SCRIPT)
@@ -110,6 +119,30 @@ def test_find_wheel_missing_errors(tmp_path):
     assert "未找到随包的 facade wheel" in str(exc.value)
 
 
+def test_dry_run_no_system_yaml_required():
+    """返修：脚本启动/建 venv/装 wheel 三步零第三方依赖（python3 -S 下也能跑 --dry-run）。"""
+    proc = subprocess.run(
+        [SYSTEM_PYTHON, "-S", str(INSTALL_SCRIPT), "--dry-run", "--wheel", str(WHEEL)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "未落盘" in proc.stdout
+    # 证明系统 Python 在该隔离下确实没有 yaml（否则本用例失去意义）。
+    no_yaml = subprocess.run([SYSTEM_PYTHON, "-S", "-c", "import yaml"], capture_output=True, text=True)
+    assert no_yaml.returncode != 0
+
+
+def test_script_top_level_has_no_yaml_import():
+    """返修：脚本源码顶层不得 import yaml（PyYAML 是待安装依赖，不是安装前置）。"""
+    raw = INSTALL_SCRIPT.read_text(encoding="utf-8")
+    import re
+    # 排除子进程内联脚本里的 `import yaml`（那是在 venv 解释器里执行的）。
+    body = raw.split("_YAML_PATCH_SCRIPT = r", 1)[0]
+    assert re.search(r"^\s*(import\s+yaml|from\s+yaml\s+import)", body, flags=re.MULTILINE) is None
+
+
 def test_write_profile_config_preserves_existing_custom_fields(tmp_path):
     """返修 3：--write-profile-config 只更新 interpreter/wewriteHome，其余字段原样保留。"""
     mod = _load_module()
@@ -127,7 +160,7 @@ def test_write_profile_config_preserves_existing_custom_fields(tmp_path):
         "    wewriteHome: /old/home\n",
         encoding="utf-8",
     )
-    venv = tmp_path / "venv"
+    venv = VENV_WITH_YAML
     home = tmp_path / "data"
     mod._update_profile_patch(path, venv, home, dry_run=False)
     text = path.read_text(encoding="utf-8")
@@ -152,7 +185,7 @@ def test_write_profile_config_creates_default_when_absent(tmp_path):
     mod = _load_module()
     path = tmp_path / "profiles" / "wewrite" / "cordis.patch.yml"
     path.parent.mkdir(parents=True)
-    venv = tmp_path / "venv"
+    venv = VENV_WITH_YAML
     home = tmp_path / "data"
     mod._update_profile_patch(path, venv, home, dry_run=False)
     parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -177,7 +210,7 @@ def test_write_profile_config_block_without_config(tmp_path, input_yaml):
     path = tmp_path / "profiles" / "wewrite" / "cordis.patch.yml"
     path.parent.mkdir(parents=True)
     path.write_text(input_yaml, encoding="utf-8")
-    venv = tmp_path / "venv"
+    venv = VENV_WITH_YAML
     home = tmp_path / "data"
     mod._update_profile_patch(path, venv, home, dry_run=False)
     parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -195,7 +228,7 @@ def test_write_profile_config_empty_config(tmp_path):
     path = tmp_path / "profiles" / "wewrite" / "cordis.patch.yml"
     path.parent.mkdir(parents=True)
     path.write_text("- id: wewrite-python\n  name: dsh-plugin-wewrite\n  config:\n", encoding="utf-8")
-    venv = tmp_path / "venv"
+    venv = VENV_WITH_YAML
     home = tmp_path / "data"
     mod._update_profile_patch(path, venv, home, dry_run=False)
     parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -221,7 +254,7 @@ def test_write_profile_config_shuffled_fields(tmp_path):
         "    agentToolsEnabled: true\n",
         encoding="utf-8",
     )
-    venv = tmp_path / "venv"
+    venv = VENV_WITH_YAML
     home = tmp_path / "data"
     mod._update_profile_patch(path, venv, home, dry_run=False)
     parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -250,7 +283,7 @@ def test_write_profile_config_nested_keys_preserved(tmp_path):
         "        value: keep\n",
         encoding="utf-8",
     )
-    venv = tmp_path / "venv"
+    venv = VENV_WITH_YAML
     home = tmp_path / "data"
     mod._update_profile_patch(path, venv, home, dry_run=False)
     parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -267,7 +300,7 @@ def test_write_profile_config_idempotent(tmp_path):
     path = tmp_path / "profiles" / "wewrite" / "cordis.patch.yml"
     path.parent.mkdir(parents=True)
     path.write_text("- id: wewrite-python\n  name: dsh-plugin-wewrite\n", encoding="utf-8")
-    venv = tmp_path / "venv"
+    venv = VENV_WITH_YAML
     home = tmp_path / "data"
     mod._update_profile_patch(path, venv, home, dry_run=False)
     first = path.read_text(encoding="utf-8")
