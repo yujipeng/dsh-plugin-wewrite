@@ -12,10 +12,18 @@ interface SettingsPanelProps {
   readonly client: WeWriteClient;
 }
 
+interface DiagnosticAction {
+  label: string;
+  command: string;
+  kind: string;
+  recheck: boolean;
+}
+
 interface Diagnostic {
   code: string;
   message: string;
   blocking: boolean;
+  actions?: DiagnosticAction[];
 }
 
 interface StyleState {
@@ -73,6 +81,15 @@ export function parseStyleText(text: string): Record<string, unknown> | null {
   }
 }
 
+/** 从诊断里取第一条「安装」类可执行动作（供设置面板展示缺什么 → 一条可复制命令）。 */
+export function firstInstallAction(diagnostics: Diagnostic[] | null): DiagnosticAction | null {
+  for (const d of diagnostics ?? []) {
+    const action = (d.actions ?? []).find((a) => a.kind === 'install');
+    if (action) return action;
+  }
+  return null;
+}
+
 export function SettingsPanel({ client }: SettingsPanelProps): JSX.Element {
   const [diagnostics, setDiagnostics] = useState<Diagnostic[] | null>(null);
   const [loading, setLoading] = useState(true);
@@ -92,6 +109,8 @@ export function SettingsPanel({ client }: SettingsPanelProps): JSX.Element {
   const [exemplars, setExemplars] = useState<{ loading: boolean; error: string | null; items: ExemplarItem[] }>({ loading: true, error: null, items: [] });
   const [exemplarDraft, setExemplarDraft] = useState<{ title: string; content: string; source: string }>({ title: '', content: '', source: '' });
   const [exemplarMsg, setExemplarMsg] = useState<string | null>(null);
+  const [rechecking, setRechecking] = useState(false);
+  const [recheckMsg, setRecheckMsg] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -109,6 +128,21 @@ export function SettingsPanel({ client }: SettingsPanelProps): JSX.Element {
     })();
     return () => { active = false; };
   }, [client]);
+
+  /** 重新检测：走宿主能力重新探针，而不是重渲染旧快照。 */
+  async function recheckDiagnostics() {
+    setRechecking(true);
+    setRecheckMsg(null);
+    const result = await client.diagnosticsRecheck();
+    if (!result.ok) {
+      setRechecking(false);
+      setRecheckMsg(result.error.message);
+      return;
+    }
+    setDiagnostics(((result.data as { diagnostics: Diagnostic[] }).diagnostics) ?? []);
+    setRechecking(false);
+    setRecheckMsg('已重新检测');
+  }
 
   async function reloadStyle() {
     setStyle((s) => ({ ...s, loading: true, error: null, saved: false }));
@@ -307,12 +341,28 @@ export function SettingsPanel({ client }: SettingsPanelProps): JSX.Element {
         </div>
       </section>
 
-      {/* 诊断列表 */}
-      <ul className="ww-settings__diags">
-        {(diagnostics ?? []).map((d, i) => (
-          <li key={i} data-testid={`ww-diag-${i}`}>{d.blocking ? '⚠️' : 'ℹ️'} {d.code}：{d.message}</li>
-        ))}
-      </ul>
+      {/* 诊断列表（JEE-1996：缺依赖时给可执行命令 + 重新检测） */}
+      <section className="ww-settings__diags-section" data-testid="ww-diags-section">
+        <div className="ww-settings__diags-actions">
+          <button type="button" data-testid="ww-recheck" disabled={rechecking} onClick={() => void recheckDiagnostics()}>
+            {rechecking ? '检测中…' : '重新检测'}
+          </button>
+          {recheckMsg ? <span data-testid="ww-recheck-msg">{recheckMsg}</span> : null}
+        </div>
+        <ul className="ww-settings__diags">
+          {(diagnostics ?? []).map((d, i) => (
+            <li key={i} data-testid={`ww-diag-${i}`}>
+              {d.blocking ? '⚠️' : 'ℹ️'} {d.code}：{d.message}
+              {(d.actions ?? []).map((a, j) => (
+                <div key={j} data-testid={`ww-diag-${i}-action-${j}`}>
+                  <div data-testid={`ww-diag-${i}-action-label-${j}`}>{a.label}</div>
+                  <code data-testid={`ww-diag-${i}-action-cmd-${j}`}>{a.command}</code>
+                </div>
+              ))}
+            </li>
+          ))}
+        </ul>
+      </section>
     </div>
   );
 }

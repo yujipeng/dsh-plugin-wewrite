@@ -33,6 +33,21 @@ describe('detectCapabilities（逐项诊断）', () => {
     expect(dataRoot!.detail.length).toBeGreaterThan(0);
   });
 
+  it('JEE-1996：缺 WEWRITE_HOME 时 dataRoot 诊断带可执行安装动作', () => {
+    const snapshot = detectCapabilities({}, { pushEnabled: false });
+    const dataRoot = snapshot.items.find((i) => i.key === 'dataRoot');
+    expect(dataRoot).toBeDefined();
+    expect(dataRoot!.ok).toBe(false);
+    const diag = snapshot.diagnostics.find((d) => d.message.includes('WEWRITE_HOME'));
+    expect(diag).toBeDefined();
+    expect(diag!.actions?.length).toBeGreaterThan(0);
+    const action = diag!.actions![0];
+    expect(action.kind).toBe('install');
+    expect(action.recheck).toBe(true);
+    expect(action.command).toContain('install_deps.py');
+    expect(action.command).not.toMatch(/^(\/|[A-Za-z]:\\)/);
+  });
+
   it('服务齐全时 read/agent/skills 可用，push 默认关闭', () => {
     const services: Record<string, unknown> = {
       connection: { admit: () => ({ peer: {} }) },
@@ -138,6 +153,58 @@ describe('createHandler（RPC 信封契约）', () => {
     expect(result.ok).toBe(true);
     expect(result.value?.ok).toBe(true);
     expect(result.value?.data).toBeDefined();
+  });
+
+  it('JEE-1996：diagnostics/recheck 重新探针，返回快照诊断而非旧快照', async () => {
+    let calls = 0;
+    const workflow = new AgentWorkflow({
+      runtime: { create: async () => { throw new Error('x'); }, resume: async () => { throw new Error('x'); }, get: () => undefined },
+      bridge: async () => ({ ok: false, error: { code: 'INTERNAL', message: '内部错误', retryable: false } }),
+      homeLabel: '数据根未配置',
+      mainSkillName: 'wewrite',
+      randomId: () => 'id-1',
+    });
+    const service = new WorkbenchService({
+      bridge: async () => ({ ok: false, error: { code: 'INTERNAL', message: '内部错误', retryable: false } }),
+      workflow,
+      randomId: () => 'id-1',
+      recheckDiagnostics: () => {
+        calls += 1;
+        return [{ code: 'CAPABILITY_UNAVAILABLE', message: '重新探针命中', blocking: true, actions: [{ label: '装', command: 'python3 scripts/install_deps.py', kind: 'install', recheck: true }] }];
+      },
+    });
+    const handler = createHandler(service);
+    const result = (await handler('diagnostics/recheck', {}, new AbortController().signal, {})) as {
+      ok: boolean;
+      value?: { ok: boolean; data?: { diagnostics: Array<{ message: string; actions?: Array<{ command: string }> }> } };
+    };
+    expect(result.ok).toBe(true);
+    expect(result.value?.ok).toBe(true);
+    expect(calls).toBe(1);
+    expect(result.value?.data?.diagnostics[0]?.message).toBe('重新探针命中');
+    expect(result.value?.data?.diagnostics[0]?.actions?.[0]?.command).toContain('install_deps.py');
+  });
+
+  it('JEE-1996：facade 不可用时 snapshot 返回骨架快照并带宿主安装引导诊断', async () => {
+    const workflow = new AgentWorkflow({
+      runtime: { create: async () => { throw new Error('x'); }, resume: async () => { throw new Error('x'); }, get: () => undefined },
+      bridge: async () => ({ ok: false, error: { code: 'INTERNAL', message: '内部错误', retryable: false } }),
+      homeLabel: '数据根未配置',
+      mainSkillName: 'wewrite',
+      randomId: () => 'id-1',
+    });
+    const service = new WorkbenchService({
+      bridge: async () => ({ ok: false, error: { code: 'INTERNAL', message: '内部错误', retryable: false } }),
+      workflow,
+      randomId: () => 'id-1',
+      recheckDiagnostics: () => [{ code: 'CAPABILITY_UNAVAILABLE', message: '解释器不可用', blocking: true, actions: [{ label: '装', command: 'python3 scripts/install_deps.py', kind: 'install', recheck: true }] }],
+    });
+    const result = await service.snapshot();
+    expect(result.ok).toBe(true);
+    const data = (result as { data: { runs: unknown[]; diagnostics: Array<{ message: string; actions?: Array<{ command: string }> }> } }).data;
+    expect(data.runs).toEqual([]);
+    expect(data.diagnostics[0]?.message).toBe('解释器不可用');
+    expect(data.diagnostics[0]?.actions?.[0]?.command).toContain('install_deps.py');
   });
 
   it('snapshot 未知字段 → {ok:false,error}，code=internal 且 message 中文不含栈', async () => {

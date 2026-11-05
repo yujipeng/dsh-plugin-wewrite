@@ -5,15 +5,18 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { accessSync, constants } from 'node:fs';
+import { accessSync, constants, existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import type { HostContext } from './types';
-import type { Issue } from '../shared/contract';
+import type { DiagnosticAction, SnapshotDiagnostic } from '../shared/contract';
 
 export interface CapabilityItem {
   readonly key: string;
   readonly label: string;
   readonly ok: boolean;
   readonly detail: string;
+  /** 缺依赖时的可执行动作（install/configure/retry），仅呈现、不代执行。 */
+  readonly actions?: readonly DiagnosticAction[];
 }
 
 export interface CapabilitySnapshot {
@@ -24,7 +27,38 @@ export interface CapabilitySnapshot {
   readonly preview: boolean;
   readonly push: boolean;
   readonly items: readonly CapabilityItem[];
-  readonly diagnostics: readonly Issue[];
+  readonly diagnostics: readonly SnapshotDiagnostic[];
+}
+
+/** 缺依赖时引导脚本的固定命令（脚本随包分发，路径运行时解析，不含机器绝对路径）。 */
+export function installCommand(): string {
+  return `python3 ${installScriptPath()}`;
+}
+
+/**
+ * 解析随包引导脚本路径。开发态（vitest/tsx）本文件在 src/host/，发布态被打进 lib/index.js，
+ * 两种情况下包根的相对层级不同；这里按磁盘真实存在性选一个，保证两端都命中 <包根>/scripts。
+ */
+export function installScriptPath(): string {
+  const candidates = [
+    fileURLToPath(new URL('../../scripts/install_deps.py', import.meta.url)),
+    fileURLToPath(new URL('../scripts/install_deps.py', import.meta.url)),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  // 兜底：都不存在（如纯单元测试无源码树）时返回相对形态，仍不含机器绝对路径。
+  return '<包根>/scripts/install_deps.py';
+}
+
+/** 解释器缺失/不可用时给「一条命令装齐」的引导。 */
+function interpreterInstallAction(): DiagnosticAction {
+  return {
+    label: '一条命令装齐 Python 依赖',
+    command: installCommand(),
+    kind: 'install',
+    recheck: true,
+  };
 }
 
 /** 解释器探测：目标 Python 解释器路径（可被 profile 私有覆盖配置替换）。 */
@@ -43,6 +77,7 @@ function probeInterpreter(): CapabilityItem {
       label: 'Python 解释器',
       ok: false,
       detail: `解释器 ${interpreter} 不可用（${error instanceof Error ? error.message : String(error)}）`,
+      actions: [interpreterInstallAction()],
     };
   }
 }
@@ -56,6 +91,7 @@ function probeDataRoot(): CapabilityItem {
       label: '数据根（WEWRITE_HOME）',
       ok: false,
       detail: '未配置 WEWRITE_HOME，无法确定数据根（profile 私有覆盖配置须提供）',
+      actions: [interpreterInstallAction()],
     };
   }
   try {
@@ -67,6 +103,7 @@ function probeDataRoot(): CapabilityItem {
       label: '数据根（WEWRITE_HOME）',
       ok: false,
       detail: `${home} 不可读写（${error instanceof Error ? error.message : String(error)}）`,
+      actions: [interpreterInstallAction()],
     };
   }
 }
@@ -123,9 +160,14 @@ export function detectCapabilities(ctx: HostContext, config: { pushEnabled: bool
     detail: effectOk ? 'ctx.effect 可用' : 'ctx.effect 缺失，无法登记 disposer',
   });
 
-  const diagnostics: Issue[] = items
+  const diagnostics: SnapshotDiagnostic[] = items
     .filter((item) => !item.ok && item.key !== 'approval')
-    .map((item) => ({ code: 'CAPABILITY_UNAVAILABLE', message: item.detail, blocking: item.key !== 'rpc' }));
+    .map((item) => ({
+      code: 'CAPABILITY_UNAVAILABLE',
+      message: item.detail,
+      blocking: item.key !== 'rpc',
+      ...(item.actions && item.actions.length > 0 ? { actions: [...item.actions] } : {}),
+    }));
 
   return {
     read: rpcOk,

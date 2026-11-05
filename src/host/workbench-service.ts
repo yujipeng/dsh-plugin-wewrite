@@ -19,6 +19,7 @@ import type { AgentWorkflow } from './agent-workflow';
 import { redactError } from './redaction';
 import { registerPushSummary } from './push-approval';
 import { timeoutFor, type BridgeResult } from './wewrite-bridge';
+import type { SnapshotDiagnostic } from '../shared/contract';
 
 /** facade 子进程调用面（注入以便测试替换为内存假实现）。 */
 export type WorkbenchBridge = (operation: string, payload: Record<string, unknown>) => Promise<{ ok: boolean; data?: unknown; error?: unknown }>;
@@ -44,6 +45,8 @@ export interface WorkbenchServiceOptions {
     intentId: string;
     expectedVersion: string | null;
   }) => Promise<{ ok: boolean; error?: { code: string; message: string } }>;
+  /** JEE-1996 方案 B：重新探针宿主能力（返回快照诊断，供设置面板「重新检测」）。 */
+  readonly recheckDiagnostics?: () => readonly SnapshotDiagnostic[];
 }
 
 type BridgeFailure = { code: string; message: string; retryable?: boolean; runId?: string };
@@ -77,9 +80,36 @@ export class WorkbenchService {
   // ── 基础读面 ─────────────────────────────────────────────────────────────
 
   async snapshot(): Promise<BusinessResult<unknown>> {
+    const host = this.options.recheckDiagnostics?.() ?? [];
     const resp = await this.safeBridge('snapshot', {});
-    if (resp.ok === false) return businessFailure('INTERNAL', '读取工作台快照失败');
+    if (resp.ok === false) {
+      // facade 缺失/不可用：不整体失败，返回骨架快照并带上宿主能力诊断（含安装引导动作），
+      // 让设置面板能展示「缺什么 → 一条命令 → 重新检测」。
+      return businessSuccess({
+        runs: [],
+        nextCursor: null,
+        themes: [],
+        capabilities: { read: false, write: false, agent: false, skills: false, preview: false, push: false },
+        diagnostics: host.length > 0
+          ? host
+          : [{ code: 'CAPABILITY_UNAVAILABLE', message: 'Python facade 不可用，需先装齐 Python 依赖', blocking: true }],
+        settings: { visualMode: 'none', pushEnabled: false, publishTransport: 'fake', credentialConfigured: false },
+      });
+    }
+    const data = resp.data as { diagnostics?: SnapshotDiagnostic[] } | undefined;
+    if (data && typeof data === 'object' && host.length > 0) {
+      return businessSuccess({
+        ...data,
+        diagnostics: [...(data.diagnostics ?? []), ...host],
+      });
+    }
     return bridgeResult(resp);
+  }
+
+  /** JEE-1996 方案 B：重新探针宿主能力（不重读 facade 快照，只刷新解释器/数据根诊断）。 */
+  diagnosticsRecheck(): BusinessResult<unknown> {
+    const diagnostics = this.options.recheckDiagnostics?.() ?? [];
+    return businessSuccess({ diagnostics });
   }
 
   async runList(payload: { cursor?: string; limit?: number }): Promise<BusinessResult<unknown>> {

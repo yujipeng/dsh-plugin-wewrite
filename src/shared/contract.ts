@@ -76,6 +76,26 @@ export const IssueSchema = z.strictObject({
 });
 export type Issue = z.infer<typeof IssueSchema>;
 
+/** 诊断可执行动作（JEE-1996 方案 B）：缺依赖时给「可照做」的引导，不只是一句「不可用」。 */
+export const DiagnosticActionSchema = z.strictObject({
+  label: z.string().min(1),
+  /** 用户可直接复制的命令（仅呈现，插件不代执行）。 */
+  command: z.string(),
+  kind: z.enum(['install', 'configure', 'retry']),
+  /** 执行该动作后是否应重新探针（设置面板据此给「重新检测」按钮）。 */
+  recheck: z.boolean(),
+});
+export type DiagnosticAction = z.infer<typeof DiagnosticActionSchema>;
+
+/** 快照诊断项：在 Issue 之上可选携带可执行动作（仅在 snapshot.diagnostics 使用）。 */
+export const SnapshotDiagnosticSchema = z.strictObject({
+  code: z.string().min(1),
+  message: z.string(),
+  blocking: z.boolean(),
+  actions: z.array(DiagnosticActionSchema).optional(),
+});
+export type SnapshotDiagnostic = z.infer<typeof SnapshotDiagnosticSchema>;
+
 /** Version：实际文件字节 SHA-256；不存在为 null。 */
 export const VersionSchema = HashSchema.nullable();
 export type Version = z.infer<typeof VersionSchema>;
@@ -261,7 +281,7 @@ const SnapshotDataSchema = z.strictObject({
     preview: z.boolean(),
     push: z.boolean(),
   }),
-  diagnostics: z.array(IssueSchema),
+  diagnostics: z.array(SnapshotDiagnosticSchema),
   settings: z.strictObject({
     visualMode: z.string(),
     pushEnabled: z.boolean(),
@@ -546,6 +566,12 @@ export const rpcContract = {
       mediaId: z.string().nullable(),
       issue: IssueSchema.nullable(),
       dryRun: z.boolean(),
+    })),
+  },
+  'diagnostics/recheck': {
+    request: EmptyRequest,
+    response: businessResult(z.strictObject({
+      diagnostics: z.array(SnapshotDiagnosticSchema),
     })),
   },
   'style/get': {

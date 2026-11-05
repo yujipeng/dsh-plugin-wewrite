@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { parseStyleText, STYLE_PLACEHOLDER } from '@/client/panels/Settings';
+import { firstInstallAction, parseStyleText, STYLE_PLACEHOLDER } from '@/client/panels/Settings';
 
 /** 服务端 yaml.safe_dump 的实际输出格式（列表项零缩进）。 */
 const SERVER_DUMP = [
@@ -47,5 +47,15 @@ describe('设置面板 style YAML 解析（返修 6）', () => {
   it('非法 YAML / 非对象返回 null', () => {
     expect(parseStyleText('topics: [unclosed')).toBeNull();
     expect(parseStyleText('- 1\n- 2')).toBeNull();
+  });
+
+  it('JEE-1996：firstInstallAction 从诊断里取第一条安装类动作', () => {
+    const install = { label: '一条命令装齐 Python 依赖', command: 'python3 scripts/install_deps.py', kind: 'install', recheck: true };
+    expect(firstInstallAction([
+      { code: 'CAPABILITY_UNAVAILABLE', message: '解释器不可用', blocking: true, actions: [install] },
+    ])).toEqual(install);
+    // 无安装动作时返回 null。
+    expect(firstInstallAction([{ code: 'X', message: 'm', blocking: false }])).toBeNull();
+    expect(firstInstallAction(null)).toBeNull();
   });
 });

@@ -101,4 +101,17 @@ describe('manifest 完整性（方案 A + 返修 4）', () => {
     expect(lines('skills/wewrite-style/references/style-template.md')).toBe(60);
     expect(lines('skills/wewrite-learn/references/learn-edits.md')).toBe(51);
   });
+
+  it('JEE-1996：package.json 不含 postinstall/preinstall/install 脚本（防 pnpm 拒绝安装）', () => {
+    const pkg = JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf8')) as { scripts?: Record<string, string> };
+    for (const hook of ['postinstall', 'preinstall', 'install']) {
+      expect(pkg.scripts?.[hook], `package.json 不得含 ${hook}`).toBeUndefined();
+    }
+  });
+
+  it('JEE-1996：package.json files 包含 python-dist 与 scripts（wheel 与引导脚本随包分发）', () => {
+    const pkg = JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf8')) as { files?: string[] };
+    expect(pkg.files).toContain('python-dist');
+    expect(pkg.files).toContain('scripts');
+  });
 });

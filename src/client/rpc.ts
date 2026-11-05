@@ -62,6 +62,7 @@ export class WeWriteClient {
   }
 
   snapshot() { return this.call<unknown>('snapshot', {}); }
+  diagnosticsRecheck() { return this.call<unknown>('diagnostics/recheck', {}); }
   runList(payload: { cursor?: string; limit?: number }) { return this.call<unknown>('run/list', payload); }
   hotspotsFetch(payload: { limit: number }) { return this.call<unknown>('hotspots/fetch', payload); }
   runCreate(payload: unknown) { return this.call<unknown>('run/create', payload); }

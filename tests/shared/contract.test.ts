@@ -15,6 +15,7 @@ import {
   HashSchema,
   AssessmentSchema,
   ReportSchema,
+  SnapshotDiagnosticSchema,
   TOPIC_MAX,
   TEXT_MAX_BYTES,
   IMAGE_MAX_BYTES,
@@ -36,6 +37,24 @@ function dims() {
 describe('RPC 通道与错误码常量（§4）', () => {
   it('通道名锁定为 /wewrite-python', () => {
     expect(RPC_CHANNEL).toBe('/wewrite-python');
+  });
+
+  it('JEE-1996 快照诊断可携带可执行动作（install/configure/retry + recheck）', () => {
+    expect(SnapshotDiagnosticSchema.safeParse({
+      code: 'CAPABILITY_UNAVAILABLE',
+      message: '解释器不可用',
+      blocking: true,
+      actions: [{ label: '一条命令装齐 Python 依赖', command: 'python3 <包根>/scripts/install_deps.py', kind: 'install', recheck: true }],
+    }).success).toBe(true);
+    // 不带 actions 的旧式诊断仍合法（向后兼容）。
+    expect(SnapshotDiagnosticSchema.safeParse({ code: 'HOME_UNINITIALIZED', message: '数据根未初始化', blocking: true }).success).toBe(true);
+    // 未知字段仍拒绝。
+    expect(SnapshotDiagnosticSchema.safeParse({ code: 'X', message: 'm', blocking: true, __bogus: 1 }).success).toBe(false);
+    // 动作必须是 install/configure/retry 之一。
+    expect(SnapshotDiagnosticSchema.safeParse({
+      code: 'X', message: 'm', blocking: true,
+      actions: [{ label: 'a', command: 'c', kind: 'other', recheck: true }],
+    }).success).toBe(false);
   });
 
   it('业务错误码全集（§4 固定 18 项）', () => {
@@ -76,7 +95,7 @@ print(json.dumps({"codes": ERROR_CODES, "messages": ERROR_MESSAGES,
     }
   });
 
-  it('端点全集覆盖设计 §4 的 17 个 RPC + 方案 B 批一 8 个账号级端点', () => {
+  it('端点全集覆盖设计 §4 的 17 个 RPC + 方案 B 批一 8 个账号级端点 + JEE-1996 重新检测端点', () => {
     expect(Object.keys(rpcContract).sort()).toEqual(
       [
         'snapshot',
@@ -105,6 +124,7 @@ print(json.dumps({"codes": ERROR_CODES, "messages": ERROR_MESSAGES,
         'exemplar/put',
         'exemplar/list',
         'exemplar/get',
+        'diagnostics/recheck',
       ].sort(),
     );
   });

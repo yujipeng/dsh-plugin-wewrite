@@ -30,6 +30,8 @@
   "files": [
     "lib",
     "skills",
+    "scripts",
+    "python-dist",
     "cordis.patch.yml",
     "THIRD_PARTY_NOTICES"
   ],

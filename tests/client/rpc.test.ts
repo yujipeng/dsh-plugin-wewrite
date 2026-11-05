@@ -64,4 +64,20 @@ describe('WeWriteClient（宿主 connection.rpc.call 接线）', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe('CAPABILITY_UNAVAILABLE');
   });
+
+  it('JEE-1996：diagnosticsRecheck 走 /wewrite-python 的 diagnostics/recheck 端点', async () => {
+    let endpointCalled = '';
+    const connection: ClientConnection = {
+      rpc: {
+        call: async (_channel, endpoint) => {
+          endpointCalled = endpoint;
+          return { ok: true, value: { ok: true, data: { diagnostics: [] } } };
+        },
+      },
+    };
+    const client = new WeWriteClient(connection);
+    const result = await client.diagnosticsRecheck();
+    expect(endpointCalled).toBe('diagnostics/recheck');
+    expect(result.ok).toBe(true);
+  });
 });
