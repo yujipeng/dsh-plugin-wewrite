@@ -20,6 +20,7 @@ import { redactError } from './redaction';
 import { registerPushSummary } from './push-approval';
 import { timeoutFor, type BridgeResult } from './wewrite-bridge';
 import type { SnapshotDiagnostic } from '../shared/contract';
+import { installAction } from './capabilities';
 
 /** facade 子进程调用面（注入以便测试替换为内存假实现）。 */
 export type WorkbenchBridge = (operation: string, payload: Record<string, unknown>) => Promise<{ ok: boolean; data?: unknown; error?: unknown }>;
@@ -50,6 +51,19 @@ export interface WorkbenchServiceOptions {
 }
 
 type BridgeFailure = { code: string; message: string; retryable?: boolean; runId?: string };
+
+/** 合并诊断并按 code+message 去重（宿主探测与 facade 诊断不丢弃任何一侧）。 */
+function mergeDiagnostics(a: readonly SnapshotDiagnostic[], b: readonly SnapshotDiagnostic[]): SnapshotDiagnostic[] {
+  const seen = new Set<string>();
+  const out: SnapshotDiagnostic[] = [];
+  for (const item of [...a, ...b]) {
+    const key = `${item.code}\u0000${item.message}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
 
 function asFailure(resp: { ok: boolean; data?: unknown; error?: unknown }): BridgeFailure | null {
   if (resp.ok) return null;
@@ -83,33 +97,49 @@ export class WorkbenchService {
     const host = this.options.recheckDiagnostics?.() ?? [];
     const resp = await this.safeBridge('snapshot', {});
     if (resp.ok === false) {
-      // facade 缺失/不可用：不整体失败，返回骨架快照并带上宿主能力诊断（含安装引导动作），
+      // facade 缺失/不可用：不整体失败，返回骨架快照并带上宿主能力诊断（含 facade 安装引导动作），
       // 让设置面板能展示「缺什么 → 一条命令 → 重新检测」。
+      const facadeDiag: SnapshotDiagnostic = {
+        code: 'CAPABILITY_UNAVAILABLE',
+        message: 'Python facade 不可用，需先装齐 Python 依赖',
+        blocking: true,
+        actions: [installAction()],
+      };
       return businessSuccess({
         runs: [],
         nextCursor: null,
         themes: [],
         capabilities: { read: false, write: false, agent: false, skills: false, preview: false, push: false },
-        diagnostics: host.length > 0
-          ? host
-          : [{ code: 'CAPABILITY_UNAVAILABLE', message: 'Python facade 不可用，需先装齐 Python 依赖', blocking: true }],
+        // 宿主诊断（含 interpreter/dataRoot/facade 探测）与兜底 facade 项合并去重，不丢弃任何一侧。
+        diagnostics: mergeDiagnostics(host, [facadeDiag]),
         settings: { visualMode: 'none', pushEnabled: false, publishTransport: 'fake', credentialConfigured: false },
       });
     }
     const data = resp.data as { diagnostics?: SnapshotDiagnostic[] } | undefined;
-    if (data && typeof data === 'object' && host.length > 0) {
+    if (data && typeof data === 'object') {
       return businessSuccess({
         ...data,
-        diagnostics: [...(data.diagnostics ?? []), ...host],
+        diagnostics: mergeDiagnostics(data.diagnostics ?? [], host),
       });
     }
     return bridgeResult(resp);
   }
 
-  /** JEE-1996 方案 B：重新探针宿主能力（不重读 facade 快照，只刷新解释器/数据根诊断）。 */
-  diagnosticsRecheck(): BusinessResult<unknown> {
-    const diagnostics = this.options.recheckDiagnostics?.() ?? [];
-    return businessSuccess({ diagnostics });
+  /** JEE-1996 方案 B：重新探针宿主能力 + facade 可用性（与 snapshot 同一判定）。 */
+  async diagnosticsRecheck(): Promise<BusinessResult<unknown>> {
+    const host = this.options.recheckDiagnostics?.() ?? [];
+    const resp = await this.safeBridge('snapshot', {});
+    if (resp.ok === false) {
+      const facadeDiag: SnapshotDiagnostic = {
+        code: 'CAPABILITY_UNAVAILABLE',
+        message: 'Python facade 不可用，需先装齐 Python 依赖',
+        blocking: true,
+        actions: [installAction()],
+      };
+      return businessSuccess({ diagnostics: mergeDiagnostics(host, [facadeDiag]) });
+    }
+    const data = resp.data as { diagnostics?: SnapshotDiagnostic[] } | undefined;
+    return businessSuccess({ diagnostics: mergeDiagnostics(data?.diagnostics ?? [], host) });
   }
 
   async runList(payload: { cursor?: string; limit?: number }): Promise<BusinessResult<unknown>> {

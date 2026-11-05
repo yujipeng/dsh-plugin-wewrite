@@ -33,6 +33,21 @@ describe('detectCapabilities（逐项诊断）', () => {
     expect(dataRoot!.detail.length).toBeGreaterThan(0);
   });
 
+  it('返修 1：detectCapabilities 采用 config.interpreter / config.wewriteHome（与桥接一致）', () => {
+    const before = process.env.WEWRITE_HOME;
+    delete process.env.WEWRITE_HOME;
+    delete process.env.WEWRITE_PYTHON;
+    try {
+      // 只给 config 注入，不设环境变量：dataRoot 必须按 config.wewriteHome 判，不能误报「未配置」。
+      const ctx: HostContext = { get: () => undefined };
+      const snapshot = detectCapabilities(ctx, { pushEnabled: false, interpreter: 'python3', wewriteHome: '/' });
+      const dataRoot = snapshot.items.find((i) => i.key === 'dataRoot')!;
+      expect(dataRoot.detail).not.toContain('未配置 WEWRITE_HOME');
+    } finally {
+      if (before === undefined) delete process.env.WEWRITE_HOME; else process.env.WEWRITE_HOME = before;
+    }
+  });
+
   it('JEE-1996：缺 WEWRITE_HOME 时 dataRoot 诊断带可执行安装动作', () => {
     const snapshot = detectCapabilities({}, { pushEnabled: false });
     const dataRoot = snapshot.items.find((i) => i.key === 'dataRoot');
@@ -46,6 +61,20 @@ describe('detectCapabilities（逐项诊断）', () => {
     expect(action.recheck).toBe(true);
     expect(action.command).toContain('install_deps.py');
     expect(action.command).not.toMatch(/^(\/|[A-Za-z]:\\)/);
+  });
+
+  it('返修 2：解释器可用 + WEWRITE_HOME 可用 + facade 未安装 → 出 facade 诊断带 install 动作', () => {
+    // 用一个「能 --version 但无 dsh_wewrite_facade 模块」的解释器模拟。
+    const ctx: HostContext = { get: () => undefined };
+    const snapshot = detectCapabilities(ctx, { pushEnabled: false, interpreter: 'python3', wewriteHome: '/' });
+    const facade = snapshot.items.find((i) => i.key === 'facade');
+    expect(facade).toBeDefined();
+    const diag = snapshot.diagnostics.find((d) => d.message.includes('dsh_wewrite_facade'));
+    expect(diag).toBeDefined();
+    expect(diag!.actions?.length).toBeGreaterThan(0);
+    expect(diag!.actions![0].kind).toBe('install');
+    expect(diag!.actions![0].recheck).toBe(true);
+    expect(diag!.actions![0].command).toContain('install_deps.py');
   });
 
   it('服务齐全时 read/agent/skills 可用，push 默认关闭', () => {
@@ -205,6 +234,29 @@ describe('createHandler（RPC 信封契约）', () => {
     expect(data.runs).toEqual([]);
     expect(data.diagnostics[0]?.message).toBe('解释器不可用');
     expect(data.diagnostics[0]?.actions?.[0]?.command).toContain('install_deps.py');
+  });
+
+  it('返修 2：facade 不可用且宿主诊断为空时，snapshot 兜底 facade 项仍带 install 动作', async () => {
+    const workflow = new AgentWorkflow({
+      runtime: { create: async () => { throw new Error('x'); }, resume: async () => { throw new Error('x'); }, get: () => undefined },
+      bridge: async () => ({ ok: false, error: { code: 'INTERNAL', message: '内部错误', retryable: false } }),
+      homeLabel: '数据根未配置',
+      mainSkillName: 'wewrite',
+      randomId: () => 'id-1',
+    });
+    const service = new WorkbenchService({
+      bridge: async () => ({ ok: false, error: { code: 'INTERNAL', message: '内部错误', retryable: false } }),
+      workflow,
+      randomId: () => 'id-1',
+      recheckDiagnostics: () => [],
+    });
+    const result = await service.snapshot();
+    expect(result.ok).toBe(true);
+    const data = (result as { data: { diagnostics: Array<{ message: string; actions?: Array<{ kind: string; command: string }> }> } }).data;
+    const facadeDiag = data.diagnostics.find((d) => d.message.includes('facade 不可用'));
+    expect(facadeDiag).toBeDefined();
+    expect(facadeDiag!.actions?.[0]?.kind).toBe('install');
+    expect(facadeDiag!.actions?.[0]?.command).toContain('install_deps.py');
   });
 
   it('snapshot 未知字段 → {ok:false,error}，code=internal 且 message 中文不含栈', async () => {

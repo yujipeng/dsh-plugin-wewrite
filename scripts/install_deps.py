@@ -175,7 +175,11 @@ def _profile_patch_path(dsh_home: Path, profile: str) -> Path:
 
 
 def _override_entry(venv: Path, home: Path) -> list[str]:
-    """生成写进 profile cordis.patch.yml 的整项覆盖（补丁按整项替换，须给全 config）。"""
+    """生成写进 profile cordis.patch.yml 的整项覆盖（补丁按整项替换，须给全 config）。
+
+    仅在「尚不存在 wewrite-python 覆盖块」时用作默认首项；已有块走 _merge_into_block 只更新
+    interpreter / wewriteHome 两个目标字段，保留用户其余自定义。
+    """
     python = _venv_python(venv)
     return [
         "- id: wewrite-python",
@@ -190,36 +194,65 @@ def _override_entry(venv: Path, home: Path) -> list[str]:
     ]
 
 
-def _update_profile_patch(path: Path, entry: list[str], *, dry_run: bool) -> str:
-    """幂等写入 profile patch：已存在 wewrite-python 覆盖则整体替换，否则追加。"""
+def _is_target_key(line: str) -> bool:
+    """判断一行是否为 interpreter / wewriteHome 配置键（config 块内 4 空格缩进）。"""
+    stripped = line.lstrip(" ")
+    indent = len(line) - len(stripped)
+    return indent >= 4 and stripped.split(":", 1)[0].strip() in ("interpreter", "wewriteHome")
+
+
+def _merge_into_block(lines: list[str], start: int, end: int, venv: Path, home: Path) -> list[str]:
+    """在既有 wewrite-python 覆盖块内只更新 interpreter/wewriteHome，其余字段原样保留。"""
+    python = _venv_python(venv)
+    block = lines[start:end]
+    kept: list[str] = []
+    # 1. 去掉旧的 interpreter / wewriteHome 行。
+    for line in block:
+        if _is_target_key(line):
+            continue
+        kept.append(line)
+    # 2. 在 `  config:` 之后插入新两行；找不到 config 行则追加到块尾。
+    new_lines = [f"    interpreter: {python}", f"    wewriteHome: {home}"]
+    merged: list[str] = []
+    inserted = False
+    for line in kept:
+        merged.append(line)
+        if not inserted and line.rstrip("\n") == "  config:":
+            merged.extend(new_lines)
+            inserted = True
+    if not inserted:
+        merged.extend(new_lines)
+    return merged
+
+
+def _update_profile_patch(path: Path, venv: Path, home: Path, *, dry_run: bool) -> str:
+    """幂等写入 profile patch：已有 wewrite-python 覆盖则只更新 interpreter/wewriteHome，否则追加默认项。"""
     if dry_run:
         return f"[dry-run] 将写入 profile 覆盖配置：{path}"
     if path.exists():
         lines = path.read_text(encoding="utf-8").splitlines()
     else:
         lines = []
-    # 定位并移除既有顶层 `- id: wewrite-python` 覆盖块（不含 `- insert:` 内的同名行）。
     out: list[str] = []
     i = 0
     replaced = False
     while i < len(lines):
         line = lines[i]
         if line == "- id: wewrite-python":
+            # 定位该覆盖块边界（到下一个顶层 `- ` 或 EOF）。
+            j = i + 1
+            while j < len(lines) and not lines[j].startswith("- "):
+                j += 1
+            out.extend(_merge_into_block(lines, i, j, venv, home))
             replaced = True
-            # 跳过该覆盖块直到下一个顶层 `- ` 或 EOF。
-            i += 1
-            while i < len(lines) and not lines[i].startswith("- "):
-                i += 1
+            i = j
             continue
         out.append(line)
         i += 1
-    if replaced:
-        out.extend(entry)
-    else:
-        # 保持一个空行分隔后追加；文件为空则直接作为列表首项。
+    if not replaced:
         if out and out[-1].strip() != "":
             out.append("")
-        out.extend(entry)
+        out.extend(_override_entry(venv, home))
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
@@ -264,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
         if not profile:
             raise SystemExit("--write-profile-config 需要同时提供 --profile <name>。")
         dsh_home = Path(args.dsh_home).expanduser() if args.dsh_home else Path(os.environ.get("DSH_HOME", Path.home() / ".dsh"))
-        steps.append(_update_profile_patch(_profile_patch_path(dsh_home, profile), _override_entry(venv, home), dry_run=dry))
+        steps.append(_update_profile_patch(_profile_patch_path(dsh_home, profile), venv, home, dry_run=dry))
 
     exports = _export_lines(venv, home)
     if dry:

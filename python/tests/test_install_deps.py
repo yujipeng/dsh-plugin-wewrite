@@ -107,3 +107,52 @@ def test_find_wheel_missing_errors(tmp_path):
     with pytest.raises(SystemExit) as exc:
         mod._find_wheel(tmp_path)
     assert "未找到随包的 facade wheel" in str(exc.value)
+
+
+def test_write_profile_config_preserves_existing_custom_fields(tmp_path):
+    """返修 3：--write-profile-config 只更新 interpreter/wewriteHome，其余字段原样保留。"""
+    mod = _load_module()
+    path = tmp_path / "profiles" / "wewrite" / "cordis.patch.yml"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "- id: wewrite-python\n"
+        "  name: dsh-plugin-wewrite\n"
+        "  config:\n"
+        "    agentToolsEnabled: true\n"
+        "    pushEnabled: true\n"
+        "    publishTransport: wechat\n"
+        "    bridgeTimeoutMs: 45000\n"
+        "    interpreter: /old/python\n"
+        "    wewriteHome: /old/home\n",
+        encoding="utf-8",
+    )
+    venv = tmp_path / "venv"
+    home = tmp_path / "data"
+    mod._update_profile_patch(path, venv, home, dry_run=False)
+    text = path.read_text(encoding="utf-8")
+    # 用户自定义字段保留。
+    assert "pushEnabled: true" in text
+    assert "publishTransport: wechat" in text
+    assert "bridgeTimeoutMs: 45000" in text
+    # 目标字段被更新。
+    assert f"interpreter: {venv / 'bin' / 'python'}" in text
+    assert f"wewriteHome: {home}" in text
+    # 旧值被移除。
+    assert "/old/python" not in text
+    assert "/old/home" not in text
+    # 只保留一个 wewrite-python 覆盖块。
+    assert text.count("- id: wewrite-python") == 1
+
+
+def test_write_profile_config_creates_default_when_absent(tmp_path):
+    """返修 3：无既有覆盖块时仍追加默认整项。"""
+    mod = _load_module()
+    path = tmp_path / "profiles" / "wewrite" / "cordis.patch.yml"
+    path.parent.mkdir(parents=True)
+    venv = tmp_path / "venv"
+    home = tmp_path / "data"
+    mod._update_profile_patch(path, venv, home, dry_run=False)
+    text = path.read_text(encoding="utf-8")
+    assert text.count("- id: wewrite-python") == 1
+    assert f"interpreter: {venv / 'bin' / 'python'}" in text
+    assert f"wewriteHome: {home}" in text
