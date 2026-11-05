@@ -1,8 +1,8 @@
 {
   "version": 1,
   "provider": "wewrite-python-bundle",
-  "sourceRevision": "imraywang/wewrite@2860fbe958311fcc04009d8132908989e43e6eaa",
-  "sourceHash": "2860fbe958311fcc04009d8132908989e43e6eaa",
+  "sourceRevision": "imraywang/wewrite@8a5cdabd303c147f174c9597dd334a1c3d3b50bd",
+  "sourceHash": "8a5cdabd303c147f174c9597dd334a1c3d3b50bd",
   "skills": [
     {
       "name": "wewrite",
@@ -39,6 +39,18 @@
       "description": "预览与请求草稿推送（本地预览 + 预检 + 逐篇确认请求；不真实推送到微信）",
       "path": "wewrite-publish/SKILL.md",
       "sha256": "282453c90f93cec56b098bc7702d2831022271a2e29b1d25afc5f7c7dd095fe7"
+    },
+    {
+      "name": "wewrite-style",
+      "description": "写作风格设置（style.yaml）：首次引导 onboard + 重设风格配置；产出 topics/target_audience/blacklist/content_style 等字段供选题与写作使用",
+      "path": "wewrite-style/SKILL.md",
+      "sha256": "32631e45f5061ecbc0367a91f144baf5e29166ab894b6dc3d140b35a886c96bd"
+    },
+    {
+      "name": "wewrite-learn",
+      "description": "自学习：记录人工改稿差异（learn）与范文库（exemplar）只读查看；写作偏好飞轮，重复出现的规则才成为硬约束",
+      "path": "wewrite-learn/SKILL.md",
+      "sha256": "87eddd32066f847240a466e459fc55193aca17273d33d479b803d91c98d3d93a"
     }
   ],
   "references": [
@@ -86,6 +98,21 @@
     {
       "path": "wewrite-publish/references/wechat-constraints.md",
       "sha256": "7736bacc8d41a525f5536995944cb9a5528bf78bc29bd6566a9e77f8da1d7028",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-style/references/onboard.md",
+      "sha256": "769bbf585167ce5becf57cfd165ddfe3aac66ea46dacdbed7b37cbe8493431e2",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-style/references/style-template.md",
+      "sha256": "eb7f9fb6b2fdd5a29b508ffad768042dbec3b0eaa40dfd4b50408a8120f8d262",
+      "adapted": false
+    },
+    {
+      "path": "wewrite-learn/references/learn-edits.md",
+      "sha256": "ccffd768b44a5adadfd75e5ecaff3243e287f7dbf55f45e895b7854dd296bac1",
       "adapted": false
     }
   ]

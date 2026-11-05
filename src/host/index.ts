@@ -214,6 +214,8 @@ function assembleWorkbench(
       agent.followup(message);
       return { ok: true };
     },
+    // JEE-1996 方案 B：设置面板「重新检测」走这里重新探针宿主能力，而非重渲染旧快照。
+    recheckDiagnostics: () => detectCapabilities(ctx, config).diagnostics,
   });
 
   const toolDefs = buildAgentTools(service);

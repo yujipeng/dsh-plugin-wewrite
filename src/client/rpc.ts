@@ -62,6 +62,7 @@ export class WeWriteClient {
   }
 
   snapshot() { return this.call<unknown>('snapshot', {}); }
+  diagnosticsRecheck() { return this.call<unknown>('diagnostics/recheck', {}); }
   runList(payload: { cursor?: string; limit?: number }) { return this.call<unknown>('run/list', payload); }
   hotspotsFetch(payload: { limit: number }) { return this.call<unknown>('hotspots/fetch', payload); }
   runCreate(payload: unknown) { return this.call<unknown>('run/create', payload); }
@@ -79,4 +80,12 @@ export class WeWriteClient {
   prepareDraft(payload: unknown) { return this.call<unknown>('wechat/prepareDraft', payload); }
   pushDraft(payload: unknown) { return this.call<unknown>('wechat/pushDraft', payload); }
   pushStatus(payload: { runId: string; operationId: string }) { return this.call<unknown>('wechat/pushStatus', payload); }
+  styleGet() { return this.call<unknown>('style/get', {}); }
+  stylePut(payload: unknown) { return this.call<unknown>('style/put', payload); }
+  styleValidate(payload: unknown) { return this.call<unknown>('style/validate', payload); }
+  learnRecord(payload: unknown) { return this.call<unknown>('learn/record', payload); }
+  learnList() { return this.call<unknown>('learn/list', {}); }
+  exemplarPut(payload: unknown) { return this.call<unknown>('exemplar/put', payload); }
+  exemplarList() { return this.call<unknown>('exemplar/list', {}); }
+  exemplarGet(payload: { id: string }) { return this.call<unknown>('exemplar/get', payload); }
 }

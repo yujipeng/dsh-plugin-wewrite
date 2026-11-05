@@ -76,6 +76,26 @@ export const IssueSchema = z.strictObject({
 });
 export type Issue = z.infer<typeof IssueSchema>;
 
+/** 诊断可执行动作（JEE-1996 方案 B）：缺依赖时给「可照做」的引导，不只是一句「不可用」。 */
+export const DiagnosticActionSchema = z.strictObject({
+  label: z.string().min(1),
+  /** 用户可直接复制的命令（仅呈现，插件不代执行）。 */
+  command: z.string(),
+  kind: z.enum(['install', 'configure', 'retry']),
+  /** 执行该动作后是否应重新探针（设置面板据此给「重新检测」按钮）。 */
+  recheck: z.boolean(),
+});
+export type DiagnosticAction = z.infer<typeof DiagnosticActionSchema>;
+
+/** 快照诊断项：在 Issue 之上可选携带可执行动作（仅在 snapshot.diagnostics 使用）。 */
+export const SnapshotDiagnosticSchema = z.strictObject({
+  code: z.string().min(1),
+  message: z.string(),
+  blocking: z.boolean(),
+  actions: z.array(DiagnosticActionSchema).optional(),
+});
+export type SnapshotDiagnostic = z.infer<typeof SnapshotDiagnosticSchema>;
+
 /** Version：实际文件字节 SHA-256；不存在为 null。 */
 export const VersionSchema = HashSchema.nullable();
 export type Version = z.infer<typeof VersionSchema>;
@@ -261,7 +281,7 @@ const SnapshotDataSchema = z.strictObject({
     preview: z.boolean(),
     push: z.boolean(),
   }),
-  diagnostics: z.array(IssueSchema),
+  diagnostics: z.array(SnapshotDiagnosticSchema),
   settings: z.strictObject({
     visualMode: z.string(),
     pushEnabled: z.boolean(),
@@ -277,6 +297,67 @@ const StepStateSchema = z.strictObject({
 });
 
 const OperationStatusSchema = z.enum(PUSH_STATUSES);
+
+// ── 方案 B 批一：style / learn / exemplar 账号级配置 schema ────────────────
+
+/** style.yaml 内容：字段结构由 facade 权威校验（拒绝未知字段），这里只约束容器形状。 */
+const StyleObjectSchema = z.record(z.unknown());
+
+const StyleViewSchema = z.strictObject({
+  exists: z.boolean(),
+  style: StyleObjectSchema,
+  raw: z.string(),
+  version: HashSchema,
+});
+
+const StylePutResultSchema = z.strictObject({
+  exists: z.literal(true),
+  style: StyleObjectSchema,
+  version: HashSchema,
+  backup: z.string(),
+});
+
+const StyleValidateResultSchema = z.strictObject({
+  valid: z.boolean(),
+  issues: z.array(z.string()),
+});
+
+const LearnRecordResultSchema = z.strictObject({
+  file: z.string(),
+  date: z.string(),
+  version: HashSchema,
+});
+
+const ExemplarIndexItemSchema = z.strictObject({
+  id: z.string(),
+  title: z.string(),
+  source: z.string(),
+  category: z.string(),
+  ownership: z.string(),
+  authenticity: z.string(),
+});
+
+const ExemplarPutResultSchema = z.strictObject({
+  id: z.string(),
+  title: z.string(),
+  source: z.string(),
+  category: z.string(),
+  ownership: z.string(),
+  authenticity: z.string(),
+  version: HashSchema,
+});
+
+const ExemplarGetResultSchema = z.strictObject({
+  id: z.string(),
+  title: z.string().nullable(),
+  source: z.string().nullable(),
+  category: z.string().nullable(),
+  ownership: z.string(),
+  authenticity: z.string(),
+  allowed_uses: z.array(z.string()),
+  personal_materials_reusable: z.boolean(),
+  content: z.string(),
+});
 
 export const rpcContract = {
   snapshot: {
@@ -487,6 +568,68 @@ export const rpcContract = {
       dryRun: z.boolean(),
     })),
   },
+  'diagnostics/recheck': {
+    request: EmptyRequest,
+    response: businessResult(z.strictObject({
+      diagnostics: z.array(SnapshotDiagnosticSchema),
+    })),
+  },
+  'style/get': {
+    request: EmptyRequest,
+    response: businessResult(StyleViewSchema),
+  },
+  'style/put': {
+    request: z.strictObject({
+      style: StyleObjectSchema,
+      // 账号级写操作不携带 run 绑定上下文；任何 context 都被视为 Agent 写路径并拒绝。
+      context: z.unknown().optional(),
+    }),
+    response: businessResult(StylePutResultSchema),
+  },
+  'style/validate': {
+    request: z.strictObject({ style: StyleObjectSchema }),
+    response: businessResult(StyleValidateResultSchema),
+  },
+  'learn/record': {
+    request: z.strictObject({
+      draft: z.string(),
+      final: z.string(),
+      diffSummary: z.record(z.unknown()),
+      patterns: z.array(z.record(z.unknown())),
+      context: z.unknown().optional(),
+    }),
+    response: businessResult(LearnRecordResultSchema),
+  },
+  'learn/list': {
+    request: EmptyRequest,
+    response: businessResult(z.strictObject({
+      items: z.array(z.record(z.unknown())),
+      total: z.number().int(),
+    })),
+  },
+  'exemplar/put': {
+    request: z.strictObject({
+      title: IdSchema,
+      content: z.string(),
+      source: z.string().optional(),
+      category: z.string().optional(),
+      ownership: z.string().optional(),
+      authenticity: z.string().optional(),
+      context: z.unknown().optional(),
+    }),
+    response: businessResult(ExemplarPutResultSchema),
+  },
+  'exemplar/list': {
+    request: EmptyRequest,
+    response: businessResult(z.strictObject({
+      items: z.array(ExemplarIndexItemSchema),
+      total: z.number().int(),
+    })),
+  },
+  'exemplar/get': {
+    request: z.strictObject({ id: z.string() }),
+    response: businessResult(ExemplarGetResultSchema),
+  },
 } as const;
 
 export type RpcContract = typeof rpcContract;
@@ -507,6 +650,14 @@ export const TOOL_NAMES = [
   'wewrite_run_finish',
   'wewrite_preview',
   'wewrite_push_draft',
+  'wewrite_style_get',
+  'wewrite_style_validate',
+  'wewrite_style_put',
+  'wewrite_learn_record',
+  'wewrite_learn_list',
+  'wewrite_exemplar_put',
+  'wewrite_exemplar_list',
+  'wewrite_exemplar_get',
 ] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
 
@@ -609,6 +760,52 @@ export const toolContract = {
       mediaId: z.string().nullable(),
       dryRun: z.boolean(),
     })),
+  },
+  // ── 方案 B 批一：账号级工具（不绑定 runId）──────────────────────────────
+  wewrite_style_get: {
+    request: z.strictObject({}),
+    response: rpcContract['style/get'].response,
+  },
+  wewrite_style_validate: {
+    request: z.strictObject({ style: StyleObjectSchema }),
+    response: rpcContract['style/validate'].response,
+  },
+  wewrite_style_put: {
+    request: z.strictObject({ style: StyleObjectSchema }),
+    // 工具已注册，但 Agent 调用路径一律返回 FORBIDDEN（账号级仅 owner 可改）。
+    response: rpcContract['style/put'].response,
+  },
+  wewrite_learn_record: {
+    request: z.strictObject({
+      draft: z.string(),
+      final: z.string(),
+      diffSummary: z.record(z.unknown()),
+      patterns: z.array(z.record(z.unknown())),
+    }),
+    response: rpcContract['learn/record'].response,
+  },
+  wewrite_learn_list: {
+    request: z.strictObject({}),
+    response: rpcContract['learn/list'].response,
+  },
+  wewrite_exemplar_put: {
+    request: z.strictObject({
+      title: IdSchema,
+      content: z.string(),
+      source: z.string().optional(),
+      category: z.string().optional(),
+      ownership: z.string().optional(),
+      authenticity: z.string().optional(),
+    }),
+    response: rpcContract['exemplar/put'].response,
+  },
+  wewrite_exemplar_list: {
+    request: z.strictObject({}),
+    response: rpcContract['exemplar/list'].response,
+  },
+  wewrite_exemplar_get: {
+    request: z.strictObject({ id: z.string() }),
+    response: rpcContract['exemplar/get'].response,
   },
 } as const;
 

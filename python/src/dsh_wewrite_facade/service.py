@@ -13,7 +13,7 @@ import os
 import uuid
 from typing import Any
 
-from . import assets, binding, contract, counters, draft_dispatch, hotspots as hotspots_mod, intents, paths, projection, publish, review as review_mod, storage
+from . import assets, binding, contract, counters, draft_dispatch, hotspots as hotspots_mod, intents, learn, paths, projection, publish, review as review_mod, storage, style
 from .errors import (
     FacadeError,
     business_failure,
@@ -531,6 +531,41 @@ def op_draft_recover(payload: dict) -> dict[str, Any]:
     return draft_dispatch.recover(payload)
 
 
+# ── 方案 B 批一：style / learn / exemplar 账号级能力 ────────────────────────
+
+def op_style_get(payload: dict) -> dict[str, Any]:
+    return business_success(style.style_get())
+
+
+def op_style_put(payload: dict) -> dict[str, Any]:
+    result = style.style_put(payload)
+    return business_success(result)
+
+
+def op_style_validate(payload: dict) -> dict[str, Any]:
+    return business_success(style.style_validate(payload))
+
+
+def op_learn_record(payload: dict) -> dict[str, Any]:
+    return business_success(learn.learn_record(payload))
+
+
+def op_learn_list(payload: dict) -> dict[str, Any]:
+    return business_success(learn.learn_list())
+
+
+def op_exemplar_put(payload: dict) -> dict[str, Any]:
+    return business_success(learn.exemplar_put(payload))
+
+
+def op_exemplar_list(payload: dict) -> dict[str, Any]:
+    return business_success(learn.exemplar_list())
+
+
+def op_exemplar_get(payload: dict) -> dict[str, Any]:
+    return business_success(learn.exemplar_get(payload))
+
+
 _DISPATCH = {
     "diagnose": op_diagnose,
     "snapshot": op_snapshot,
@@ -555,6 +590,14 @@ _DISPATCH = {
     "draft.send": op_draft_send,
     "draft.status": op_draft_status,
     "draft.recover": op_draft_recover,
+    "style.get": op_style_get,
+    "style.put": op_style_put,
+    "style.validate": op_style_validate,
+    "learn.record": op_learn_record,
+    "learn.list": op_learn_list,
+    "exemplar.put": op_exemplar_put,
+    "exemplar.list": op_exemplar_list,
+    "exemplar.get": op_exemplar_get,
 }
 
 

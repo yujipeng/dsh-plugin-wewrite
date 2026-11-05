@@ -19,6 +19,8 @@ import type { AgentWorkflow } from './agent-workflow';
 import { redactError } from './redaction';
 import { registerPushSummary } from './push-approval';
 import { timeoutFor, type BridgeResult } from './wewrite-bridge';
+import type { SnapshotDiagnostic } from '../shared/contract';
+import { installAction } from './capabilities';
 
 /** facade 子进程调用面（注入以便测试替换为内存假实现）。 */
 export type WorkbenchBridge = (operation: string, payload: Record<string, unknown>) => Promise<{ ok: boolean; data?: unknown; error?: unknown }>;
@@ -44,9 +46,24 @@ export interface WorkbenchServiceOptions {
     intentId: string;
     expectedVersion: string | null;
   }) => Promise<{ ok: boolean; error?: { code: string; message: string } }>;
+  /** JEE-1996 方案 B：重新探针宿主能力（返回快照诊断，供设置面板「重新检测」）。 */
+  readonly recheckDiagnostics?: () => readonly SnapshotDiagnostic[];
 }
 
 type BridgeFailure = { code: string; message: string; retryable?: boolean; runId?: string };
+
+/** 合并诊断并按 code+message 去重（宿主探测与 facade 诊断不丢弃任何一侧）。 */
+function mergeDiagnostics(a: readonly SnapshotDiagnostic[], b: readonly SnapshotDiagnostic[]): SnapshotDiagnostic[] {
+  const seen = new Set<string>();
+  const out: SnapshotDiagnostic[] = [];
+  for (const item of [...a, ...b]) {
+    const key = `${item.code}\u0000${item.message}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
 
 function asFailure(resp: { ok: boolean; data?: unknown; error?: unknown }): BridgeFailure | null {
   if (resp.ok) return null;
@@ -77,9 +94,52 @@ export class WorkbenchService {
   // ── 基础读面 ─────────────────────────────────────────────────────────────
 
   async snapshot(): Promise<BusinessResult<unknown>> {
+    const host = this.options.recheckDiagnostics?.() ?? [];
     const resp = await this.safeBridge('snapshot', {});
-    if (resp.ok === false) return businessFailure('INTERNAL', '读取工作台快照失败');
+    if (resp.ok === false) {
+      // facade 缺失/不可用：不整体失败，返回骨架快照并带上宿主能力诊断（含 facade 安装引导动作），
+      // 让设置面板能展示「缺什么 → 一条命令 → 重新检测」。
+      const facadeDiag: SnapshotDiagnostic = {
+        code: 'CAPABILITY_UNAVAILABLE',
+        message: 'Python facade 不可用，需先装齐 Python 依赖',
+        blocking: true,
+        actions: [installAction()],
+      };
+      return businessSuccess({
+        runs: [],
+        nextCursor: null,
+        themes: [],
+        capabilities: { read: false, write: false, agent: false, skills: false, preview: false, push: false },
+        // 宿主诊断（含 interpreter/dataRoot/facade 探测）与兜底 facade 项合并去重，不丢弃任何一侧。
+        diagnostics: mergeDiagnostics(host, [facadeDiag]),
+        settings: { visualMode: 'none', pushEnabled: false, publishTransport: 'fake', credentialConfigured: false },
+      });
+    }
+    const data = resp.data as { diagnostics?: SnapshotDiagnostic[] } | undefined;
+    if (data && typeof data === 'object') {
+      return businessSuccess({
+        ...data,
+        diagnostics: mergeDiagnostics(data.diagnostics ?? [], host),
+      });
+    }
     return bridgeResult(resp);
+  }
+
+  /** JEE-1996 方案 B：重新探针宿主能力 + facade 可用性（与 snapshot 同一判定）。 */
+  async diagnosticsRecheck(): Promise<BusinessResult<unknown>> {
+    const host = this.options.recheckDiagnostics?.() ?? [];
+    const resp = await this.safeBridge('snapshot', {});
+    if (resp.ok === false) {
+      const facadeDiag: SnapshotDiagnostic = {
+        code: 'CAPABILITY_UNAVAILABLE',
+        message: 'Python facade 不可用，需先装齐 Python 依赖',
+        blocking: true,
+        actions: [installAction()],
+      };
+      return businessSuccess({ diagnostics: mergeDiagnostics(host, [facadeDiag]) });
+    }
+    const data = resp.data as { diagnostics?: SnapshotDiagnostic[] } | undefined;
+    return businessSuccess({ diagnostics: mergeDiagnostics(data?.diagnostics ?? [], host) });
   }
 
   async runList(payload: { cursor?: string; limit?: number }): Promise<BusinessResult<unknown>> {
@@ -229,6 +289,40 @@ export class WorkbenchService {
     return bridgeResult(await this.safeBridge('draft.status', payload));
   }
 
+  // ── 方案 B 批一：style / learn / exemplar 账号级能力 ──────────────────────
+
+  async styleGet(): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('style.get', {}));
+  }
+
+  async stylePut(payload: { style: unknown }): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('style.put', payload));
+  }
+
+  async styleValidate(payload: { style: unknown }): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('style.validate', payload));
+  }
+
+  async learnRecord(payload: { draft: string; final: string; diffSummary: unknown; patterns: unknown[] }): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('learn.record', payload));
+  }
+
+  async learnList(): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('learn.list', {}));
+  }
+
+  async exemplarPut(payload: { title: string; content: string; source?: string; category?: string; ownership?: string; authenticity?: string }): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('exemplar.put', payload));
+  }
+
+  async exemplarList(): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('exemplar.list', {}));
+  }
+
+  async exemplarGet(payload: { id: string }): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('exemplar.get', payload));
+  }
+
   /**
    * S4 推送工具第二闸：execute 内业务状态复验 + 经私有 stdin 传凭据发 draft.send。
    * 这是业务状态复验，不是第二次证明宿主审批（宿主 ask 的 allowed-once 是第一闸权威）。
@@ -321,6 +415,41 @@ export class WorkbenchService {
   async toolPreview(args: { requestId: string; runId: string; kind: string; expectedVersion: string | null; themeId: string }, ctx: ToolBindingContext): Promise<BusinessResult<unknown>> {
     this.assertToolContext(args.runId, ctx);
     return this.articlePreview({ ...args, kind: args.kind });
+  }
+
+  // ── 方案 B 批一：账号级工具（不绑定 runId）───────────────────────────────
+  // 读工具正常走 RPC；写工具「存在但 Agent 调用即拒」——账号级配置仅 owner 可改。
+
+  async toolStyleGet(): Promise<BusinessResult<unknown>> {
+    return this.styleGet();
+  }
+
+  async toolStyleValidate(args: { style: unknown }): Promise<BusinessResult<unknown>> {
+    return this.styleValidate({ style: args.style });
+  }
+
+  async toolStylePut(): Promise<BusinessResult<unknown>> {
+    return businessFailure('FORBIDDEN', '账号级配置仅 owner 可改，请在工作台设置面板操作');
+  }
+
+  async toolLearnRecord(): Promise<BusinessResult<unknown>> {
+    return businessFailure('FORBIDDEN', '账号级配置仅 owner 可改，请在工作台操作');
+  }
+
+  async toolLearnList(): Promise<BusinessResult<unknown>> {
+    return this.learnList();
+  }
+
+  async toolExemplarPut(): Promise<BusinessResult<unknown>> {
+    return businessFailure('FORBIDDEN', '账号级配置仅 owner 可改，请在工作台范文库操作');
+  }
+
+  async toolExemplarList(): Promise<BusinessResult<unknown>> {
+    return this.exemplarList();
+  }
+
+  async toolExemplarGet(args: { id: string }): Promise<BusinessResult<unknown>> {
+    return this.exemplarGet({ id: args.id });
   }
 
   /** 工具入场上下文校验：参数 runId 必须与真实 Agent 绑定 runId 相同（服务端绑定，不信模型自报）。 */
