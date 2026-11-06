@@ -148,13 +148,17 @@ def test_stats_fetch_rejects_invalid_days(tmp_path):
 
 # ── 批二返修：stats.fetch 成功分支逐篇指标 + 脱敏 ──────────────────────────
 
-def _call_fake_fetch(home: Path, days: int, daily: list[dict], token_ok: str = "1") -> dict:
-    """经 stats_wechat_facade.py 伪造微信响应，走标准 facade 协议入口。"""
+def _call_fake_fetch(home: Path, days: int, daily: list[dict], token_ok: str = "1", token_status: int = 200) -> dict:
+    """经 stats_wechat_facade.py 伪造微信响应，走标准 facade 协议入口。
+
+    ``daily`` 每个元素为 ``{"status": <http 状态码>, "body": <响应体>}``。
+    """
     env = facade_env(str(home))
     # 注入非空假凭证，触发「有凭证」真实拉取分支（数据由 fake requests 提供）。
     env["WECHAT_APPID"] = "fake-appid"
     env["WECHAT_SECRET"] = "fake-secret"
     env["FAKE_TOKEN_OK"] = token_ok
+    env["FAKE_TOKEN_STATUS"] = str(token_status)
     env["FAKE_DAILY"] = json.dumps(daily, ensure_ascii=False)
     req = json.dumps({
         "protocol": 1, "requestId": "r", "operation": "stats.fetch", "payload": {"days": days},
@@ -167,6 +171,11 @@ def _call_fake_fetch(home: Path, days: int, daily: list[dict], token_ok: str = "
     return json.loads(proc.stdout)
 
 
+def _ok(day_body) -> dict:
+    """包装一个 HTTP 200 的每日响应。"""
+    return {"status": 200, "body": day_body}
+
+
 def test_stats_fetch_success_returns_per_article_metrics_no_credentials(tmp_path):
     """成功分支返回逐篇脱敏指标（articles），且响应中无任何凭据明文。"""
     home = make_home(tmp_path)
@@ -174,14 +183,14 @@ def test_stats_fetch_success_returns_per_article_metrics_no_credentials(tmp_path
         {"title": "表现好", "media_id": "m-good"},
         {"title": "表现差", "media_id": "m-bad"},
     ])
-    daily = [{
+    daily = [_ok({
         "list": [
             {"media_id": "m-good", "title": "表现好", "int_page_read_count": 100,
              "share_count": 5, "like_count": 3, "old_like_count": 0, "target_user": 1000},
             {"media_id": "m-bad", "title": "表现差", "int_page_read_count": 10,
              "share_count": 0, "like_count": 1, "old_like_count": 0, "target_user": 1000},
         ],
-    }]
+    })]
     resp = _call_fake_fetch(home, days=1, daily=daily)
     assert resp["ok"] is True, resp
     data = resp["data"]
@@ -209,10 +218,10 @@ def test_stats_fetch_success_marks_unmatched(tmp_path):
     """微信返回了 history 里没有的 media_id → matched=false，但仍返回指标。"""
     home = make_home(tmp_path)
     _seed_history(home, [{"title": "只有这篇", "media_id": "m-known"}])
-    daily = [{"list": [
+    daily = [_ok({"list": [
         {"media_id": "m-unknown", "title": "陌生文章", "int_page_read_count": 7,
          "share_count": 0, "like_count": 0, "target_user": 100},
-    ]}]
+    ]})]
     resp = _call_fake_fetch(home, days=1, daily=daily)
     assert resp["ok"] is True, resp
     data = resp["data"]
@@ -230,9 +239,9 @@ def test_stats_fetch_daily_errcode_fails_and_does_not_write_history(tmp_path):
     before = (home / "history.yaml").read_bytes()
 
     daily = [
-        {"list": [{"media_id": "m-a", "title": "第一篇", "int_page_read_count": 100,
-                   "share_count": 0, "like_count": 0, "target_user": 1000}]},
-        {"errcode": 45009, "errmsg": "reach max api daily quota limit"},
+        _ok({"list": [{"media_id": "m-a", "title": "第一篇", "int_page_read_count": 100,
+                       "share_count": 0, "like_count": 0, "target_user": 1000}]}),
+        _ok({"errcode": 45009, "errmsg": "reach max api daily quota limit"}),
     ]
     resp = _call_fake_fetch(home, days=2, daily=daily)
     assert resp["ok"] is False, resp
@@ -246,8 +255,8 @@ def test_stats_fetch_all_success_positive(tmp_path):
     """全部成功正向用例：防过度收紧。"""
     home = make_home(tmp_path)
     _seed_history(home, [{"title": "第一篇", "media_id": "m-a"}])
-    daily = [{"list": [{"media_id": "m-a", "title": "第一篇", "int_page_read_count": 50,
-                        "share_count": 2, "like_count": 1, "target_user": 500}]}]
+    daily = [_ok({"list": [{"media_id": "m-a", "title": "第一篇", "int_page_read_count": 50,
+                            "share_count": 2, "like_count": 1, "target_user": 500}]})]
     resp = _call_fake_fetch(home, days=1, daily=daily)
     assert resp["ok"] is True, resp
     assert resp["data"]["backfilled"] == 1
@@ -257,9 +266,59 @@ def test_stats_fetch_daily_non_dict_fails(tmp_path):
     """每日响应不是 dict → 业务失败。"""
     home = make_home(tmp_path)
     _seed_history(home, [{"title": "第一篇", "media_id": "m-a"}])
-    resp = _call_fake_fetch(home, days=1, daily=["not-a-dict"])
+    resp = _call_fake_fetch(home, days=1, daily=[{"status": 200, "body": "not-a-dict"}])
     assert resp["ok"] is False, resp
     assert resp["error"]["code"] == "CAPABILITY_UNAVAILABLE"
+
+
+# ── 批二返修（第 3 轮）：HTTP 状态码校验 ─────────────────────────────────────
+
+def test_stats_fetch_daily_http_500_fails_and_does_not_write_history(tmp_path):
+    """首日 200 正常、次日 500 且正文 {"list":[]}：整批失败，history.yaml 字节不变。"""
+    home = make_home(tmp_path)
+    _seed_history(home, [{"title": "第一篇", "media_id": "m-a"}])
+    before = (home / "history.yaml").read_bytes()
+
+    daily = [
+        _ok({"list": [{"media_id": "m-a", "title": "第一篇", "int_page_read_count": 100,
+                       "share_count": 0, "like_count": 0, "target_user": 1000}]}),
+        {"status": 500, "body": {"list": []}},
+    ]
+    resp = _call_fake_fetch(home, days=2, daily=daily)
+    assert resp["ok"] is False, resp
+    assert resp["error"]["code"] == "CAPABILITY_UNAVAILABLE", resp
+    assert "HTTP 500" in resp["error"]["message"]
+    assert (home / "history.yaml").read_bytes() == before
+
+
+def test_stats_fetch_token_http_500_fails_and_does_not_write_history(tmp_path):
+    """令牌接口 500：整批失败，history.yaml 字节不变。"""
+    home = make_home(tmp_path)
+    _seed_history(home, [{"title": "第一篇", "media_id": "m-a"}])
+    before = (home / "history.yaml").read_bytes()
+
+    daily = [_ok({"list": [{"media_id": "m-a", "title": "第一篇", "int_page_read_count": 50,
+                            "share_count": 0, "like_count": 0, "target_user": 500}]})]
+    resp = _call_fake_fetch(home, days=1, daily=daily, token_status=500)
+    assert resp["ok"] is False, resp
+    assert resp["error"]["code"] == "CAPABILITY_UNAVAILABLE", resp
+    assert "令牌" in resp["error"]["message"]
+    assert (home / "history.yaml").read_bytes() == before
+
+
+def test_stats_fetch_http_control_group_success(tmp_path):
+    """对照组：令牌 200 + 每日 200 且数据正常 → 成功、articles 有指标、history 被写入。"""
+    home = make_home(tmp_path)
+    _seed_history(home, [{"title": "第一篇", "media_id": "m-a"}])
+    daily = [_ok({"list": [{"media_id": "m-a", "title": "第一篇", "int_page_read_count": 50,
+                            "share_count": 2, "like_count": 1, "target_user": 500}]})]
+    resp = _call_fake_fetch(home, days=1, daily=daily)
+    assert resp["ok"] is True, resp
+    data = resp["data"]
+    assert data["backfilled"] == 1
+    assert data["articles"][0]["stats"]["read_count"] == 50
+    on_disk = yaml.safe_load((home / "history.yaml").read_text(encoding="utf-8"))
+    assert on_disk["articles"][0]["stats"]["read_count"] == 50
 
 
 # ── 批二返修：回填读-改-写在同一把 home 锁内（并发不丢更新）─────────────────

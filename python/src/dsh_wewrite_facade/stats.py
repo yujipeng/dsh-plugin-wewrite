@@ -164,6 +164,16 @@ def _fetch_real_stats(appid: str, secret: str, days: int) -> list[dict[str, Any]
 
     from .counters import get_counters
 
+    def _check_status(resp: Any, what: str) -> None:
+        """HTTP 状态校验：非 2xx 抛业务失败（解析 .json() 之前）。"""
+        status = getattr(resp, "status_code", None)
+        if status is None or not (200 <= int(status) < 300):
+            raise FacadeError(
+                "CAPABILITY_UNAVAILABLE",
+                f"{what}失败（HTTP {status}）",
+                retryable=True,
+            )
+
     _assert_stats_endpoint(_STATS_TOKEN_ENDPOINT)
     get_counters().inc_wechat()
     try:
@@ -172,7 +182,10 @@ def _fetch_real_stats(appid: str, secret: str, days: int) -> list[dict[str, Any]
             params={"grant_type": "client_credential", "appid": appid, "secret": secret},
             timeout=_API_TIMEOUT,
         )
+        _check_status(resp, "微信数据接口令牌获取")
         token_body = resp.json()
+    except FacadeError:
+        raise
     except Exception as exc:
         raise FacadeError("CAPABILITY_UNAVAILABLE", "微信数据接口令牌获取失败", retryable=True) from exc
     if not isinstance(token_body, dict) or "access_token" not in token_body:
@@ -191,7 +204,10 @@ def _fetch_real_stats(appid: str, secret: str, days: int) -> list[dict[str, Any]
                 json={"begin_date": date, "end_date": date},
                 timeout=_API_TIMEOUT,
             )
+            _check_status(resp, f"{date} 微信数据接口调用")
             body = resp.json()
+        except FacadeError:
+            raise
         except Exception as exc:
             raise FacadeError("CAPABILITY_UNAVAILABLE", f"{date} 微信数据接口调用失败", retryable=True) from exc
         # 逐日校验：①是 dict ②无 errcode（或 errcode==0）③list 是数组。
