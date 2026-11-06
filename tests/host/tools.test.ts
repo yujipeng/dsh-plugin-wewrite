@@ -36,7 +36,7 @@ function makeService() {
 }
 
 describe('Agent 工具（设计 §5 表格）', () => {
-  it('16 个受控工具名与设计 §5 表格一致（8 写作 + 8 账号级：3 写 5 读），且不注册 wewrite_push_draft', () => {
+  it('20 个受控工具名与设计 §5 表格一致（8 写作 + 12 账号级），且不注册 wewrite_push_draft', () => {
     expect([...AGENT_TOOL_NAMES].sort()).toEqual(
       [
         'wewrite_run_start',
@@ -55,6 +55,10 @@ describe('Agent 工具（设计 §5 表格）', () => {
         'wewrite_exemplar_put',
         'wewrite_exemplar_list',
         'wewrite_exemplar_get',
+        'wewrite_stats_fetch',
+        'wewrite_stats_backfill',
+        'wewrite_rewrite_score',
+        'wewrite_rewrite_similarity',
       ].sort(),
     );
     expect(AGENT_TOOL_NAMES).not.toContain('wewrite_push_draft');
@@ -62,7 +66,7 @@ describe('Agent 工具（设计 §5 表格）', () => {
 
   it('工具定义可构建，名与参数 schema 具备', () => {
     const defs = buildAgentTools(makeService());
-    expect(defs).toHaveLength(16);
+    expect(defs).toHaveLength(20);
     for (const def of defs) {
       expect(CONTROLLED_TOOL_SET.has(def.name)).toBe(true);
       expect(typeof def.execute).toBe('function');
@@ -90,6 +94,52 @@ describe('账号级工具：写工具注册但 Agent 调用即拒，读工具可
       expect(err.code).toBe('FORBIDDEN');
       expect(err.message).toContain('owner');
     }
+  });
+
+  it('stats_backfill 经 Agent 路径调用返回 FORBIDDEN（账号级写操作）', async () => {
+    const service = makeService();
+    const r = await service.toolStatsBackfill();
+    expect(r.ok).toBe(false);
+    const err = (r as { ok: false; error: { code: string; message: string } }).error;
+    expect(err.code).toBe('FORBIDDEN');
+    expect(err.message).toContain('owner');
+  });
+
+  it('三个新只读/分析工具正向可用（stats_fetch / rewrite_score / rewrite_similarity 走 bridge）', async () => {
+    const workflow = new AgentWorkflow({
+      runtime: {
+        create: async () => { throw new Error('agents 缺失'); },
+        resume: async () => { throw new Error('agents 缺失'); },
+        get: () => undefined,
+      },
+      bridge: async () => ({ ok: false, error: { code: 'INTERNAL', message: '内部错误', retryable: false } }),
+      homeLabel: '数据根',
+      mainSkillName: 'wewrite',
+      randomId: () => 'id',
+    });
+    const calls: string[] = [];
+    const service = new WorkbenchService({
+      bridge: async (operation) => {
+        calls.push(operation);
+        if (operation === 'stats.fetch') {
+          return { ok: true, data: { degraded: true, days: 7, fetched: 0, backfilled: 0, wechatApiCalls: 0 } };
+        }
+        if (operation === 'rewrite.score') return { ok: true, data: { quality_score: 70, composite_score: 30, char_count: 10, param_scores: {} } };
+        if (operation === 'rewrite.similarity') return { ok: true, data: { max_similarity: 0.4, param: 'similarity_threshold', variants: [] } };
+        return { ok: false, error: { code: 'INTERNAL', message: '内部错误', retryable: false } };
+      },
+      workflow,
+      randomId: () => 'id',
+    });
+    const fetch = await service.toolStatsFetch({ days: 7 });
+    expect(fetch.ok).toBe(true);
+    expect(calls).toContain('stats.fetch');
+    const score = await service.toolRewriteScore({ text: 'x' });
+    expect(score.ok).toBe(true);
+    expect(calls).toContain('rewrite.score');
+    const sim = await service.toolRewriteSimilarity({ source: 's', variants: ['a'] });
+    expect(sim.ok).toBe(true);
+    expect(calls).toContain('rewrite.similarity');
   });
 
   it('两个新只读工具正向可用（style_validate / exemplar_get 走 bridge）', async () => {

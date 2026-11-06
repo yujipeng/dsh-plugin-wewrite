@@ -51,6 +51,18 @@
       "description": "自学习：记录人工改稿差异（learn）与范文库（exemplar）只读查看；写作偏好飞轮，重复出现的规则才成为硬约束",
       "path": "wewrite-learn/SKILL.md",
       "sha256": "87eddd32066f847240a466e459fc55193aca17273d33d479b803d91c98d3d93a"
+    },
+    {
+      "name": "wewrite-rewrite",
+      "description": "多平台改写：把公众号文章内容级真改写成小红书/抖音版本，过编辑质量与源稿相似度双质量门；源稿只读不改",
+      "path": "wewrite-rewrite/SKILL.md",
+      "sha256": "13fc9131dd8baa84aea1599d895289cb76bb8b3fc28800139af5980531bb8125"
+    },
+    {
+      "name": "wewrite-stats",
+      "description": "数据复盘：拉取公众号文章阅读/分享/点赞数据并回填 history.yaml，给出选题/标题/框架调整建议；无凭证降级为定性分析",
+      "path": "wewrite-stats/SKILL.md",
+      "sha256": "c675bca65d68aaeead8546a37837f10e5f3c5a26f231dc78109f776a4ce08835"
     }
   ],
   "references": [
@@ -114,6 +126,18 @@
       "path": "wewrite-learn/references/learn-edits.md",
       "sha256": "ccffd768b44a5adadfd75e5ecaff3243e287f7dbf55f45e895b7854dd296bac1",
       "adapted": false
+    },
+    {
+      "path": "wewrite-rewrite/references/multiplatform-rewrite.md",
+      "sha256": "ea8cad19299e7efdb56f30b8e88fe72e218ead01395f7470236875d4fbdbe04f",
+      "adapted": false,
+      "note": "逐字保留；文内 wewrite score/similarity CLI 引用由 SKILL.md 映射到 wewrite_rewrite_score / wewrite_rewrite_similarity 受控工具"
+    },
+    {
+      "path": "wewrite-stats/references/effect-review.md",
+      "sha256": "3bcaf20781f86f840b7c007639a22fbd504dce47d76956a8c328d9b2a3aa0256",
+      "adapted": false,
+      "note": "逐字保留；文内 wewrite stats CLI 引用由 SKILL.md 映射到 wewrite_stats_fetch 受控工具"
     }
   ]
 }

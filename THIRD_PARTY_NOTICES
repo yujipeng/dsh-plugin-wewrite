@@ -12,10 +12,10 @@
 - 用途：本插件的设计以该仓库为业务真源。当前 S1 阶段仅记录来源契约（runId 形态、状态/产物、错误码等），
   后续 stage 的 Python facade 将以独立包名 `dsh_wewrite_facade` 复用其公开方法，不修改上游、不放残缺遮蔽包。
 
-### 编辑知识层 references（方案 A，来源 imraywang/wewrite）
+### 编辑知识层 references（来源 imraywang/wewrite）
 
-`skills/**/references/*.md`（9 个文件，共 855 行）编辑方法论与事实核查纪律逐字保留自上游
-`https://github.com/imraywang/wewrite`，锁定修订 `2860fbe958311fcc04009d8132908989e43e6eaa`
+`skills/**/references/*.md` 编辑方法论、事实核查纪律、风格/自学习/多平台改写/数据复盘知识
+逐字保留自上游 `https://github.com/imraywang/wewrite`，锁定修订 `8a5cdabd303c147f174c9597dd334a1c3d3b50bd`
 （版本 4.2.1，MIT License）：
 
 | 文件 | 归属 skill |
@@ -26,12 +26,20 @@
 | `references/seo-rules.md` | `wewrite-review` |
 | `references/visual-guide.md` | `wewrite-visual` |
 | `references/wechat-constraints.md` | `wewrite-publish` |
+| `references/onboard.md` / `style-template.md` | `wewrite-style`（方案 B 批一） |
+| `references/learn-edits.md` | `wewrite-learn`（方案 B 批一） |
+| `references/multiplatform-rewrite.md` | `wewrite-rewrite`（方案 B 批二） |
+| `references/effect-review.md` | `wewrite-stats`（方案 B 批二） |
 
-9 份 `references/*.md` 的逐文件 sha256 已全部登记在 `skills/manifest.json` 的 `references`
-数组中（64 位小写十六进制真实值）。其中 `pipeline-state.md` 因 CLI 引用改写而哈希不同于上游，
-manifest 中以 `"adapted": true` + `"note": "已按受控工具适配，语义与上游一致（6 处 CLI 引用改为受控工具）"`
-标注；其余 8 个文件逐字保留、`"adapted": false`，sha256 与上游同文件一致。manifest 逐文件哈希与磁盘
-`sha256sum` 的一致性由 `tests/host/manifest-integrity.test.ts` 钉定。
+全部 `references/*.md` 的逐文件 sha256 已登记在 `skills/manifest.json` 的 `references` 数组中
+（64 位小写十六进制真实值）。其中 `pipeline-state.md` 因 CLI 引用改写而哈希不同于上游，manifest 中
+以 `"adapted": true` + `"note": "已按受控工具适配，语义与上游一致"` 标注；其余文件逐字保留、
+`"adapted": false`，sha256 与上游同文件一致。批二两份 references（`multiplatform-rewrite.md` /
+`effect-review.md`）文内仍含 `wewrite score/similarity/stats` 上游 CLI 引用，属「逐字保留」的
+历史写法，映射关系由各自 SKILL.md 声明为 `wewrite_rewrite_score` / `wewrite_rewrite_similarity` /
+`wewrite_stats_fetch` 受控工具。`wewrite-rewrite/platforms/*.yaml`（小红书/抖音平台调性）同为
+逐字保留的上游内容。manifest 逐文件哈希与磁盘 `sha256sum` 的一致性由
+`tests/host/manifest-integrity.test.ts` 钉定。
 
 ### Python facade 复用来源（S2 起）
 

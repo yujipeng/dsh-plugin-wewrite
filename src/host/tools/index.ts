@@ -32,6 +32,10 @@ export const AGENT_TOOL_NAMES = [
   'wewrite_exemplar_put',
   'wewrite_exemplar_list',
   'wewrite_exemplar_get',
+  'wewrite_stats_fetch',
+  'wewrite_stats_backfill',
+  'wewrite_rewrite_score',
+  'wewrite_rewrite_similarity',
 ] as const;
 
 export type AgentToolName = (typeof AGENT_TOOL_NAMES)[number];
@@ -357,6 +361,33 @@ export function buildAgentTools(service: WorkbenchService): ToolDefinition[] {
     accountTool('wewrite_exemplar_get', '按 id 读单篇范文（含 frontmatter 与正文）。账号级配置，不绑定 runId。', {
       id: stringParam('范文 id（16 位十六进制）'),
     }, (args) => service.toolExemplarGet(args as { id: string })),
+  );
+
+  // ── 方案 B 批二：stats / rewrite 账号级工具（不绑定 runId）────────────────
+  // 读/分析工具正常走 bridge；stats.backfill 属账号级写操作，Agent 调用即拒。
+  defs.push(
+    accountTool('wewrite_stats_fetch', '拉取公众号文章数据并回填 history.yaml；无微信凭证时返回「只能定性分析」的降级结果（不产生任何微信调用）。账号级能力，不绑定 runId。', {
+      days: { type: 'integer' as const, description: '回看天数（1–30）' },
+    }, (args) => service.toolStatsFetch(args as { days: number })),
+  );
+
+  defs.push(
+    accountTool('wewrite_stats_backfill', '把已获取的 stats 数据回填 history.yaml（账号级仅 owner 可改；Agent 调用一律 FORBIDDEN，请在工作台操作）。不绑定 runId。', {
+      entries: { type: 'array' as const, items: { type: 'object' as const, additionalProperties: true }, description: '待回填的 stats 数据点列表' },
+    }, () => service.toolStatsBackfill()),
+  );
+
+  defs.push(
+    accountTool('wewrite_rewrite_score', '对改写产物做机械语言风险打分（quality_score 0–100，≥60 建议通过）。纯本地分析，不修改文件。不绑定 runId。', {
+      text: stringParam('改写产物全文'),
+    }, (args) => service.toolRewriteScore(args as { text: string })),
+  );
+
+  defs.push(
+    accountTool('wewrite_rewrite_similarity', '计算源稿与各改写版本的字符 n-gram 相似度（max_similarity 0–1，≤0.6 建议通过）。纯本地分析，不修改源稿。不绑定 runId。', {
+      source: stringParam('源稿全文'),
+      variants: { type: 'array' as const, items: { type: 'string' as const }, description: '各平台改写版本全文列表' },
+    }, (args) => service.toolRewriteSimilarity(args as { source: string; variants: string[] })),
   );
 
   return defs;

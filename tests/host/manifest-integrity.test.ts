@@ -39,7 +39,7 @@ describe('manifest 完整性（方案 A + 返修 4）', () => {
     expect(manifest.skills.length).toBeGreaterThanOrEqual(8);
     for (const skill of manifest.skills) {
       expect(skill.sha256).toMatch(HEX64);
-      expect(skill.sha256).not.toMatch(/^(main-skill|topic|write|review|visual|publish|style|learn)$/);
+      expect(skill.sha256).not.toMatch(/^(main-skill|topic|write|review|visual|publish|style|learn|rewrite|stats)$/);
     }
   });
 
@@ -47,6 +47,12 @@ describe('manifest 完整性（方案 A + 返修 4）', () => {
     const names = manifest.skills.map((s) => s.name);
     expect(names).toContain('wewrite-style');
     expect(names).toContain('wewrite-learn');
+  });
+
+  it('方案 B 批二：新增 wewrite-rewrite 与 wewrite-stats 两个 skill 条目', () => {
+    const names = manifest.skills.map((s) => s.name);
+    expect(names).toContain('wewrite-rewrite');
+    expect(names).toContain('wewrite-stats');
   });
 
   it('每个 skill 的 sha256 与磁盘 SKILL.md 一致', () => {
@@ -57,9 +63,9 @@ describe('manifest 完整性（方案 A + 返修 4）', () => {
     }
   });
 
-  it('12 份 references 逐文件 sha256 已在 manifest 登记，且与磁盘文件一致', () => {
+  it('14 份 references 逐文件 sha256 已在 manifest 登记，且与磁盘文件一致', () => {
     expect(Array.isArray(manifest.references)).toBe(true);
-    expect(manifest.references.length).toBe(12);
+    expect(manifest.references.length).toBe(14);
     for (const ref of manifest.references) {
       expect(ref.sha256).toMatch(HEX64);
       const file = resolve(ROOT, 'skills', ref.path);
@@ -68,12 +74,12 @@ describe('manifest 完整性（方案 A + 返修 4）', () => {
     }
   });
 
-  it('pipeline-state.md 已标注「已按受控工具适配」，其余 11 份 adapted=false', () => {
+  it('pipeline-state.md 已标注「已按受控工具适配」，其余 13 份 adapted=false', () => {
     const pipeline = manifest.references.find((r) => r.path === 'wewrite/references/pipeline-state.md');
     expect(pipeline?.adapted).toBe(true);
     expect(pipeline?.note).toContain('受控工具适配');
     const others = manifest.references.filter((r) => r.path !== 'wewrite/references/pipeline-state.md');
-    expect(others.length).toBe(11);
+    expect(others.length).toBe(13);
     for (const r of others) {
       expect(r.adapted).toBe(false);
     }
@@ -100,6 +106,28 @@ describe('manifest 完整性（方案 A + 返修 4）', () => {
     expect(lines('skills/wewrite-style/references/onboard.md')).toBe(88);
     expect(lines('skills/wewrite-style/references/style-template.md')).toBe(60);
     expect(lines('skills/wewrite-learn/references/learn-edits.md')).toBe(51);
+  });
+
+  it('方案 B 批二：两个 references 行数与上游一致（21 / 19），无 Bash/Write/Edit/Glob 工具与 CLI 调用', () => {
+    const lines = (rel: string) => {
+      const text = readFileSync(resolve(ROOT, rel), 'utf8');
+      return (text.match(/\n/g) ?? []).length;
+    };
+    expect(lines('skills/wewrite-rewrite/references/multiplatform-rewrite.md')).toBe(21);
+    expect(lines('skills/wewrite-stats/references/effect-review.md')).toBe(19);
+    for (const rel of [
+      'skills/wewrite-rewrite/SKILL.md',
+      'skills/wewrite-stats/SKILL.md',
+      'skills/wewrite-rewrite/references/multiplatform-rewrite.md',
+      'skills/wewrite-stats/references/effect-review.md',
+    ]) {
+      const raw = readFileSync(resolve(ROOT, rel), 'utf8');
+      expect(raw, `${rel} 含 Bash`).not.toMatch(/\bBash\b/);
+      expect(raw, `${rel} 含 Write`).not.toMatch(/\bWrite\b/);
+      expect(raw, `${rel} 含 Edit`).not.toMatch(/\bEdit\b/);
+      expect(raw, `${rel} 含 Glob`).not.toMatch(/\bGlob\b/);
+      expect(raw, `${rel} 含 allowed-tools`).not.toMatch(/allowed-tools/);
+    }
   });
 
   it('JEE-1996：package.json 不含 postinstall/preinstall/install 脚本（防 pnpm 拒绝安装）', () => {

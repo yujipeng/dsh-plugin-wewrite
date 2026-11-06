@@ -95,7 +95,7 @@ print(json.dumps({"codes": ERROR_CODES, "messages": ERROR_MESSAGES,
     }
   });
 
-  it('端点全集覆盖设计 §4 的 17 个 RPC + 方案 B 批一 8 个账号级端点 + JEE-1996 重新检测端点', () => {
+  it('端点全集覆盖设计 §4 的 17 个 RPC + 方案 B 批一 8 个账号级端点 + 批二 4 个账号级端点 + JEE-1996 重新检测端点', () => {
     expect(Object.keys(rpcContract).sort()).toEqual(
       [
         'snapshot',
@@ -124,6 +124,10 @@ print(json.dumps({"codes": ERROR_CODES, "messages": ERROR_MESSAGES,
         'exemplar/put',
         'exemplar/list',
         'exemplar/get',
+        'stats/fetch',
+        'stats/backfill',
+        'rewrite/score',
+        'rewrite/similarity',
         'diagnostics/recheck',
       ].sort(),
     );
@@ -396,6 +400,32 @@ describe('合法请求与响应形状（表驱动抽查）', () => {
     expect(rpcContract['learn/record'].request.safeParse({ draft: 'a', final: 'b', diffSummary: {} }).success).toBe(false);
     expect(rpcContract['exemplar/put'].request.safeParse({ title: 't', content: 'c' }).success).toBe(true);
     expect(rpcContract['exemplar/get'].request.safeParse({ id: '0123456789abcdef' }).success).toBe(true);
+  });
+
+  it('方案 B 批二：stats/rewrite 请求 schema 拒绝非法 days 与非对象 entries', () => {
+    expect(rpcContract['stats/fetch'].request.safeParse({ days: 7 }).success).toBe(true);
+    expect(rpcContract['stats/fetch'].request.safeParse({ days: 0 }).success).toBe(false);
+    expect(rpcContract['stats/fetch'].request.safeParse({ days: 31 }).success).toBe(false);
+    expect(rpcContract['stats/fetch'].request.safeParse({ days: 7, __extra: 1 }).success).toBe(false);
+    expect(rpcContract['stats/backfill'].request.safeParse({ entries: [] }).success).toBe(true);
+    expect(rpcContract['stats/backfill'].request.safeParse({ entries: 'x' }).success).toBe(false);
+    expect(rpcContract['rewrite/score'].request.safeParse({ text: 'x' }).success).toBe(true);
+    expect(rpcContract['rewrite/score'].request.safeParse({ text: 1 }).success).toBe(false);
+    expect(rpcContract['rewrite/similarity'].request.safeParse({ source: 's', variants: ['a', 'b'] }).success).toBe(true);
+    expect(rpcContract['rewrite/similarity'].request.safeParse({ source: 's', variants: 'a' }).success).toBe(false);
+    // stats.fetch 降级响应形状可通过。
+    expect(rpcContract['stats/fetch'].response.safeParse({
+      ok: true,
+      data: {
+        degraded: true,
+        reason: '数据复盘需要配置公众号 API（config.yaml），当前只能基于 history.yaml 已有记录做定性分析',
+        days: 7,
+        fetched: 0,
+        backfilled: 0,
+        wechatApiCalls: 0,
+        history: { articleCount: 0, withStats: 0, items: [] },
+      },
+    }).success).toBe(true);
   });
 
   it('Report.pass_number 仅 1|2，decision 非法 enum 拒', () => {

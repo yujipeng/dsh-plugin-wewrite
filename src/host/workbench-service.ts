@@ -323,6 +323,24 @@ export class WorkbenchService {
     return bridgeResult(await this.safeBridge('exemplar.get', payload));
   }
 
+  // ── 方案 B 批二：stats / rewrite 账号级能力 ──────────────────────────────
+
+  async statsFetch(payload: { days: number }): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('stats.fetch', payload));
+  }
+
+  async statsBackfill(payload: { entries: unknown[] }): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('stats.backfill', payload));
+  }
+
+  async rewriteScore(payload: { text: string }): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('rewrite.score', payload));
+  }
+
+  async rewriteSimilarity(payload: { source: string; variants: string[] }): Promise<BusinessResult<unknown>> {
+    return bridgeResult(await this.safeBridge('rewrite.similarity', payload));
+  }
+
   /**
    * S4 推送工具第二闸：execute 内业务状态复验 + 经私有 stdin 传凭据发 draft.send。
    * 这是业务状态复验，不是第二次证明宿主审批（宿主 ask 的 allowed-once 是第一闸权威）。
@@ -450,6 +468,25 @@ export class WorkbenchService {
 
   async toolExemplarGet(args: { id: string }): Promise<BusinessResult<unknown>> {
     return this.exemplarGet({ id: args.id });
+  }
+
+  // ── 方案 B 批二：stats / rewrite 账号级工具（不绑定 runId）─────────────────
+  // 读/分析工具正常走 RPC；stats.backfill 属账号级写操作，Agent 调用即拒。
+
+  async toolStatsFetch(args: { days: number }): Promise<BusinessResult<unknown>> {
+    return this.statsFetch({ days: args.days });
+  }
+
+  async toolStatsBackfill(): Promise<BusinessResult<unknown>> {
+    return businessFailure('FORBIDDEN', '账号级配置仅 owner 可改，请在工作台操作');
+  }
+
+  async toolRewriteScore(args: { text: string }): Promise<BusinessResult<unknown>> {
+    return this.rewriteScore({ text: args.text });
+  }
+
+  async toolRewriteSimilarity(args: { source: string; variants: string[] }): Promise<BusinessResult<unknown>> {
+    return this.rewriteSimilarity({ source: args.source, variants: args.variants });
   }
 
   /** 工具入场上下文校验：参数 runId 必须与真实 Agent 绑定 runId 相同（服务端绑定，不信模型自报）。 */

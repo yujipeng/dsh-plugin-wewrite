@@ -13,7 +13,7 @@ import os
 import uuid
 from typing import Any
 
-from . import assets, binding, contract, counters, draft_dispatch, hotspots as hotspots_mod, intents, learn, paths, projection, publish, review as review_mod, storage, style
+from . import assets, binding, contract, counters, draft_dispatch, hotspots as hotspots_mod, intents, learn, paths, projection, publish, review as review_mod, rewrite, stats, storage, style
 from .errors import (
     FacadeError,
     business_failure,
@@ -566,6 +566,24 @@ def op_exemplar_get(payload: dict) -> dict[str, Any]:
     return business_success(learn.exemplar_get(payload))
 
 
+# ── 方案 B 批二：stats / rewrite 账号级能力 ────────────────────────────────
+
+def op_stats_fetch(payload: dict) -> dict[str, Any]:
+    return business_success(stats.stats_fetch(payload))
+
+
+def op_stats_backfill(payload: dict) -> dict[str, Any]:
+    return business_success(stats.stats_backfill(payload))
+
+
+def op_rewrite_score(payload: dict) -> dict[str, Any]:
+    return business_success(rewrite.rewrite_score(payload))
+
+
+def op_rewrite_similarity(payload: dict) -> dict[str, Any]:
+    return business_success(rewrite.rewrite_similarity(payload))
+
+
 _DISPATCH = {
     "diagnose": op_diagnose,
     "snapshot": op_snapshot,
@@ -598,6 +616,10 @@ _DISPATCH = {
     "exemplar.put": op_exemplar_put,
     "exemplar.list": op_exemplar_list,
     "exemplar.get": op_exemplar_get,
+    "stats.fetch": op_stats_fetch,
+    "stats.backfill": op_stats_backfill,
+    "rewrite.score": op_rewrite_score,
+    "rewrite.similarity": op_rewrite_similarity,
 }
 
 

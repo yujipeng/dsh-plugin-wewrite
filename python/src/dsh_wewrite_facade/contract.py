@@ -45,6 +45,10 @@ OPERATIONS = (
     "exemplar.put",
     "exemplar.list",
     "exemplar.get",
+    "stats.fetch",
+    "stats.backfill",
+    "rewrite.score",
+    "rewrite.similarity",
 )
 
 KINDS = ("brief", "claims", "draft", "article", "review_report", "sources",
@@ -498,6 +502,48 @@ def _v_exemplar_get(p: dict) -> dict:
     return {"id": exemplar_id}
 
 
+def _v_stats_fetch(p: dict) -> dict:
+    days = p.get("days")
+    if isinstance(days, bool) or not isinstance(days, int) or not (1 <= days <= 30):
+        raise invalid_input("days 须在 1–30")
+    return {"days": days}
+
+
+def _v_stats_backfill(p: dict) -> dict:
+    entries = p.get("entries")
+    if not isinstance(entries, list):
+        raise invalid_input("entries 不合法")
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise invalid_input("entries 不合法")
+    context = _optional_binding_context_any_run(p)
+    return {"entries": entries, "context": context}
+
+
+def _v_rewrite_score(p: dict) -> dict:
+    text = p.get("text")
+    if not isinstance(text, str):
+        raise invalid_input("text 不合法")
+    text = _require_bytes_limit(text, "text", TEXT_MAX_BYTES)
+    return {"text": text}
+
+
+def _v_rewrite_similarity(p: dict) -> dict:
+    source = p.get("source")
+    if not isinstance(source, str):
+        raise invalid_input("source 不合法")
+    source = _require_bytes_limit(source, "source", TEXT_MAX_BYTES)
+    variants = p.get("variants")
+    if not isinstance(variants, list):
+        raise invalid_input("variants 不合法")
+    cleaned: list[str] = []
+    for variant in variants:
+        if not isinstance(variant, str):
+            raise invalid_input("variants 不合法")
+        cleaned.append(_require_bytes_limit(variant, "variants", TEXT_MAX_BYTES))
+    return {"source": source, "variants": cleaned}
+
+
 _VALIDATORS = {
     "diagnose": _v_diagnose,
     "snapshot": _v_snapshot,
@@ -530,4 +576,8 @@ _VALIDATORS = {
     "exemplar.put": _v_exemplar_put,
     "exemplar.list": _v_exemplar_list,
     "exemplar.get": _v_exemplar_get,
+    "stats.fetch": _v_stats_fetch,
+    "stats.backfill": _v_stats_backfill,
+    "rewrite.score": _v_rewrite_score,
+    "rewrite.similarity": _v_rewrite_similarity,
 }
