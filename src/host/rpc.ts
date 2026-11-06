@@ -55,6 +55,10 @@ const HANDLERS: Record<string, EndpointHandler> = {
   'exemplar/put': (s, p) => s.exemplarPut(p as never),
   'exemplar/list': (s) => s.exemplarList(),
   'exemplar/get': (s, p) => s.exemplarGet(p as never),
+  'stats/fetch': (s, p) => s.statsFetch(p as never),
+  'stats/backfill': (s, p) => s.statsBackfill(p as never),
+  'rewrite/score': (s, p) => s.rewriteScore(p as never),
+  'rewrite/similarity': (s, p) => s.rewriteSimilarity(p as never),
 };
 
 export function createHandler(service: WorkbenchService): RpcHandler {

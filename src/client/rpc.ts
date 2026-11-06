@@ -88,4 +88,8 @@ export class WeWriteClient {
   exemplarPut(payload: unknown) { return this.call<unknown>('exemplar/put', payload); }
   exemplarList() { return this.call<unknown>('exemplar/list', {}); }
   exemplarGet(payload: { id: string }) { return this.call<unknown>('exemplar/get', payload); }
+  statsFetch(payload: { days: number }) { return this.call<unknown>('stats/fetch', payload); }
+  statsBackfill(payload: unknown) { return this.call<unknown>('stats/backfill', payload); }
+  rewriteScore(payload: { text: string }) { return this.call<unknown>('rewrite/score', payload); }
+  rewriteSimilarity(payload: { source: string; variants: string[] }) { return this.call<unknown>('rewrite/similarity', payload); }
 }

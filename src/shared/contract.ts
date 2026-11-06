@@ -359,6 +359,43 @@ const ExemplarGetResultSchema = z.strictObject({
   content: z.string(),
 });
 
+// ── 方案 B 批二：stats / rewrite 账号级能力 schema ──────────────────────────
+
+/** stats.fetch 结果：degraded 分支（无凭证降级）与真实拉取分支共用同一形状（可选字段区分）。 */
+const StatsFetchResultSchema = z.strictObject({
+  degraded: z.boolean(),
+  days: z.number().int().min(1).max(30),
+  fetched: z.number().int().min(0),
+  backfilled: z.number().int().min(0),
+  reason: z.string().optional(),
+  wechatApiCalls: z.number().int().min(0).optional(),
+  mediaIds: z.array(z.string()).optional(),
+  historyVersion: HashSchema.optional(),
+  history: z.strictObject({
+    articleCount: z.number().int().min(0),
+    withStats: z.number().int().min(0),
+    items: z.array(z.record(z.unknown())),
+  }).optional(),
+});
+
+const StatsBackfillResultSchema = z.strictObject({
+  backfilled: z.number().int().min(0),
+  historyVersion: HashSchema,
+});
+
+const RewriteScoreResultSchema = z.strictObject({
+  quality_score: z.number(),
+  composite_score: z.number(),
+  char_count: z.number().int(),
+  param_scores: z.record(z.number()),
+});
+
+const RewriteSimilarityResultSchema = z.strictObject({
+  max_similarity: z.number(),
+  param: z.literal('similarity_threshold'),
+  variants: z.array(z.strictObject({ similarity: z.number() })),
+});
+
 export const rpcContract = {
   snapshot: {
     request: EmptyRequest,
@@ -630,6 +667,28 @@ export const rpcContract = {
     request: z.strictObject({ id: z.string() }),
     response: businessResult(ExemplarGetResultSchema),
   },
+  'stats/fetch': {
+    request: z.strictObject({ days: z.number().int().min(1).max(30) }),
+    response: businessResult(StatsFetchResultSchema),
+  },
+  'stats/backfill': {
+    request: z.strictObject({
+      entries: z.array(z.record(z.unknown())),
+      context: z.unknown().optional(),
+    }),
+    response: businessResult(StatsBackfillResultSchema),
+  },
+  'rewrite/score': {
+    request: z.strictObject({ text: MarkdownField }),
+    response: businessResult(RewriteScoreResultSchema),
+  },
+  'rewrite/similarity': {
+    request: z.strictObject({
+      source: MarkdownField,
+      variants: z.array(MarkdownField),
+    }),
+    response: businessResult(RewriteSimilarityResultSchema),
+  },
 } as const;
 
 export type RpcContract = typeof rpcContract;
@@ -658,6 +717,10 @@ export const TOOL_NAMES = [
   'wewrite_exemplar_put',
   'wewrite_exemplar_list',
   'wewrite_exemplar_get',
+  'wewrite_stats_fetch',
+  'wewrite_stats_backfill',
+  'wewrite_rewrite_score',
+  'wewrite_rewrite_similarity',
 ] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
 
@@ -806,6 +869,27 @@ export const toolContract = {
   wewrite_exemplar_get: {
     request: z.strictObject({ id: z.string() }),
     response: rpcContract['exemplar/get'].response,
+  },
+  // ── 方案 B 批二：stats / rewrite 账号级工具（不绑定 runId）────────────────
+  wewrite_stats_fetch: {
+    request: z.strictObject({ days: z.number().int().min(1).max(30) }),
+    response: rpcContract['stats/fetch'].response,
+  },
+  wewrite_stats_backfill: {
+    request: z.strictObject({ entries: z.array(z.record(z.unknown())) }),
+    // 工具已注册，但 Agent 调用路径一律返回 FORBIDDEN（账号级仅 owner 可改）。
+    response: rpcContract['stats/backfill'].response,
+  },
+  wewrite_rewrite_score: {
+    request: z.strictObject({ text: MarkdownField }),
+    response: rpcContract['rewrite/score'].response,
+  },
+  wewrite_rewrite_similarity: {
+    request: z.strictObject({
+      source: MarkdownField,
+      variants: z.array(MarkdownField),
+    }),
+    response: rpcContract['rewrite/similarity'].response,
   },
 } as const;
 

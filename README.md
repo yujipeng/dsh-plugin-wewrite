@@ -7,20 +7,22 @@ DSH Web 工作台 WeWrite 插件（`dsh-plugin-wewrite`）。
 - S3：业务 RPC / Agent 工具 / skills 随包装载 / 工作台 UI。
 - S4：微信草稿推送双闸、逐篇确认与安全边界。
 - 方案 A（本阶段）：接回上游编辑知识层（9 个 references + 3 个 skill 内容层 + 五维判据与红线）。
+- 方案 B：补齐 4 个 skill（`wewrite-style` + `wewrite-learn` + `wewrite-rewrite` + `wewrite-stats`）
+  及 style/learn/exemplar/stats/rewrite 的 facade 能力与契约。
 
 ## 模块
 
 | 模块 | 说明 |
 |---|---|
-| `src/shared/contract.ts` | 契约真源：17 个 RPC + 8 个 Agent 工具的严格 schema（拒绝未知字段）。 |
+| `src/shared/contract.ts` | 契约真源：17 个 RPC + 20 个 Agent 工具的严格 schema（拒绝未知字段）。 |
 | `src/host/workbench-service.ts` | 统一业务 Module：RPC 与工具是同一 Interface 的两个 Adapter。 |
 | `src/host/agent-workflow.ts` | 创建/恢复/取消 Agent 与 run 绑定，落实接管栅栏（CAS + generation 原子递增 + 新 workflowId）。 |
 | `src/host/wewrite-bridge.ts` | 固定解释器 JSON 子进程协议 + 子进程回收。 |
-| `src/host/tools/index.ts` | 8 个受控 Agent 工具（`wewrite_push_draft` 属 S4 不注册）。 |
+| `src/host/tools/index.ts` | 20 个受控 Agent 工具（8 写作 + 12 账号级；`wewrite_push_draft` 属 S4 条件注册）。 |
 | `src/host/skills-provider.ts` | 随包 skills Provider（`wewrite-python-bundle`，固定 manifest 加载，禁止目录扫描）。 |
 | `src/client/panels/` | 任务/选题/编辑器/审稿/设置面板，四态不白屏。 |
-| `skills/` | 6 个 skill（主 skill 接收已创建 run，不执行 run start/resume）；`skills/**/references/*.md` 为上游编辑知识层（9 个文件）。 |
-| `python/` | facade：读面投影 / 写锁 / 路径安全 / 版本 CAS / binding 栅栏。 |
+| `skills/` | 10 个 skill（主 skill 接收已创建 run，不执行 run start/resume）；`skills/**/references/*.md` 为上游编辑知识层（14 个文件）。 |
+| `python/` | facade：读面投影 / 写锁 / 路径安全 / 版本 CAS / binding 栅栏 / style/learn/exemplar/stats/rewrite 账号级能力。 |
 
 ## 契约硬约束（已定死）
 
