@@ -62,7 +62,7 @@
       "name": "wewrite-stats",
       "description": "数据复盘：拉取公众号文章阅读/分享/点赞数据并回填 history.yaml，给出选题/标题/框架调整建议；无凭证降级为定性分析",
       "path": "wewrite-stats/SKILL.md",
-      "sha256": "79a0e244d03c1ed37ca1f5b624a1eca1cc862b435093f04264391c1fdf444a89"
+      "sha256": "c675bca65d68aaeead8546a37837f10e5f3c5a26f231dc78109f776a4ce08835"
     }
   ],
   "references": [

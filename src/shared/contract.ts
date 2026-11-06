@@ -361,7 +361,21 @@ const ExemplarGetResultSchema = z.strictObject({
 
 // ── 方案 B 批二：stats / rewrite 账号级能力 schema ──────────────────────────
 
-/** stats.fetch 结果：degraded 分支（无凭证降级）与真实拉取分支共用同一形状（可选字段区分）。 */
+/** stats.fetch 逐篇脱敏指标：只含 media_id/title/stats/matched，绝不回显凭据。 */
+const StatsArticleMetricSchema = z.strictObject({
+  media_id: z.string().nullable(),
+  title: z.string().nullable(),
+  stats: z.strictObject({
+    read_count: z.number().int(),
+    share_count: z.number().int(),
+    like_count: z.number().int(),
+    read_rate: z.number(),
+  }),
+  matched: z.boolean(),
+});
+
+/** stats.fetch 结果：degraded 分支（无凭证降级）与真实拉取分支共用同一形状（可选字段区分）。
+ * 成功分支必带 articles（逐篇脱敏指标）；降级分支不返回 articles。 */
 const StatsFetchResultSchema = z.strictObject({
   degraded: z.boolean(),
   days: z.number().int().min(1).max(30),
@@ -370,6 +384,7 @@ const StatsFetchResultSchema = z.strictObject({
   reason: z.string().optional(),
   wechatApiCalls: z.number().int().min(0).optional(),
   mediaIds: z.array(z.string()).optional(),
+  articles: z.array(StatsArticleMetricSchema).optional(),
   historyVersion: HashSchema.optional(),
   history: z.strictObject({
     articleCount: z.number().int().min(0),

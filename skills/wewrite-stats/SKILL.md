@@ -7,9 +7,9 @@ whenToUse: 需要复盘公众号文章数据表现时
 
 ## 运行约定
 
-- **受控工具**：拉数与回填统一走 `wewrite_stats_fetch`（days 回看天数），回填结果用于分析；
-  `wewrite_stats_backfill` 是账号级写操作，只有 owner 可改，Agent 调用一律 FORBIDDEN，
-  实际回填由工作台完成。
+- **受控工具**：拉数与回填统一走 `wewrite_stats_fetch`（days 回看天数），`stats.fetch` 会**自动
+  回填** history.yaml 并返回逐篇脱敏指标 `articles`；`wewrite_stats_backfill` 是账号级写操作，
+  仅供 owner 在工作台手工补录，Agent 调用一律 FORBIDDEN。
 - **{home}**：用户状态目录（工作台数据根）。config/style/history/playbook/output/exemplars 全在
   {home}，不在仓库；references 文档中的状态路径同此约定。
 - **`读取: <路径>`** = 用受控工具或随包 references 真实读完该文件再继续，不是注释。
@@ -21,8 +21,9 @@ whenToUse: 需要复盘公众号文章数据表现时
 读取: {skill_dir}/references/effect-review.md
 ```
 
-按其流程执行：调用 `wewrite_stats_fetch`（days=7）拉数据 → 回填 history.yaml 的 stats 字段 →
-分析最好/最差表现及原因 → 给出后续选题/标题/框架的调整建议。
+按其流程执行：调用 `wewrite_stats_fetch`（days=7）拉数据 → 自动回填 history.yaml 的 stats 字段 →
+用 `wewrite_stats_fetch` 返回的 `articles`（逐篇 `media_id`/`title`/`stats{read_count, share_count,
+like_count, read_rate}`/`matched`）分析最好/最差表现及原因 → 给出后续选题/标题/框架的调整建议。
 
 **前置**：真实拉数需要 config.yaml 里的微信 API 凭证。`wewrite_stats_fetch` 无凭证时返回
 `degraded=true` 的降级结果（「数据复盘需要配置公众号 API（config.yaml），当前只能基于

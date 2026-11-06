@@ -2,12 +2,17 @@
 
 - ``stats.fetch``：在**服务端**读取 config.yaml / 环境变量里的微信凭证（不经 RPC/工具/
   日志/前端回显），拉取公众号文章阅读/分享/点赞数据并回填 history.yaml 的 stats 字段。
-  **无凭证时返回明确的降级结果**（``degraded=true``，只能基于 history.yaml 已有记录做
-  定性分析），且不产生任何微信 API 调用（``wechatApiCalls`` 恒为 0）。
+  成功分支返回逐篇脱敏指标（``articles``），供 Agent 端做最好/最差表现分析；**无凭证时
+  返回明确的降级结果**（``degraded=true``，只能基于 history.yaml 已有记录做定性分析），
+  且不产生任何微信 API 调用（``wechatApiCalls`` 恒为 0）。
 - ``stats.backfill``：把已获取的 stats 数据按 media_id（精确）/title（回退）匹配回填
   history.yaml。账号级写操作，仅 owner 可改（携带绑定上下文一律 FORBIDDEN）。
 - history.yaml 位于 ``{home}`` 根；读写走 facade 安全原语（O_NOFOLLOW + home 全局锁 +
   同目录临时文件 + replace 原子写），**不**经上游 ``save_history`` 的裸 Path 写。
+- 回填的读-改-写全程在同一把 ``home_lock`` 内（``home_lock`` 不可重入，锁内只用
+  「调用方已持锁」的原子写原语，不二次取锁），杜绝并发丢更新。
+- 每日微信摘要响应逐日校验（HTTP 成功 / dict / 无 errcode / list 为数组），任一失败
+  即整批业务失败且不写 history.yaml（半份数据比没有更糟）。
 - 复用上游 ``wewrite.history`` 的形状规范（``version:1`` + ``articles``），与选题模块
   wewrite-topic 读取的 history.yaml 结构一致。
 - 时间经 ``_now`` 注入点（测试可 monkeypatch，不引入时间炸弹）。
@@ -35,8 +40,6 @@ _STATS_TOTAL_ENDPOINT = "datacube/getarticletotal"
 _STATS_ENDPOINTS = (_STATS_TOKEN_ENDPOINT, _STATS_SUMMARY_ENDPOINT, _STATS_TOTAL_ENDPOINT)
 
 _API_TIMEOUT = 30
-_DAYS_MIN = 1
-_DAYS_MAX = 30
 _HISTORY_MAX_BYTES = 4 * 1024 * 1024
 
 
@@ -114,15 +117,17 @@ def read_history() -> dict[str, Any]:
     return _normalize_history(data)
 
 
-def _write_history(data: dict[str, Any]) -> str:
-    """home 锁内原子写 history.yaml；返回新字节哈希。"""
+def _write_history_locked(data: dict[str, Any]) -> str:
+    """**调用方已持 home 锁**：原子写 history.yaml 并返回新字节哈希。
+
+    不在此处再取 home 锁（``home_lock`` 不可重入，嵌套会永久阻塞）。
+    """
     canonical = _normalize_history(data)
     text = yaml.safe_dump(canonical, allow_unicode=True, sort_keys=False)
     raw = text.encode("utf-8")
     if len(raw) > _HISTORY_MAX_BYTES:
         raise invalid_input("history.yaml 超过 4 MiB 上限")
-    with storage.home_lock(create=True):
-        return _write_home_file_atomic(HISTORY_FILENAME, raw)
+    return _write_home_file_atomic(HISTORY_FILENAME, raw)
 
 
 def wechat_credentials() -> tuple[str, str] | None:
@@ -149,37 +154,55 @@ def _assert_stats_endpoint(endpoint: str) -> None:
 
 
 def _fetch_real_stats(appid: str, secret: str, days: int) -> list[dict[str, Any]]:
-    """真实拉取最近 days 天的文章摘要数据。每个微信调用前过白名单并计入 wechatApiCalls。"""
+    """真实拉取最近 days 天的文章摘要数据。每个微信调用前过白名单并计入 wechatApiCalls。
+
+    每日摘要响应**逐日严格校验**：HTTP 调用成功、响应是 dict、无 errcode（或 errcode==0）、
+    ``list`` 是数组。任一条不满足即抛业务失败（整批失败，不写历史），绝不静默跳过某日
+    再以 ``degraded=false`` 冒充成功。
+    """
     import requests
 
     from .counters import get_counters
 
     _assert_stats_endpoint(_STATS_TOKEN_ENDPOINT)
     get_counters().inc_wechat()
-    resp = requests.get(
-        "https://api.weixin.qq.com/cgi-bin/token",
-        params={"grant_type": "client_credential", "appid": appid, "secret": secret},
-        timeout=_API_TIMEOUT,
-    )
-    data = resp.json()
-    if "access_token" not in data:
+    try:
+        resp = requests.get(
+            "https://api.weixin.qq.com/cgi-bin/token",
+            params={"grant_type": "client_credential", "appid": appid, "secret": secret},
+            timeout=_API_TIMEOUT,
+        )
+        token_body = resp.json()
+    except Exception as exc:
+        raise FacadeError("CAPABILITY_UNAVAILABLE", "微信数据接口令牌获取失败", retryable=True) from exc
+    if not isinstance(token_body, dict) or "access_token" not in token_body:
         raise FacadeError("CAPABILITY_UNAVAILABLE", "微信数据接口令牌获取失败", retryable=False)
-    token = data["access_token"]
+    token = token_body["access_token"]
 
     all_stats: list[dict[str, Any]] = []
     for i in range(days):
         date = (_now() - timedelta(days=i + 1)).strftime("%Y-%m-%d")
         _assert_stats_endpoint(_STATS_SUMMARY_ENDPOINT)
         get_counters().inc_wechat()
-        resp = requests.post(
-            "https://api.weixin.qq.com/datacube/getarticlesummary",
-            params={"access_token": token},
-            json={"begin_date": date, "end_date": date},
-            timeout=_API_TIMEOUT,
-        )
-        body = resp.json()
-        if isinstance(body, dict) and isinstance(body.get("list"), list):
-            all_stats.extend(body["list"])
+        try:
+            resp = requests.post(
+                "https://api.weixin.qq.com/datacube/getarticlesummary",
+                params={"access_token": token},
+                json={"begin_date": date, "end_date": date},
+                timeout=_API_TIMEOUT,
+            )
+            body = resp.json()
+        except Exception as exc:
+            raise FacadeError("CAPABILITY_UNAVAILABLE", f"{date} 微信数据接口调用失败", retryable=True) from exc
+        # 逐日校验：①是 dict ②无 errcode（或 errcode==0）③list 是数组。
+        if not isinstance(body, dict):
+            raise FacadeError("CAPABILITY_UNAVAILABLE", f"{date} 微信数据接口响应不合法", retryable=True)
+        errcode = body.get("errcode")
+        if errcode is not None and errcode != 0:
+            raise FacadeError("CAPABILITY_UNAVAILABLE", f"{date} 微信数据接口返回错误（errcode={errcode}）", retryable=True)
+        if not isinstance(body.get("list"), list):
+            raise FacadeError("CAPABILITY_UNAVAILABLE", f"{date} 微信数据接口响应不合法", retryable=True)
+        all_stats.extend(body["list"])
     return all_stats
 
 
@@ -205,47 +228,65 @@ def _stat_to_stored(stat: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def backfill_history(stats_list: list[dict[str, Any]]) -> int:
-    """按 media_id（精确）/title（回退）把 stats 回填进 history.yaml，返回回填条数。"""
-    history = read_history()
-    articles = history.get("articles", [])
-    if not isinstance(articles, list):
-        articles = []
-    if not articles:
-        return 0
+def _article_metric(stat: dict[str, Any], matched: bool) -> dict[str, Any]:
+    """逐篇脱敏指标：只含 media_id/title/stats/matched，绝不回显任何凭据。"""
+    return {
+        "media_id": stat.get("media_id"),
+        "title": stat.get("title"),
+        "stats": _stat_to_stored(stat),
+        "matched": matched,
+    }
 
-    media_id_to_idx: dict[str, int] = {}
-    title_to_idx: dict[str, int] = {}
-    for i, article in enumerate(articles):
-        if not isinstance(article, dict):
-            continue
-        mid = article.get("media_id", "")
-        if isinstance(mid, str) and mid:
-            media_id_to_idx[mid] = i
-        title = article.get("title", "")
-        if isinstance(title, str) and title:
-            title_to_idx[title] = i
 
-    updated = 0
-    for stat in stats_list:
-        if not isinstance(stat, dict):
-            continue
-        idx = None
-        stat_media_id = stat.get("media_id", "")
-        if isinstance(stat_media_id, str) and stat_media_id and stat_media_id in media_id_to_idx:
-            idx = media_id_to_idx[stat_media_id]
-        else:
-            title = stat.get("title", "")
-            if isinstance(title, str) and title in title_to_idx:
-                idx = title_to_idx[title]
-        if idx is not None:
-            articles[idx]["stats"] = _stat_to_stored(stat)
-            updated += 1
+def backfill_history(stats_list: list[dict[str, Any]]) -> tuple[int, list[dict[str, Any]]]:
+    """按 media_id（精确）/title（回退）把 stats 回填进 history.yaml。
 
-    if updated > 0:
-        history["articles"] = articles
-        _write_history(history)
-    return updated
+    读 → 匹配 → 修改 → 原子替换**全程在同一把 home 锁内**，杜绝并发丢更新。
+    返回 ``(updated, articles)``：``articles`` 为逐篇脱敏指标（含 matched 标识），
+    供 ``stats.fetch`` 成功分支回传与 Agent 端分析。
+    """
+    with storage.home_lock(create=True):
+        history = read_history()
+        articles = history.get("articles", [])
+        if not isinstance(articles, list):
+            articles = []
+
+        media_id_to_idx: dict[str, int] = {}
+        title_to_idx: dict[str, int] = {}
+        for i, article in enumerate(articles):
+            if not isinstance(article, dict):
+                continue
+            mid = article.get("media_id", "")
+            if isinstance(mid, str) and mid:
+                media_id_to_idx[mid] = i
+            title = article.get("title", "")
+            if isinstance(title, str) and title:
+                title_to_idx[title] = i
+
+        updated = 0
+        out_articles: list[dict[str, Any]] = []
+        for stat in stats_list:
+            if not isinstance(stat, dict):
+                continue
+            stat_media_id = stat.get("media_id", "")
+            stat_title = stat.get("title", "")
+            idx = None
+            matched = False
+            if isinstance(stat_media_id, str) and stat_media_id and stat_media_id in media_id_to_idx:
+                idx = media_id_to_idx[stat_media_id]
+                matched = True
+            elif isinstance(stat_title, str) and stat_title and stat_title in title_to_idx:
+                idx = title_to_idx[stat_title]
+                matched = True
+            if idx is not None:
+                articles[idx]["stats"] = _stat_to_stored(stat)
+                updated += 1
+            out_articles.append(_article_metric(stat, matched))
+
+        if updated > 0:
+            history["articles"] = articles
+            _write_history_locked(history)
+        return updated, out_articles
 
 
 def _degraded_result(days: int) -> dict[str, Any]:
@@ -280,7 +321,10 @@ def _degraded_result(days: int) -> dict[str, Any]:
 
 
 def stats_fetch(payload: dict[str, Any]) -> dict[str, Any]:
-    """stats.fetch：有凭证真实拉取并回填；无凭证返回降级结果且零微信调用。"""
+    """stats.fetch：有凭证真实拉取并回填；无凭证返回降级结果且零微信调用。
+
+    成功分支返回逐篇脱敏指标 ``articles``（media_id/title/stats/matched），不回显任何凭据。
+    """
     days = payload["days"]
     creds = wechat_credentials()
     if creds is None:
@@ -294,13 +338,14 @@ def stats_fetch(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception:
         raise FacadeError("CAPABILITY_UNAVAILABLE", "微信数据接口不可用，请稍后重试", retryable=True)
 
-    backfilled = backfill_history(fetched)
+    backfilled, articles = backfill_history(fetched)
     return {
         "degraded": False,
         "days": days,
         "fetched": len(fetched),
         "backfilled": backfilled,
         "mediaIds": [s.get("media_id") for s in fetched if isinstance(s, dict) and s.get("media_id")],
+        "articles": articles,
         "historyVersion": storage.sha256_hex(
             yaml.safe_dump(read_history(), allow_unicode=True, sort_keys=False).encode("utf-8")
         ),
@@ -312,7 +357,7 @@ def stats_backfill(payload: dict[str, Any]) -> dict[str, Any]:
     if payload.get("context"):
         raise forbidden("数据回填为账号级配置，仅 owner 可改")
     entries = payload["entries"]
-    backfilled = backfill_history(entries)
+    backfilled, _articles = backfill_history(entries)
     return {
         "backfilled": backfilled,
         "historyVersion": storage.sha256_hex(

@@ -11,24 +11,25 @@
 
 from __future__ import annotations
 
-import hashlib
+import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import yaml
 
-from conftest import call_facade, make_home
+from conftest import PYTHON_SRC, VENV_PY, call_facade, facade_env, make_home
 
 
-def _seed_history(home: Path) -> None:
+def _seed_history(home: Path, articles: list[dict] | None = None) -> None:
     """直接在 home 根写一份 history.yaml（绕过 facade 构造夹具，含 media_id/title）。"""
-    data = {
-        "version": 1,
-        "articles": [
+    if articles is None:
+        articles = [
             {"title": "第一篇", "media_id": "media-aaa", "run_id": "20261103-000000-aaaaaa"},
             {"title": "第二篇", "run_id": "20261103-000000-bbbbbb"},
-        ],
-    }
+        ]
+    data = {"version": 1, "articles": articles}
     (home / "history.yaml").write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
 
 
@@ -143,6 +144,175 @@ def test_stats_fetch_rejects_invalid_days(tmp_path):
         resp = call_facade(str(home), "stats.fetch", {"days": bad})
         assert resp["ok"] is False, f"days={bad} 应被拒绝"
         assert resp["error"]["code"] == "INVALID_INPUT"
+
+
+# ── 批二返修：stats.fetch 成功分支逐篇指标 + 脱敏 ──────────────────────────
+
+def _call_fake_fetch(home: Path, days: int, daily: list[dict], token_ok: str = "1") -> dict:
+    """经 stats_wechat_facade.py 伪造微信响应，走标准 facade 协议入口。"""
+    env = facade_env(str(home))
+    # 注入非空假凭证，触发「有凭证」真实拉取分支（数据由 fake requests 提供）。
+    env["WECHAT_APPID"] = "fake-appid"
+    env["WECHAT_SECRET"] = "fake-secret"
+    env["FAKE_TOKEN_OK"] = token_ok
+    env["FAKE_DAILY"] = json.dumps(daily, ensure_ascii=False)
+    req = json.dumps({
+        "protocol": 1, "requestId": "r", "operation": "stats.fetch", "payload": {"days": days},
+    }, ensure_ascii=False)
+    proc = subprocess.run(
+        [VENV_PY, str(Path(__file__).resolve().parent / "stats_wechat_facade.py")],
+        input=req + "\n", capture_output=True, text=True, env=env, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def test_stats_fetch_success_returns_per_article_metrics_no_credentials(tmp_path):
+    """成功分支返回逐篇脱敏指标（articles），且响应中无任何凭据明文。"""
+    home = make_home(tmp_path)
+    _seed_history(home, [
+        {"title": "表现好", "media_id": "m-good"},
+        {"title": "表现差", "media_id": "m-bad"},
+    ])
+    daily = [{
+        "list": [
+            {"media_id": "m-good", "title": "表现好", "int_page_read_count": 100,
+             "share_count": 5, "like_count": 3, "old_like_count": 0, "target_user": 1000},
+            {"media_id": "m-bad", "title": "表现差", "int_page_read_count": 10,
+             "share_count": 0, "like_count": 1, "old_like_count": 0, "target_user": 1000},
+        ],
+    }]
+    resp = _call_fake_fetch(home, days=1, daily=daily)
+    assert resp["ok"] is True, resp
+    data = resp["data"]
+    assert data["degraded"] is False
+    assert data["backfilled"] == 2
+
+    articles = data["articles"]
+    assert len(articles) == 2
+    # 顺序稳定：与微信响应 list 顺序一致。
+    assert [a["media_id"] for a in articles] == ["m-good", "m-bad"]
+    good, bad = articles
+    assert good["stats"]["read_count"] == 100
+    assert bad["stats"]["read_count"] == 10
+    assert good["matched"] is True
+    assert bad["matched"] is True
+    # 脱敏：响应 JSON 全文不含任何凭据明文。
+    dumped = json.dumps(resp, ensure_ascii=False)
+    assert "fake-token" not in dumped
+    assert "appid" not in dumped
+    assert "secret" not in dumped
+    assert "access_token" not in dumped
+
+
+def test_stats_fetch_success_marks_unmatched(tmp_path):
+    """微信返回了 history 里没有的 media_id → matched=false，但仍返回指标。"""
+    home = make_home(tmp_path)
+    _seed_history(home, [{"title": "只有这篇", "media_id": "m-known"}])
+    daily = [{"list": [
+        {"media_id": "m-unknown", "title": "陌生文章", "int_page_read_count": 7,
+         "share_count": 0, "like_count": 0, "target_user": 100},
+    ]}]
+    resp = _call_fake_fetch(home, days=1, daily=daily)
+    assert resp["ok"] is True, resp
+    data = resp["data"]
+    assert data["backfilled"] == 0
+    assert data["articles"][0]["matched"] is False
+    assert data["articles"][0]["stats"]["read_count"] == 7
+
+
+# ── 批二返修：每日摘要响应逐日校验，失败即业务失败且不写历史 ────────────────
+
+def test_stats_fetch_daily_errcode_fails_and_does_not_write_history(tmp_path):
+    """首日成功、次日 errcode=45009：整批业务失败，history.yaml 字节不变。"""
+    home = make_home(tmp_path)
+    _seed_history(home, [{"title": "第一篇", "media_id": "m-a"}])
+    before = (home / "history.yaml").read_bytes()
+
+    daily = [
+        {"list": [{"media_id": "m-a", "title": "第一篇", "int_page_read_count": 100,
+                   "share_count": 0, "like_count": 0, "target_user": 1000}]},
+        {"errcode": 45009, "errmsg": "reach max api daily quota limit"},
+    ]
+    resp = _call_fake_fetch(home, days=2, daily=daily)
+    assert resp["ok"] is False, resp
+    assert resp["error"]["code"] == "CAPABILITY_UNAVAILABLE", resp
+    assert "45009" in resp["error"]["message"] or "errcode" in resp["error"]["message"]
+    # 失败路径不得写 history.yaml（半份数据比没有更糟）。
+    assert (home / "history.yaml").read_bytes() == before
+
+
+def test_stats_fetch_all_success_positive(tmp_path):
+    """全部成功正向用例：防过度收紧。"""
+    home = make_home(tmp_path)
+    _seed_history(home, [{"title": "第一篇", "media_id": "m-a"}])
+    daily = [{"list": [{"media_id": "m-a", "title": "第一篇", "int_page_read_count": 50,
+                        "share_count": 2, "like_count": 1, "target_user": 500}]}]
+    resp = _call_fake_fetch(home, days=1, daily=daily)
+    assert resp["ok"] is True, resp
+    assert resp["data"]["backfilled"] == 1
+
+
+def test_stats_fetch_daily_non_dict_fails(tmp_path):
+    """每日响应不是 dict → 业务失败。"""
+    home = make_home(tmp_path)
+    _seed_history(home, [{"title": "第一篇", "media_id": "m-a"}])
+    resp = _call_fake_fetch(home, days=1, daily=["not-a-dict"])
+    assert resp["ok"] is False, resp
+    assert resp["error"]["code"] == "CAPABILITY_UNAVAILABLE"
+
+
+# ── 批二返修：回填读-改-写在同一把 home 锁内（并发不丢更新）─────────────────
+
+def _call_backfill_hold(home: Path, entries: list[dict], hold_ms: int) -> dict:
+    """经 backfill_hold_facade.py 注入读后延迟，走标准 facade 协议入口。"""
+    env = facade_env(str(home))
+    env["BACKFILL_HOLD_MS"] = str(hold_ms)
+    req = json.dumps({
+        "protocol": 1, "requestId": "r", "operation": "stats.backfill", "payload": {"entries": entries},
+    }, ensure_ascii=False)
+    proc = subprocess.run(
+        [VENV_PY, str(Path(__file__).resolve().parent / "backfill_hold_facade.py")],
+        input=req + "\n", capture_output=True, text=True, env=env, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def test_stats_backfill_concurrent_no_lost_update(tmp_path):
+    """两个子进程并发回填不同 media_id：最终 history.yaml 两项 stats 都在，无 .tmp 残留。"""
+    home = make_home(tmp_path)
+    _seed_history(home, [
+        {"title": "甲篇", "media_id": "m-a"},
+        {"title": "乙篇", "media_id": "m-b"},
+    ])
+
+    import threading
+    results: dict[str, dict] = {}
+
+    def worker(name: str, media_id: str) -> None:
+        results[name] = _call_backfill_hold(home, [{
+            "media_id": media_id, "title": name, "int_page_read_count": 100,
+            "share_count": 1, "like_count": 1, "target_user": 1000,
+        }], hold_ms=400)
+
+    t1 = threading.Thread(target=worker, args=("甲篇", "m-a"))
+    t2 = threading.Thread(target=worker, args=("乙篇", "m-b"))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert results["甲篇"]["ok"] is True, results
+    assert results["乙篇"]["ok"] is True, results
+
+    on_disk = yaml.safe_load((home / "history.yaml").read_text(encoding="utf-8"))
+    by_media = {a["media_id"]: a for a in on_disk["articles"] if "media_id" in a}
+    assert "stats" in by_media["m-a"], "m-a 的 stats 丢失（并发丢更新）"
+    assert "stats" in by_media["m-b"], "m-b 的 stats 丢失（并发丢更新）"
+    # 并发期间无残留 .tmp 文件。
+    leftovers = [p for p in home.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == []
 
 
 def test_rewrite_score_returns_quality_score(tmp_path):
